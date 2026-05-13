@@ -323,22 +323,6 @@ struct ConvertGetTileBlockId
   }
 };
 
-/// Convert cuda_tile.muli to arith.muli.
-struct ConvertMulI : public OpConversionPattern<cuda_tile::MulIOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(cuda_tile::MulIOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    Type resultType = getTypeConverter()->convertType(op.getType());
-    if (!resultType)
-      return failure();
-    rewriter.replaceOpWithNewOp<arith::MulIOp>(op, adaptor.getLhs(),
-                                               adaptor.getRhs());
-    return success();
-  }
-};
-
 struct ConvertAtan2 : public OpConversionPattern<cuda_tile::Atan2Op> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -360,6 +344,83 @@ struct ConvertUnarySourceOp : public OpConversionPattern<SrcOp> {
                   typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     rewriter.template replaceOpWithNewOp<DstOp>(op, adaptor.getSource());
+    return success();
+  }
+};
+
+template <typename SrcOp, typename DstOp>
+struct ConvertBinaryLhsRhsOp : public OpConversionPattern<SrcOp> {
+  using OpConversionPattern<SrcOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(SrcOp op,
+                  typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.template replaceOpWithNewOp<DstOp>(op, adaptor.getLhs(),
+                                                adaptor.getRhs());
+    return success();
+  }
+};
+
+template <typename SrcOp, bool IsMax>
+struct ConvertMinMaxFOp : public OpConversionPattern<SrcOp> {
+  using OpConversionPattern<SrcOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(SrcOp op,
+                  typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getFlushToZero())
+      return rewriter.notifyMatchFailure(
+          op, IsMax
+                  ? "maxf flush_to_zero is not representable in arith max operations"
+                  : "minf flush_to_zero is not representable in arith min operations");
+
+    if (op.getPropagateNan()) {
+      if constexpr (IsMax) {
+        rewriter.template replaceOpWithNewOp<arith::MaximumFOp>(
+            op, adaptor.getLhs(), adaptor.getRhs());
+      } else {
+        rewriter.template replaceOpWithNewOp<arith::MinimumFOp>(
+            op, adaptor.getLhs(), adaptor.getRhs());
+      }
+    } else {
+      if constexpr (IsMax) {
+        rewriter.template replaceOpWithNewOp<arith::MaxNumFOp>(
+            op, adaptor.getLhs(), adaptor.getRhs());
+      } else {
+        rewriter.template replaceOpWithNewOp<arith::MinNumFOp>(
+            op, adaptor.getLhs(), adaptor.getRhs());
+      }
+    }
+    return success();
+  }
+};
+
+template <typename SrcOp, bool IsMax>
+struct ConvertMinMaxIOp : public OpConversionPattern<SrcOp> {
+  using OpConversionPattern<SrcOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(SrcOp op,
+                  typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    bool isUnsigned = op.getSignedness() == cuda_tile::Signedness::Unsigned;
+    if constexpr (IsMax) {
+      if (isUnsigned)
+        rewriter.template replaceOpWithNewOp<arith::MaxUIOp>(
+            op, adaptor.getLhs(), adaptor.getRhs());
+      else
+        rewriter.template replaceOpWithNewOp<arith::MaxSIOp>(
+            op, adaptor.getLhs(), adaptor.getRhs());
+    } else {
+      if (isUnsigned)
+        rewriter.template replaceOpWithNewOp<arith::MinUIOp>(
+            op, adaptor.getLhs(), adaptor.getRhs());
+      else
+        rewriter.template replaceOpWithNewOp<arith::MinSIOp>(
+            op, adaptor.getLhs(), adaptor.getRhs());
+    }
     return success();
   }
 };
@@ -391,46 +452,6 @@ struct ConvertExp2 : public OpConversionPattern<cuda_tile::Exp2Op> {
       return rewriter.notifyMatchFailure(
           op, "exp2 flush_to_zero is not representable in math.exp2");
     rewriter.replaceOpWithNewOp<math::Exp2Op>(op, adaptor.getSource());
-    return success();
-  }
-};
-
-struct ConvertMaxF : public OpConversionPattern<cuda_tile::MaxFOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(cuda_tile::MaxFOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    if (op.getFlushToZero())
-      return rewriter.notifyMatchFailure(
-          op,
-          "maxf flush_to_zero is not representable in arith max operations");
-    if (op.getPropagateNan())
-      rewriter.replaceOpWithNewOp<arith::MaximumFOp>(op, adaptor.getLhs(),
-                                                     adaptor.getRhs());
-    else
-      rewriter.replaceOpWithNewOp<arith::MaxNumFOp>(op, adaptor.getLhs(),
-                                                    adaptor.getRhs());
-    return success();
-  }
-};
-
-struct ConvertMinF : public OpConversionPattern<cuda_tile::MinFOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(cuda_tile::MinFOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    if (op.getFlushToZero())
-      return rewriter.notifyMatchFailure(
-          op,
-          "minf flush_to_zero is not representable in arith min operations");
-    if (op.getPropagateNan())
-      rewriter.replaceOpWithNewOp<arith::MinimumFOp>(op, adaptor.getLhs(),
-                                                     adaptor.getRhs());
-    else
-      rewriter.replaceOpWithNewOp<arith::MinNumFOp>(op, adaptor.getLhs(),
-                                                    adaptor.getRhs());
     return success();
   }
 };
@@ -492,38 +513,6 @@ struct ConvertCmpI : public OpConversionPattern<cuda_tile::CmpIOp> {
   }
 };
 
-struct ConvertMaxI : public OpConversionPattern<cuda_tile::MaxIOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(cuda_tile::MaxIOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    if (op.getSignedness() == cuda_tile::Signedness::Unsigned)
-      rewriter.replaceOpWithNewOp<arith::MaxUIOp>(op, adaptor.getLhs(),
-                                                  adaptor.getRhs());
-    else
-      rewriter.replaceOpWithNewOp<arith::MaxSIOp>(op, adaptor.getLhs(),
-                                                  adaptor.getRhs());
-    return success();
-  }
-};
-
-struct ConvertMinI : public OpConversionPattern<cuda_tile::MinIOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(cuda_tile::MinIOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    if (op.getSignedness() == cuda_tile::Signedness::Unsigned)
-      rewriter.replaceOpWithNewOp<arith::MinUIOp>(op, adaptor.getLhs(),
-                                                  adaptor.getRhs());
-    else
-      rewriter.replaceOpWithNewOp<arith::MinSIOp>(op, adaptor.getLhs(),
-                                                  adaptor.getRhs());
-    return success();
-  }
-};
-
 struct ConvertMulhiI : public OpConversionPattern<cuda_tile::MulhiIOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -550,18 +539,6 @@ struct ConvertNegI : public OpConversionPattern<cuda_tile::NegIOp> {
           op, "cannot create zero value for negi source type");
     Value zero = arith::ConstantOp::create(rewriter, op.getLoc(), ty, zeroAttr);
     rewriter.replaceOpWithNewOp<arith::SubIOp>(op, zero, adaptor.getSource());
-    return success();
-  }
-};
-
-struct ConvertXOrI : public OpConversionPattern<cuda_tile::XOrIOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(cuda_tile::XOrIOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<arith::XOrIOp>(op, adaptor.getLhs(),
-                                               adaptor.getRhs());
     return success();
   }
 };
@@ -1273,17 +1250,25 @@ static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
   MLIRContext *ctx = patterns.getContext();
   // Patterns that don't need the tvMap.
   patterns
-      .add<ConvertModule, ConvertConstant, ConvertGetTileBlockId, ConvertMulI,
+     .add<ConvertModule, ConvertConstant, ConvertGetTileBlockId,
+       ConvertBinaryLhsRhsOp<cuda_tile::MulIOp, arith::MulIOp>,
            ConvertAtan2, ConvertUnarySourceOp<cuda_tile::CeilOp, math::CeilOp>,
            ConvertCmpF, ConvertUnarySourceOp<cuda_tile::CosOp, math::CosOp>,
            ConvertExp2, ConvertUnarySourceOp<cuda_tile::ExpOp, math::ExpOp>,
            ConvertUnarySourceOp<cuda_tile::FloorOp, math::FloorOp>,
-           ConvertUnarySourceOp<cuda_tile::Log2Op, math::Log2Op>, ConvertMaxF,
-           ConvertMinF, ConvertUnarySourceOp<cuda_tile::NegFOp, arith::NegFOp>,
+           ConvertUnarySourceOp<cuda_tile::Log2Op, math::Log2Op>,
+           ConvertMinMaxFOp<cuda_tile::MaxFOp, /*IsMax=*/true>,
+           ConvertMinMaxFOp<cuda_tile::MinFOp, /*IsMax=*/false>,
+           ConvertUnarySourceOp<cuda_tile::NegFOp, arith::NegFOp>,
            ConvertPow, ConvertRsqrt,
            ConvertUnarySourceOp<cuda_tile::SinOp, math::SinOp>, ConvertTanH,
-           ConvertCmpI, ConvertMaxI, ConvertMinI, ConvertMmaI, ConvertMulhiI,
-           ConvertNegI, ConvertXOrI, ConvertFor, ConvertContinue, ConvertReturn,
+           ConvertCmpI,
+           ConvertMinMaxIOp<cuda_tile::MaxIOp, /*IsMax=*/true>,
+           ConvertMinMaxIOp<cuda_tile::MinIOp, /*IsMax=*/false>, ConvertMmaI,
+           ConvertMulhiI,
+           ConvertNegI,
+           ConvertBinaryLhsRhsOp<cuda_tile::XOrIOp, arith::XOrIOp>, ConvertFor,
+           ConvertContinue, ConvertReturn,
            ConvertMmaF, ConvertAssume>(converter, ctx);
   // Patterns that need the tvMap.
   patterns.add<ConvertEntry, ConvertGetIndexSpaceShape, ConvertLoadViewTko,
