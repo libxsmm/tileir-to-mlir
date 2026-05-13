@@ -8,6 +8,7 @@ configure_lit_site_cfg(
 
 set(CUDATILE_TO_GPU_TEST_DEPENDS
   FileCheck
+  mlir-opt
   cudatile-to-gpu
 )
 

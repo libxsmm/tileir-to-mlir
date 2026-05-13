@@ -69,3 +69,9 @@ You can pipe output into `FileCheck` for ad-hoc validation:
 ```bash
 build/tools/cudatile-to-gpu --convert-cuda-tile-to-gpu test/Conversion/CudaTileToGPU/cudatile-to-mlir.mlir | FileCheck test/Conversion/CudaTileToGPU/cudatile-to-mlir.mlir
 ```
+
+Example: convert the appendix example and run canonical cleanup passes:
+
+```bash
+build/tools/cudatile-to-gpu --convert-cuda-tile-to-gpu test/Conversion/CudaTileToGPU/examples_cudatile_appendix.mlir | mlir-opt --loop-invariant-code-motion -cse -canonicalize -cse
+```

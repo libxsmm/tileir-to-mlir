@@ -1,4 +1,5 @@
 // RUN: cudatile-to-gpu --convert-cuda-tile-to-gpu %s | FileCheck %s
+// RUN: cudatile-to-gpu --convert-cuda-tile-to-gpu %s | mlir-opt --loop-invariant-code-motion -cse -canonicalize -cse > /dev/null
 
 // CHECK-LABEL: gpu.module @m {
 cuda_tile.module @m {

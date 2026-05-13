@@ -26,6 +26,7 @@ tool_dirs = [
 tools = [
     "cudatile-to-gpu",
     "FileCheck",
+    "mlir-opt",
 ]
 
 llvm_config.add_tool_substitutions(tools, tool_dirs)

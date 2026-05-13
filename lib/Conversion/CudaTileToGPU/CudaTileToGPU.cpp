@@ -1354,10 +1354,10 @@ struct ConvertTileIRToGPUPass
     // CudaTile ops are illegal (target of conversion).
     target.addIllegalDialect<cuda_tile::CudaTileDialect>();
 
-    // But keep view-construction and assume ops legal during conversion so
-    // that load/store patterns can trace through them.
+    // Keep view-construction ops legal during conversion so load/store
+    // patterns can trace through them.
     target.addLegalOp<cuda_tile::MakeTensorViewOp,
-                      cuda_tile::MakePartitionViewOp, cuda_tile::AssumeOp>();
+              cuda_tile::MakePartitionViewOp>();
 
     if (failed(applyPartialConversion(module, target, std::move(patterns))))
       return signalPassFailure();
