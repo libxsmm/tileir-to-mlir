@@ -26,14 +26,10 @@
 
 int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
-  registry.insert<mlir::arith::ArithDialect,
-                  mlir::func::FuncDialect,
-                  mlir::gpu::GPUDialect,
-                  mlir::memref::MemRefDialect,
-                  mlir::scf::SCFDialect,
-                  mlir::ub::UBDialect,
-                  mlir::vector::VectorDialect,
-                  mlir::cuda_tile::CudaTileDialect>();
+  registry.insert<
+      mlir::arith::ArithDialect, mlir::func::FuncDialect, mlir::gpu::GPUDialect,
+      mlir::memref::MemRefDialect, mlir::scf::SCFDialect, mlir::ub::UBDialect,
+      mlir::vector::VectorDialect, mlir::cuda_tile::CudaTileDialect>();
 
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return mlir::createConvertTileIRToGPUPass();
@@ -56,5 +52,5 @@ int main(int argc, char **argv) {
 
   return mlir::asMainReturnCode(
       mlir::MlirOptMain(newArgc, const_cast<char **>(newArgv.data()),
-              "CudaTileToGPU optimizer driver\n", registry));
+                        "CudaTileToGPU optimizer driver\n", registry));
 }
