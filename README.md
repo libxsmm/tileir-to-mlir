@@ -1,4 +1,4 @@
-# VectorToCudaTile
+# CudaTileToGPU
 
 Conversion pass and tooling for lowering CudaTile IR to MLIR GPU/vector/scf/arith/memref dialects.
 
