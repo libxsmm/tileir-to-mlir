@@ -921,7 +921,9 @@ static void populateTileIRToGPUTypeConverter(TypeConverter &converter,
   converter.addConversion([](Type type) { return type; });
 
   // cuda_tile.tile<MxNxelemTy> -> vector<MxNxelemTy> (ranked tiles)
-  // cuda_tile.tile<elemTy> (scalar, rank 0) -> index (for integers) or elemTy
+  // cuda_tile.tile<elemTy> (scalar, rank 0):
+  //   - i32 -> index (index-like scalar in tile IR)
+  //   - other integers/floats -> preserved scalar type
   // cuda_tile.tile<ptr<elemTy>> (scalar, pointer) -> kept as-is (intermediate)
   converter.addConversion([ctx](cuda_tile::TileType tileTy) -> Type {
     auto shape = tileTy.getShape();
@@ -929,8 +931,13 @@ static void populateTileIRToGPUTypeConverter(TypeConverter &converter,
 
     if (shape.empty()) {
       // Scalar tile
-      if (isa<IntegerType>(elemTy))
-        return IndexType::get(ctx);
+      if (auto intTy = dyn_cast<IntegerType>(elemTy)) {
+        // Keep i32 as index because tile-level loop bounds/indices lower to
+        // SCF/memref index arithmetic, but preserve all other integer widths.
+        if (intTy.getWidth() == 32)
+          return IndexType::get(ctx);
+        return elemTy;
+      }
       if (isa<FloatType>(elemTy))
         return elemTy;
       // Pointer types in scalar tiles -> keep as-is (will be dead after

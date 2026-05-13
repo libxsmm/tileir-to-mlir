@@ -99,11 +99,13 @@ cuda_tile.module @m {
   entry @test_shape_identity(%p: !cuda_tile.tile<!cuda_tile.ptr<f16>>, %m: !cuda_tile.tile<i32>, %n: !cuda_tile.tile<i32>, %s: !cuda_tile.tile<i32>) {
     %tv = make_tensor_view %p, shape = [%m, %n], strides = [%s, 1] : tile<i32> -> tensor_view<?x?xf16, strides=[?,1]>
     %pv = make_partition_view %tv : partition_view<tile=(16x8), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[0, 1]>
-    // CHECK: memref.dim {{.*}}, {{.*}}0
-    // CHECK: arith.constant 16 : index
-    // CHECK: memref.dim {{.*}}, {{.*}}1
-    // CHECK: arith.constant 8 : index
-    // CHECK: arith.ceildivui
+    // CHECK-SAME: %[[SID_PTR:[a-zA-Z0-9_]+]]: memref<?x?xf16, strided<[?, 1]>>
+    // CHECK: %[[SID_D0:.*]] = memref.dim %[[SID_PTR]], {{.*}}0
+    // CHECK: %[[SID_C16:.*]] = arith.constant 16 : index
+    // CHECK: %[[SID_Q0:.*]] = arith.ceildivui %[[SID_D0]], %[[SID_C16]] : index
+    // CHECK: %[[SID_D1:.*]] = memref.dim %[[SID_PTR]], {{.*}}1
+    // CHECK: %[[SID_C8:.*]] = arith.constant 8 : index
+    // CHECK: %[[SID_Q1:.*]] = arith.ceildivui %[[SID_D1]], %[[SID_C8]] : index
     %dims:2 = get_index_space_shape %pv : partition_view<tile=(16x8), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[0, 1]> -> tile<i32>
   }
 
@@ -111,11 +113,13 @@ cuda_tile.module @m {
   entry @test_shape_swizzled(%p: !cuda_tile.tile<!cuda_tile.ptr<f16>>, %m: !cuda_tile.tile<i32>, %n: !cuda_tile.tile<i32>, %s: !cuda_tile.tile<i32>) {
     %tv = make_tensor_view %p, shape = [%m, %n], strides = [%s, 1] : tile<i32> -> tensor_view<?x?xf16, strides=[?,1]>
     %pv = make_partition_view %tv : partition_view<tile=(16x8), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>
-    // CHECK: memref.dim {{.*}}, {{.*}}1
-    // CHECK: arith.constant 16 : index
-    // CHECK: memref.dim {{.*}}, {{.*}}0
-    // CHECK: arith.constant 8 : index
-    // CHECK: arith.ceildivui
+    // CHECK-SAME: %[[SSW_PTR:[a-zA-Z0-9_]+]]: memref<?x?xf16, strided<[?, 1]>>
+    // CHECK: %[[SSW_D0:.*]] = memref.dim %[[SSW_PTR]], {{.*}}1
+    // CHECK: %[[SSW_C16:.*]] = arith.constant 16 : index
+    // CHECK: %[[SSW_Q0:.*]] = arith.ceildivui %[[SSW_D0]], %[[SSW_C16]] : index
+    // CHECK: %[[SSW_D1:.*]] = memref.dim %[[SSW_PTR]], {{.*}}0
+    // CHECK: %[[SSW_C8:.*]] = arith.constant 8 : index
+    // CHECK: %[[SSW_Q1:.*]] = arith.ceildivui %[[SSW_D1]], %[[SSW_C8]] : index
     %dims:2 = get_index_space_shape %pv : partition_view<tile=(16x8), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]> -> tile<i32>
   }
 
@@ -125,8 +129,9 @@ cuda_tile.module @m {
     %c1 = constant <i32: 1> : tile<i32>
     %tv = make_tensor_view %p, shape = [%m, %n], strides = [%s, 1] : tile<i32> -> tensor_view<?x?xf16, strides=[?,1]>
     %pv = make_partition_view %tv : partition_view<tile=(4x2), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[0, 1]>
-    // CHECK: ub.poison : f16
-    // CHECK: vector.transfer_read
+    // CHECK-SAME: %[[LID_PTR:[a-zA-Z0-9_]+]]: memref<?x?xf16, strided<[?, 1]>>
+    // CHECK: %[[LID_PAD:.*]] = ub.poison : f16
+    // CHECK: %[[LID_TILE:.*]] = vector.transfer_read %[[LID_PTR]]{{.*}}, %[[LID_PAD]] : memref<?x?xf16, strided<[?, 1]>>, vector<4x2xf16>
     // CHECK-NOT: permutation_map
     %tile, %tok = load_view_tko weak %pv[%c0, %c1] : partition_view<tile=(4x2), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[0, 1]>, tile<i32> -> tile<4x2xf16>, token
   }
