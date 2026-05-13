@@ -9,6 +9,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
@@ -115,6 +116,111 @@ getPartitionViewInfo(ConversionPatternRewriter &rewriter, Operation *op,
   info.paddingValue = pvType.getPaddingValue();
 
   return info;
+}
+
+static FailureOr<arith::CmpFPredicate>
+mapCmpFPredicate(cuda_tile::ComparisonPredicate pred,
+                 cuda_tile::ComparisonOrdering ord) {
+  using CP = cuda_tile::ComparisonPredicate;
+  using CO = cuda_tile::ComparisonOrdering;
+  if (ord == CO::ORDERED) {
+    switch (pred) {
+    case CP::EQUAL:
+      return arith::CmpFPredicate::OEQ;
+    case CP::NOT_EQUAL:
+      return arith::CmpFPredicate::ONE;
+    case CP::LESS_THAN:
+      return arith::CmpFPredicate::OLT;
+    case CP::LESS_THAN_OR_EQUAL:
+      return arith::CmpFPredicate::OLE;
+    case CP::GREATER_THAN:
+      return arith::CmpFPredicate::OGT;
+    case CP::GREATER_THAN_OR_EQUAL:
+      return arith::CmpFPredicate::OGE;
+    }
+  }
+  if (ord == CO::UNORDERED) {
+    switch (pred) {
+    case CP::EQUAL:
+      return arith::CmpFPredicate::UEQ;
+    case CP::NOT_EQUAL:
+      return arith::CmpFPredicate::UNE;
+    case CP::LESS_THAN:
+      return arith::CmpFPredicate::ULT;
+    case CP::LESS_THAN_OR_EQUAL:
+      return arith::CmpFPredicate::ULE;
+    case CP::GREATER_THAN:
+      return arith::CmpFPredicate::UGT;
+    case CP::GREATER_THAN_OR_EQUAL:
+      return arith::CmpFPredicate::UGE;
+    }
+  }
+  return failure();
+}
+
+static FailureOr<arith::CmpIPredicate>
+mapCmpIPredicate(cuda_tile::ComparisonPredicate pred,
+                 cuda_tile::Signedness signedness) {
+  using CP = cuda_tile::ComparisonPredicate;
+  bool isUnsigned = signedness == cuda_tile::Signedness::Unsigned;
+  switch (pred) {
+  case CP::EQUAL:
+    return arith::CmpIPredicate::eq;
+  case CP::NOT_EQUAL:
+    return arith::CmpIPredicate::ne;
+  case CP::LESS_THAN:
+    return isUnsigned ? arith::CmpIPredicate::ult : arith::CmpIPredicate::slt;
+  case CP::LESS_THAN_OR_EQUAL:
+    return isUnsigned ? arith::CmpIPredicate::ule : arith::CmpIPredicate::sle;
+  case CP::GREATER_THAN:
+    return isUnsigned ? arith::CmpIPredicate::ugt : arith::CmpIPredicate::sgt;
+  case CP::GREATER_THAN_OR_EQUAL:
+    return isUnsigned ? arith::CmpIPredicate::uge : arith::CmpIPredicate::sge;
+  }
+  return failure();
+}
+
+struct MmaContractionSpec {
+  AffineMap mapA;
+  AffineMap mapB;
+  AffineMap mapC;
+  SmallVector<Attribute> iterTypes;
+};
+
+/// Build vector.contract indexing maps and iterator attributes for
+/// matmul-style contractions used by both mmaf and mmai lowerings.
+///
+/// Supported ranks:
+///   - rank 2 result: unbatched [M, N]
+///   - rank 3 result: batched   [B, M, N]
+static FailureOr<MmaContractionSpec>
+buildMmaContractionSpec(MLIRContext *ctx, int64_t resultRank) {
+  if (resultRank != 2 && resultRank != 3)
+    return failure();
+
+  bool batched = (resultRank == 3);
+  MmaContractionSpec spec;
+
+  auto parAttr =
+      vector::IteratorTypeAttr::get(ctx, vector::IteratorType::parallel);
+  auto redAttr =
+      vector::IteratorTypeAttr::get(ctx, vector::IteratorType::reduction);
+  auto d0 = getAffineDimExpr(0, ctx);
+  auto d1 = getAffineDimExpr(1, ctx);
+  auto d2 = getAffineDimExpr(2, ctx);
+  if (!batched) {
+    spec.mapA = AffineMap::get(3, 0, {d0, d2}, ctx);
+    spec.mapB = AffineMap::get(3, 0, {d2, d1}, ctx);
+    spec.mapC = AffineMap::get(3, 0, {d0, d1}, ctx);
+    spec.iterTypes = {parAttr, parAttr, redAttr};
+  } else {
+    auto d3 = getAffineDimExpr(3, ctx);
+    spec.mapA = AffineMap::get(4, 0, {d0, d1, d3}, ctx);
+    spec.mapB = AffineMap::get(4, 0, {d0, d3, d2}, ctx);
+    spec.mapC = AffineMap::get(4, 0, {d0, d1, d2}, ctx);
+    spec.iterTypes = {parAttr, parAttr, parAttr, redAttr};
+  }
+  return spec;
 }
 
 //===----------------------------------------------------------------------===//
@@ -232,6 +338,232 @@ struct ConvertMulI : public OpConversionPattern<cuda_tile::MulIOp> {
   }
 };
 
+struct ConvertAtan2 : public OpConversionPattern<cuda_tile::Atan2Op> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::Atan2Op op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<math::Atan2Op>(op, adaptor.getX(),
+                                               adaptor.getY());
+    return success();
+  }
+};
+
+template <typename SrcOp, typename DstOp>
+struct ConvertUnarySourceOp : public OpConversionPattern<SrcOp> {
+  using OpConversionPattern<SrcOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(SrcOp op,
+                  typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.template replaceOpWithNewOp<DstOp>(op, adaptor.getSource());
+    return success();
+  }
+};
+
+struct ConvertCmpF : public OpConversionPattern<cuda_tile::CmpFOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::CmpFOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto pred =
+        mapCmpFPredicate(op.getComparisonPredicate(), op.getComparisonOrdering());
+    if (failed(pred))
+      return rewriter.notifyMatchFailure(op,
+                                         "unsupported cmpf predicate/ordering");
+    rewriter.replaceOpWithNewOp<arith::CmpFOp>(op, *pred, adaptor.getLhs(),
+                                               adaptor.getRhs());
+    return success();
+  }
+};
+
+struct ConvertExp2 : public OpConversionPattern<cuda_tile::Exp2Op> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::Exp2Op op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getFlushToZero())
+      return rewriter.notifyMatchFailure(
+          op, "exp2 flush_to_zero is not representable in math.exp2");
+    rewriter.replaceOpWithNewOp<math::Exp2Op>(op, adaptor.getSource());
+    return success();
+  }
+};
+
+struct ConvertMaxF : public OpConversionPattern<cuda_tile::MaxFOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::MaxFOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getFlushToZero())
+      return rewriter.notifyMatchFailure(
+          op,
+          "maxf flush_to_zero is not representable in arith max operations");
+    if (op.getPropagateNan())
+      rewriter.replaceOpWithNewOp<arith::MaximumFOp>(op, adaptor.getLhs(),
+                                                     adaptor.getRhs());
+    else
+      rewriter.replaceOpWithNewOp<arith::MaxNumFOp>(op, adaptor.getLhs(),
+                                                    adaptor.getRhs());
+    return success();
+  }
+};
+
+struct ConvertMinF : public OpConversionPattern<cuda_tile::MinFOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::MinFOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getFlushToZero())
+      return rewriter.notifyMatchFailure(
+          op,
+          "minf flush_to_zero is not representable in arith min operations");
+    if (op.getPropagateNan())
+      rewriter.replaceOpWithNewOp<arith::MinimumFOp>(op, adaptor.getLhs(),
+                                                     adaptor.getRhs());
+    else
+      rewriter.replaceOpWithNewOp<arith::MinNumFOp>(op, adaptor.getLhs(),
+                                                    adaptor.getRhs());
+    return success();
+  }
+};
+
+struct ConvertPow : public OpConversionPattern<cuda_tile::PowOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::PowOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<math::PowFOp>(op, adaptor.getSource(),
+                                              adaptor.getExponent());
+    return success();
+  }
+};
+
+struct ConvertRsqrt : public OpConversionPattern<cuda_tile::RsqrtOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::RsqrtOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getFlushToZero())
+      return rewriter.notifyMatchFailure(
+          op, "rsqrt flush_to_zero is not representable in math.rsqrt");
+    rewriter.replaceOpWithNewOp<math::RsqrtOp>(op, adaptor.getSource());
+    return success();
+  }
+};
+
+struct ConvertTanH : public OpConversionPattern<cuda_tile::TanHOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::TanHOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getRoundingMode() != cuda_tile::RoundingMode::FULL)
+      return rewriter.notifyMatchFailure(
+          op, "tanh rounding<approx> is not representable in math.tanh");
+    rewriter.replaceOpWithNewOp<math::TanhOp>(op, adaptor.getSource());
+    return success();
+  }
+};
+
+struct ConvertCmpI : public OpConversionPattern<cuda_tile::CmpIOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::CmpIOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto pred = mapCmpIPredicate(op.getComparisonPredicate(), op.getSignedness());
+    if (failed(pred))
+      return rewriter.notifyMatchFailure(op,
+                                         "unsupported cmpi predicate/signedness");
+    rewriter.replaceOpWithNewOp<arith::CmpIOp>(op, *pred, adaptor.getLhs(),
+                                               adaptor.getRhs());
+    return success();
+  }
+};
+
+struct ConvertMaxI : public OpConversionPattern<cuda_tile::MaxIOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::MaxIOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getSignedness() == cuda_tile::Signedness::Unsigned)
+      rewriter.replaceOpWithNewOp<arith::MaxUIOp>(op, adaptor.getLhs(),
+                                                  adaptor.getRhs());
+    else
+      rewriter.replaceOpWithNewOp<arith::MaxSIOp>(op, adaptor.getLhs(),
+                                                  adaptor.getRhs());
+    return success();
+  }
+};
+
+struct ConvertMinI : public OpConversionPattern<cuda_tile::MinIOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::MinIOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getSignedness() == cuda_tile::Signedness::Unsigned)
+      rewriter.replaceOpWithNewOp<arith::MinUIOp>(op, adaptor.getLhs(),
+                                                  adaptor.getRhs());
+    else
+      rewriter.replaceOpWithNewOp<arith::MinSIOp>(op, adaptor.getLhs(),
+                                                  adaptor.getRhs());
+    return success();
+  }
+};
+
+struct ConvertMulhiI : public OpConversionPattern<cuda_tile::MulhiIOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::MulhiIOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto ext = arith::MulUIExtendedOp::create(rewriter, op.getLoc(),
+                                              adaptor.getX(), adaptor.getY());
+    rewriter.replaceOp(op, ext.getHigh());
+    return success();
+  }
+};
+
+struct ConvertNegI : public OpConversionPattern<cuda_tile::NegIOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::NegIOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type ty = adaptor.getSource().getType();
+    auto zeroAttr = rewriter.getZeroAttr(ty);
+    if (!zeroAttr)
+      return rewriter.notifyMatchFailure(op,
+                                         "cannot create zero value for negi source type");
+    Value zero = arith::ConstantOp::create(rewriter, op.getLoc(), ty, zeroAttr);
+    rewriter.replaceOpWithNewOp<arith::SubIOp>(op, zero, adaptor.getSource());
+    return success();
+  }
+};
+
+struct ConvertXOrI : public OpConversionPattern<cuda_tile::XOrIOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::XOrIOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<arith::XOrIOp>(op, adaptor.getLhs(),
+                                               adaptor.getRhs());
+    return success();
+  }
+};
+
 /// Convert cuda_tile.for to scf.for.
 ///   1. Create scf.ForOp with converted bounds and initial values.
 ///   2. Convert region types in old body using type converter.
@@ -322,45 +654,51 @@ struct ConvertMmaF : public OpConversionPattern<cuda_tile::MmaFOp> {
       return failure();
 
     auto vecResultTy = cast<VectorType>(resultType);
-    int64_t rank = vecResultTy.getRank();
-    if (rank != 2 && rank != 3)
-      return rewriter.notifyMatchFailure(
-          op,
-          "only 2D or 3D (batched) mmaf is supported");
-
-    auto *ctx = rewriter.getContext();
-    bool batched = (rank == 3);
-
-    // Iteration space:
-    //   Unbatched (3 dims): d0=m, d1=n, d2=k
-    //   Batched   (4 dims): d0=b, d1=m, d2=n, d3=k
-    AffineMap mapA, mapB, mapC;
-    SmallVector<Attribute> iterTypes;
-    auto parAttr =
-        vector::IteratorTypeAttr::get(ctx, vector::IteratorType::parallel);
-    auto redAttr =
-        vector::IteratorTypeAttr::get(ctx, vector::IteratorType::reduction);
-    auto d0 = getAffineDimExpr(0, ctx);
-    auto d1 = getAffineDimExpr(1, ctx);
-    auto d2 = getAffineDimExpr(2, ctx);
-    if (!batched) {
-      mapA = AffineMap::get(3, 0, {d0, d2}, ctx);
-      mapB = AffineMap::get(3, 0, {d2, d1}, ctx);
-      mapC = AffineMap::get(3, 0, {d0, d1}, ctx);
-      iterTypes = {parAttr, parAttr, redAttr};
-    } else {
-      auto d3 = getAffineDimExpr(3, ctx);
-      mapA = AffineMap::get(4, 0, {d0, d1, d3}, ctx);
-      mapB = AffineMap::get(4, 0, {d0, d3, d2}, ctx);
-      mapC = AffineMap::get(4, 0, {d0, d1, d2}, ctx);
-      iterTypes = {parAttr, parAttr, parAttr, redAttr};
-    }
+    auto spec = buildMmaContractionSpec(rewriter.getContext(),
+                                        vecResultTy.getRank());
+    if (failed(spec))
+      return rewriter.notifyMatchFailure(op,
+                                         "only 2D or 3D (batched) mmaf is supported");
 
     // Explicit combining kind = add (mmaf is multiply-accumulate).
     rewriter.replaceOpWithNewOp<vector::ContractionOp>(
         op, adaptor.getLhs(), adaptor.getRhs(), adaptor.getAcc(),
-        rewriter.getAffineMapArrayAttr({mapA, mapB, mapC}),
-        rewriter.getArrayAttr(iterTypes), vector::CombiningKind::ADD);
+        rewriter.getAffineMapArrayAttr({spec->mapA, spec->mapB, spec->mapC}),
+        rewriter.getArrayAttr(spec->iterTypes), vector::CombiningKind::ADD);
+    return success();
+  }
+};
+
+/// Convert cuda_tile.mmai to vector.contract (matmul-style contraction).
+///
+/// Source-op semantics (from cuda_tile.mmai verifier):
+///   Unbatched: lhs[M,K] x rhs[K,N] + acc[M,N] -> result[M,N]
+///   Batched:   lhs[B,M,K] x rhs[B,K,N] + acc[B,M,N] -> result[B,M,N]
+///
+/// Lowering mirrors mmaf and uses the same indexing-map / iterator builder.
+/// The only semantic difference here is element type domain (integer).
+struct ConvertMmaI : public OpConversionPattern<cuda_tile::MmaIOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::MmaIOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto resultType = getTypeConverter()->convertType(op.getType());
+    if (!resultType)
+      return failure();
+
+    auto vecResultTy = cast<VectorType>(resultType);
+    auto spec = buildMmaContractionSpec(rewriter.getContext(),
+                                        vecResultTy.getRank());
+    if (failed(spec))
+      return rewriter.notifyMatchFailure(op,
+                                         "only 2D or 3D (batched) mmai is supported");
+
+    // Explicit combining kind = add (mmai is integer multiply-accumulate).
+    rewriter.replaceOpWithNewOp<vector::ContractionOp>(
+        op, adaptor.getLhs(), adaptor.getRhs(), adaptor.getAcc(),
+        rewriter.getAffineMapArrayAttr({spec->mapA, spec->mapB, spec->mapC}),
+        rewriter.getArrayAttr(spec->iterTypes), vector::CombiningKind::ADD);
     return success();
   }
 };
@@ -461,6 +799,77 @@ static Value makePaddingValue(OpBuilder &b, Location loc, Type elemTy,
   return arith::ConstantFloatOp::create(b, loc, fty, val);
 }
 
+template <typename TkoOp>
+static LogicalResult checkCommonTkoGuards(TkoOp op,
+                                          ConversionPatternRewriter &rewriter) {
+  if (op.getMemoryOrderingSemantics() !=
+      cuda_tile::MemoryOrderingSemantics::WEAK)
+    return rewriter.notifyMatchFailure(
+        op, "only `weak` memory_ordering_semantics is supported");
+  if (op.getMemoryScope())
+    return rewriter.notifyMatchFailure(
+        op, "memory_scope is not supported by this lowering");
+  if (!op.getResultToken().use_empty())
+    return rewriter.notifyMatchFailure(
+        op, "result_token has live uses; this lowering drops the token");
+  return success();
+}
+
+struct TransferViewAccessPlan {
+  PartitionViewInfo pvInfo;
+  SmallVector<Value> memrefIndices;
+  AffineMap permutationMap;
+  SmallVector<bool> inBounds;
+};
+
+static FailureOr<TransferViewAccessPlan> buildTransferViewAccessPlan(
+    ConversionPatternRewriter &rewriter, Operation *op, Value view,
+    VectorType vecTy, ValueRange convertedIndices, const TensorViewMap &tvMap) {
+  auto pvInfo = getPartitionViewInfo(rewriter, op, view, tvMap);
+  if (failed(pvInfo))
+    return failure();
+
+  unsigned tileRank = pvInfo->tileShape.size();
+  unsigned tensorRank = pvInfo->tensorViewRank;
+
+  if ((unsigned)vecTy.getRank() != tileRank)
+    return rewriter.notifyMatchFailure(
+        op, "converted tile rank does not match partition tile_shape rank");
+
+  Location loc = op->getLoc();
+  auto *ctx = rewriter.getContext();
+
+  // Build memref indices in tensor-dimension order.
+  Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+  SmallVector<Value> memrefIndices(tensorRank, zero);
+  for (unsigned i = 0; i < tileRank; ++i) {
+    unsigned tensorDim = pvInfo->dimMap[i];
+    int64_t tileSize = pvInfo->tileShape[i];
+    Value tileSizeVal = arith::ConstantIndexOp::create(rewriter, loc, tileSize);
+    Value elemOffset =
+        arith::MulIOp::create(rewriter, loc, convertedIndices[i], tileSizeVal);
+    memrefIndices[tensorDim] = elemOffset;
+  }
+
+  SmallVector<AffineExpr> permExprs;
+  permExprs.reserve(tileRank);
+  for (int32_t td : pvInfo->dimMap)
+    permExprs.push_back(getAffineDimExpr(td, ctx));
+  auto permutationMap = AffineMap::get(tensorRank, 0, permExprs, ctx);
+
+  auto memrefTy = cast<MemRefType>(pvInfo->memref.getType());
+  auto memrefShape = memrefTy.getShape();
+  SmallVector<bool> inBounds(tileRank, false);
+  for (unsigned i = 0; i < tileRank; ++i) {
+    int64_t ms = memrefShape[pvInfo->dimMap[i]];
+    int64_t ts = pvInfo->tileShape[i];
+    inBounds[i] = (ms != ShapedType::kDynamic && ts > 0 && (ms % ts) == 0);
+  }
+
+  return TransferViewAccessPlan{*pvInfo, std::move(memrefIndices), permutationMap,
+                                std::move(inBounds)};
+}
+
 /// Convert cuda_tile.load_view_tko to vector.transfer_read.
 ///
 /// Mapping summary:
@@ -494,83 +903,23 @@ struct ConvertLoadViewTko
   matchAndRewrite(cuda_tile::LoadViewTkoOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    auto *ctx = rewriter.getContext();
-
-    // Guard: unsupported memory ordering / scope.
-    if (op.getMemoryOrderingSemantics() !=
-        cuda_tile::MemoryOrderingSemantics::WEAK)
-      return rewriter.notifyMatchFailure(
-        op,
-          "only `weak` memory_ordering_semantics is supported");
-    if (op.getMemoryScope())
-      return rewriter.notifyMatchFailure(
-        op,
-          "memory_scope is not supported by this lowering");
-
-    // Guard: token result must be unused (we cannot materialize a token).
-    if (!op.getResultToken().use_empty())
-      return rewriter.notifyMatchFailure(
-          op,
-          "result_token has live uses; this lowering drops the token");
-
-    auto pvInfo = getPartitionViewInfo(rewriter, op, op.getView(), tvMap);
-    if (failed(pvInfo))
+    if (failed(checkCommonTkoGuards(op, rewriter)))
       return failure();
 
     auto vecTy = cast<VectorType>(
         getTypeConverter()->convertType(op.getTile().getType()));
 
-    auto convertedIndices = adaptor.getIndex();
-    unsigned tileRank = pvInfo->tileShape.size();
-    unsigned tensorRank = pvInfo->tensorViewRank;
-
-    if ((unsigned)vecTy.getRank() != tileRank)
-      return rewriter.notifyMatchFailure(
-          op,
-          "converted tile rank does not match partition tile_shape rank");
-
-    // Build memref indices in tensor-dimension order.
-    Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
-    SmallVector<Value> memrefIndices(tensorRank, zero);
-    for (unsigned i = 0; i < tileRank; ++i) {
-      unsigned tensorDim = pvInfo->dimMap[i];
-      int64_t tileSize = pvInfo->tileShape[i];
-      Value tileSizeVal =
-          arith::ConstantIndexOp::create(rewriter, loc, tileSize);
-        Value elemOffset = arith::MulIOp::create(
-          rewriter, loc, convertedIndices[i], tileSizeVal);
-      memrefIndices[tensorDim] = elemOffset;
-    }
-
-    // permutation_map: (d0,...,d_{tensorRank-1}) -> (d_{dimMap[0]},...,
-    // d_{dimMap[tileRank-1]}). This makes vector dim i correspond to memref
-    // dim dimMap[i], handling both transposed dim_map and partial-rank tiles
-    // (tileRank < tensorRank) without an extra vector.transpose.
-    SmallVector<AffineExpr> permExprs;
-    permExprs.reserve(tileRank);
-    for (int32_t td : pvInfo->dimMap)
-      permExprs.push_back(getAffineDimExpr(td, ctx));
-    auto permMap = AffineMap::get(tensorRank, 0, permExprs, ctx);
-
-    // inBounds[i] is true only when we can statically prove the tile fits in
-    // the corresponding memref dim. Otherwise transfer_read masks and uses
-    // the padding value for OOB lanes.
-    auto memrefTy = cast<MemRefType>(pvInfo->memref.getType());
-    auto memrefShape = memrefTy.getShape();
-    SmallVector<bool> inBounds(tileRank, false);
-    for (unsigned i = 0; i < tileRank; ++i) {
-      int64_t ms = memrefShape[pvInfo->dimMap[i]];
-      int64_t ts = pvInfo->tileShape[i];
-      inBounds[i] =
-          (ms != ShapedType::kDynamic && ts > 0 && (ms % ts) == 0);
-    }
+    auto plan = buildTransferViewAccessPlan(rewriter, op, op.getView(), vecTy,
+                                            adaptor.getIndex(), tvMap);
+    if (failed(plan))
+      return failure();
 
     Value padding = makePaddingValue(rewriter, loc, vecTy.getElementType(),
-                                     pvInfo->paddingValue);
+                                     plan->pvInfo.paddingValue);
     auto readOp = vector::TransferReadOp::create(
-        rewriter, loc, vecTy, pvInfo->memref, memrefIndices,
-        AffineMapAttr::get(permMap), padding,
-      /*mask=*/Value(), rewriter.getBoolArrayAttr(inBounds));
+        rewriter, loc, vecTy, plan->pvInfo.memref, plan->memrefIndices,
+        AffineMapAttr::get(plan->permutationMap), padding,
+        /*mask=*/Value(), rewriter.getBoolArrayAttr(plan->inBounds));
 
     // result_token has no live uses (guarded above); drop it.
     rewriter.replaceOp(op, {readOp.getResult(), Value()});
@@ -606,72 +955,22 @@ struct ConvertStoreViewTko
   matchAndRewrite(cuda_tile::StoreViewTkoOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    auto *ctx = rewriter.getContext();
-
-    if (op.getMemoryOrderingSemantics() !=
-        cuda_tile::MemoryOrderingSemantics::WEAK)
-      return rewriter.notifyMatchFailure(
-        op,
-          "only `weak` memory_ordering_semantics is supported");
-    if (op.getMemoryScope())
-      return rewriter.notifyMatchFailure(
-        op,
-          "memory_scope is not supported by this lowering");
-    if (!op.getResultToken().use_empty())
-      return rewriter.notifyMatchFailure(
-        op,
-          "result_token has live uses; this lowering drops the token");
-
-    auto pvInfo = getPartitionViewInfo(rewriter, op, op.getView(), tvMap);
-    if (failed(pvInfo))
+    if (failed(checkCommonTkoGuards(op, rewriter)))
       return failure();
 
     auto vecTy = cast<VectorType>(
         getTypeConverter()->convertType(op.getTile().getType()));
 
-    auto convertedIndices = adaptor.getIndex();
-    unsigned tileRank = pvInfo->tileShape.size();
-    unsigned tensorRank = pvInfo->tensorViewRank;
-
-    if ((unsigned)vecTy.getRank() != tileRank)
-      return rewriter.notifyMatchFailure(
-          op,
-          "converted tile rank does not match partition tile_shape rank");
-
-    // Build memref indices in tensor-dimension order.
-    Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
-    SmallVector<Value> memrefIndices(tensorRank, zero);
-    for (unsigned i = 0; i < tileRank; ++i) {
-      unsigned tensorDim = pvInfo->dimMap[i];
-      int64_t tileSize = pvInfo->tileShape[i];
-      Value tileSizeVal =
-          arith::ConstantIndexOp::create(rewriter, loc, tileSize);
-        Value elemOffset = arith::MulIOp::create(
-          rewriter, loc, convertedIndices[i], tileSizeVal);
-      memrefIndices[tensorDim] = elemOffset;
-    }
-
-    // permutation_map: vector dim i corresponds to memref dim dimMap[i].
-    SmallVector<AffineExpr> permExprs;
-    permExprs.reserve(tileRank);
-    for (int32_t td : pvInfo->dimMap)
-      permExprs.push_back(getAffineDimExpr(td, ctx));
-    auto permMap = AffineMap::get(tensorRank, 0, permExprs, ctx);
-
-    auto memrefTy = cast<MemRefType>(pvInfo->memref.getType());
-    auto memrefShape = memrefTy.getShape();
-    SmallVector<bool> inBounds(tileRank, false);
-    for (unsigned i = 0; i < tileRank; ++i) {
-      int64_t ms = memrefShape[pvInfo->dimMap[i]];
-      int64_t ts = pvInfo->tileShape[i];
-      inBounds[i] =
-          (ms != ShapedType::kDynamic && ts > 0 && (ms % ts) == 0);
-    }
+    auto plan = buildTransferViewAccessPlan(rewriter, op, op.getView(), vecTy,
+                                            adaptor.getIndex(), tvMap);
+    if (failed(plan))
+      return failure();
 
     auto writeOp = vector::TransferWriteOp::create(
         rewriter, loc, /*resultTypes=*/TypeRange{}, adaptor.getTile(),
-        pvInfo->memref, memrefIndices, AffineMapAttr::get(permMap),
-        /*mask=*/Value(), rewriter.getBoolArrayAttr(inBounds));
+        plan->pvInfo.memref, plan->memrefIndices,
+        AffineMapAttr::get(plan->permutationMap),
+        /*mask=*/Value(), rewriter.getBoolArrayAttr(plan->inBounds));
     (void)writeOp;
 
     rewriter.eraseOp(op);
@@ -975,8 +1274,23 @@ static void populateTileIRToGPUConversionPatterns(
   MLIRContext *ctx = patterns.getContext();
   // Patterns that don't need the tvMap.
   patterns.add<ConvertModule, ConvertConstant, ConvertGetTileBlockId,
-               ConvertMulI, ConvertFor, ConvertContinue, ConvertReturn,
-               ConvertMmaF, ConvertAssume>(converter, ctx);
+               ConvertMulI, ConvertAtan2,
+               ConvertUnarySourceOp<cuda_tile::CeilOp, math::CeilOp>,
+               ConvertCmpF,
+               ConvertUnarySourceOp<cuda_tile::CosOp, math::CosOp>,
+               ConvertExp2,
+               ConvertUnarySourceOp<cuda_tile::ExpOp, math::ExpOp>,
+               ConvertUnarySourceOp<cuda_tile::FloorOp, math::FloorOp>,
+               ConvertUnarySourceOp<cuda_tile::Log2Op, math::Log2Op>,
+               ConvertMaxF, ConvertMinF,
+               ConvertUnarySourceOp<cuda_tile::NegFOp, arith::NegFOp>,
+               ConvertPow, ConvertRsqrt,
+               ConvertUnarySourceOp<cuda_tile::SinOp, math::SinOp>,
+               ConvertTanH,
+               ConvertCmpI, ConvertMaxI, ConvertMinI, ConvertMmaI,
+               ConvertMulhiI, ConvertNegI, ConvertXOrI, ConvertFor,
+               ConvertContinue, ConvertReturn, ConvertMmaF,
+               ConvertAssume>(converter, ctx);
   // Patterns that need the tvMap.
   patterns.add<ConvertEntry, ConvertGetIndexSpaceShape, ConvertLoadViewTko,
                ConvertStoreViewTko>(converter, ctx, tvMap);
@@ -1001,6 +1315,7 @@ struct ConvertTileIRToGPUPass
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<cuda_tile::CudaTileDialect>();
     registry.insert<arith::ArithDialect>();
+    registry.insert<math::MathDialect>();
     registry.insert<vector::VectorDialect>();
     registry.insert<scf::SCFDialect>();
     registry.insert<memref::MemRefDialect>();
@@ -1031,6 +1346,7 @@ struct ConvertTileIRToGPUPass
 
     // GPU/vector/arith/scf/memref/ub ops are legal.
     target.addLegalDialect<arith::ArithDialect, gpu::GPUDialect,
+                 math::MathDialect,
                            memref::MemRefDialect, scf::SCFDialect,
                            ub::UBDialect, vector::VectorDialect>();
     target.addLegalOp<UnrealizedConversionCastOp>();
