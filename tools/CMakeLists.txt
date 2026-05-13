@@ -1,0 +1,22 @@
+add_executable(cudatile-to-gpu
+  cudatile-to-gpu.cpp
+)
+
+target_link_libraries(cudatile-to-gpu
+  PRIVATE
+  CudaTileToGPU
+  MLIROptLib
+  MLIRArithDialect
+  MLIRFuncDialect
+  MLIRGPUDialect
+  MLIRMemRefDialect
+  MLIRSCFDialect
+  MLIRUBDialect
+  MLIRVectorDialect
+  MLIRTransforms
+  MLIRTransformUtils
+  MLIRPass
+  MLIRIR
+  MLIRSupport
+  CudaTileDialect
+)
