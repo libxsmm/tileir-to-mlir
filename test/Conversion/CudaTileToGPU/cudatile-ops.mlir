@@ -470,4 +470,47 @@ cuda_tile.module @ops_module {
 
     return
   }
+
+  // --- if ---
+  // CHECK-LABEL: gpu.func @test_if
+  entry @test_if() {
+    // CHECK: %[[COND:.*]] = arith.constant true
+    %condition = constant <i1: 1> : tile<i1>
+
+    // Simple if with no results.
+    // CHECK: scf.if %[[COND]] {
+    // CHECK: }
+    if %condition {
+    }
+
+    // If with else, no results.
+    // CHECK: scf.if %[[COND]] {
+    // CHECK: } else {
+    // CHECK: }
+    if %condition {
+    } else {
+    }
+
+    // If with else, returning mixed types (f32, i32).
+    // CHECK: %[[IF_RES:.*]]:2 = scf.if %[[COND]] -> (f32, i32) {
+    // CHECK:   %[[XT:.*]] = arith.constant 1.000000e+00 : f32
+    // CHECK:   %[[YT:.*]] = arith.constant 2 : i32
+    // CHECK:   scf.yield %[[XT]], %[[YT]] : f32, i32
+    // CHECK: } else {
+    // CHECK:   %[[XE:.*]] = arith.constant 1.000000e+00 : f32
+    // CHECK:   %[[YE:.*]] = arith.constant 42 : i32
+    // CHECK:   scf.yield %[[XE]], %[[YE]] : f32, i32
+    // CHECK: }
+    %x, %y = if %condition -> (tile<f32>, tile<i32>) {
+      %x_then = constant <f32: 1.0> : tile<f32>
+      %y_then = constant <i32: 2> : tile<i32>
+      yield %x_then, %y_then : tile<f32>, tile<i32>
+    } else {
+      %x_else = constant <f32: 1.0> : tile<f32>
+      %y_else = constant <i32: 42> : tile<i32>
+      yield %x_else, %y_else : tile<f32>, tile<i32>
+    }
+
+    return
+  }
 }

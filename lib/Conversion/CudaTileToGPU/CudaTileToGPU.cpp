@@ -597,14 +597,56 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
   }
 };
 
-/// Convert cuda_tile.continue to scf.yield.
-struct ConvertContinue : public OpConversionPattern<cuda_tile::ContinueOp> {
+/// Convert cuda_tile terminators (continue / yield) to scf.yield.
+template <typename SrcOp>
+struct ConvertToScfYield : public OpConversionPattern<SrcOp> {
+  using OpConversionPattern<SrcOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(SrcOp op,
+                  typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.template replaceOpWithNewOp<scf::YieldOp>(op,
+                                                       adaptor.getOperands());
+    return success();
+  }
+};
+
+/// Convert cuda_tile.if to scf.if.
+struct ConvertIf : public OpConversionPattern<cuda_tile::IfOp> {
   using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
-  matchAndRewrite(cuda_tile::ContinueOp op, OpAdaptor adaptor,
+  matchAndRewrite(cuda_tile::IfOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<scf::YieldOp>(op, adaptor.getOperands());
+    SmallVector<Type> resultTypes;
+    if (failed(
+            getTypeConverter()->convertTypes(op.getResultTypes(), resultTypes)))
+      return rewriter.notifyMatchFailure(op, "cannot convert if result types");
+
+    bool hasElse = !op.getElseRegion().empty();
+    auto newIfOp = scf::IfOp::create(rewriter, op.getLoc(), resultTypes,
+                                     adaptor.getCondition(), hasElse);
+
+    // Move then region.
+    {
+      Block *oldBlock = op.getThenBlock();
+      Block *newBlock = newIfOp.thenBlock();
+      if (newBlock->mightHaveTerminator())
+        rewriter.eraseOp(newBlock->getTerminator());
+      rewriter.mergeBlocks(oldBlock, newBlock, {});
+    }
+
+    // Move else region (if present).
+    if (hasElse) {
+      Block *oldBlock = op.getElseBlock();
+      Block *newBlock = newIfOp.elseBlock();
+      if (newBlock->mightHaveTerminator())
+        rewriter.eraseOp(newBlock->getTerminator());
+      rewriter.mergeBlocks(oldBlock, newBlock, {});
+    }
+
+    rewriter.replaceOp(op, newIfOp.getResults());
     return success();
   }
 };
@@ -1282,10 +1324,10 @@ static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
            ConvertMinMaxIOp<cuda_tile::MinIOp, /*IsMax=*/false>, ConvertMmaI,
            ConvertMulhiI, ConvertNegI,
            ConvertBinaryLhsRhsOp<cuda_tile::XOrIOp, arith::XOrIOp>, ConvertFor,
-           ConvertContinue, ConvertReturn, ConvertMmaF, ConvertAssume,
-           ConvertReshape, ConvertGetIndexSpaceShape, ConvertLoadViewTko,
-           ConvertStoreViewTko>(
-          converter, ctx);
+           ConvertIf, ConvertToScfYield<cuda_tile::ContinueOp>,
+           ConvertToScfYield<cuda_tile::YieldOp>, ConvertReturn, ConvertMmaF,
+           ConvertAssume, ConvertReshape, ConvertGetIndexSpaceShape,
+           ConvertLoadViewTko, ConvertStoreViewTko>(converter, ctx);
 }
 
 //===----------------------------------------------------------------------===//
