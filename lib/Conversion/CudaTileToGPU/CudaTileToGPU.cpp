@@ -26,29 +26,54 @@
 
 using namespace mlir;
 
-//===----------------------------------------------------------------------===//
-// Metadata populated during preprocessing
-//===----------------------------------------------------------------------===//
-
 namespace {
 
-/// Metadata for a tensor_view, populated during analysis before any IR
-/// mutation.
-struct TensorViewMetadata {
-  Value baseValue;     // Root base pointer SSA value (may or may not be a
-                       // BlockArgument)
-  MemRefType memrefTy; // The memref type derived from tensor_view
-                       // shape/strides
-  Value memref;        // The gpu.func memref argument (set during entry
-                       // conversion)
-};
+/// Derive the ranked MemRefType that corresponds to a tensor_view type.
+/// If the tensor_view describes a default contiguous row-major layout with
+/// fully static shape/strides, a plain (layout-free) memref is returned;
+/// otherwise a strided-layout memref is returned (which also covers any
+/// dynamic shape or stride).
+static MemRefType tensorViewToMemRefType(cuda_tile::TensorViewType tvTy) {
+  auto shape = tvTy.getShape();
+  auto strides = tvTy.getStrides();
+  Type elemTy = tvTy.getElementType();
+  unsigned rank = shape.size();
 
-/// Map from make_tensor_view Operation* to its metadata.
-using TensorViewMap = DenseMap<Operation *, TensorViewMetadata>;
+  bool isDefaultLayout = true;
+  if (rank == 0) {
+    isDefaultLayout = true;
+  } else {
+    for (unsigned i = 0; i < rank; ++i) {
+      if (strides[i] == ShapedType::kDynamic ||
+          shape[i] == ShapedType::kDynamic) {
+        isDefaultLayout = false;
+        break;
+      }
+    }
+    if (isDefaultLayout) {
+      int64_t expected = 1;
+      for (int i = rank - 1; i >= 0; --i) {
+        if (strides[i] != expected) {
+          isDefaultLayout = false;
+          break;
+        }
+        expected *= shape[i];
+      }
+    }
+  }
 
-/// Information about a partition view extracted from the IR.
+  SmallVector<int64_t> memrefShape(shape.begin(), shape.end());
+  if (isDefaultLayout)
+    return MemRefType::get(memrefShape, elemTy);
+  SmallVector<int64_t> memrefStrides(strides.begin(), strides.end());
+  auto layout =
+      StridedLayoutAttr::get(elemTy.getContext(), /*offset=*/0, memrefStrides);
+  return MemRefType::get(memrefShape, elemTy, layout);
+}
+
+/// Information extracted from a partition_view operand at a use site.
 struct PartitionViewInfo {
-  Value memref;                   // The memref value in the converted IR
+  Value memref;                   // Converted memref backing the partition view
   SmallVector<int64_t> tileShape; // Tile dimensions
   SmallVector<int32_t> dimMap;    // Mapping from tile dims to tensor_view dims
   unsigned tensorViewRank;        // Rank of the underlying tensor_view
@@ -57,63 +82,17 @@ struct PartitionViewInfo {
   cuda_tile::PaddingValueAttr paddingValue;
 };
 
-/// Trace through assume ops to find the defining op.
-static Value traceToDefThroughAssumes(Value val) {
-  while (val) {
-    if (auto assumeOp =
-            dyn_cast_or_null<cuda_tile::AssumeOp>(val.getDefiningOp())) {
-      val = assumeOp.getValue();
-      continue;
-    }
-    break;
-  }
-  return val;
-}
-
-/// Resolve a partition_view SSA value to a PartitionViewInfo:
-/// walk back from `partitionView` to its defining `make_partition_view` and
-/// the underlying `make_tensor_view`, look up the latter in `tvMap`, and
-/// collect the tile shape, dim_map, tensor-view rank, and the converted
-/// memref.
-static FailureOr<PartitionViewInfo>
-getPartitionViewInfo(ConversionPatternRewriter &rewriter, Operation *op,
-                     Value partitionView, const TensorViewMap &tvMap) {
-  auto pvOp = dyn_cast_or_null<cuda_tile::MakePartitionViewOp>(
-      partitionView.getDefiningOp());
-  if (!pvOp)
-    return rewriter.notifyMatchFailure(
-        op,
-        "partition view operand is not defined by a make_partition_view op");
-
-  auto tvOp = dyn_cast_or_null<cuda_tile::MakeTensorViewOp>(
-      pvOp.getTensorView().getDefiningOp());
-  if (!tvOp)
-    return rewriter.notifyMatchFailure(
-        op, "underlying tensor view is not defined by a make_tensor_view op");
-
-  auto it = tvMap.find(tvOp.getOperation());
-  if (it == tvMap.end())
-    return rewriter.notifyMatchFailure(
-        op,
-        "make_tensor_view not present in TensorViewMap (analysis missed it)");
-
-  if (!it->second.memref)
-    return rewriter.notifyMatchFailure(
-        op, "tensor view has no associated memref yet "
-            "(cuda_tile.entry not yet converted to gpu.func)");
-
-  auto pvType = cast<cuda_tile::PartitionViewType>(pvOp.getType());
-  auto tvType = pvType.getTensorView();
-
+/// Extract partition-view layout info from `view`'s type and pair it with the
+/// already type-converted memref `convertedView`.
+static PartitionViewInfo getPartitionViewInfo(Value view, Value convertedView) {
+  auto pvType = cast<cuda_tile::PartitionViewType>(view.getType());
   PartitionViewInfo info;
-  auto tileShapeAttr = pvType.getTileShape();
-  for (auto v : tileShapeAttr.asArrayRef())
+  info.memref = convertedView;
+  for (auto v : pvType.getTileShape().asArrayRef())
     info.tileShape.push_back(v);
   info.dimMap.assign(pvType.getDimMap().begin(), pvType.getDimMap().end());
-  info.tensorViewRank = tvType.getShape().size();
-  info.memref = it->second.memref;
+  info.tensorViewRank = pvType.getTensorView().getShape().size();
   info.paddingValue = pvType.getPaddingValue();
-
   return info;
 }
 
@@ -179,6 +158,16 @@ mapCmpIPredicate(cuda_tile::ComparisonPredicate pred,
   return failure();
 }
 
+static Value castValueToType(OpBuilder &builder, Location loc, Value value,
+                             Type targetType) {
+  if (value.getType() == targetType)
+    return value;
+  if ((isa<IndexType>(value.getType()) && isa<IntegerType>(targetType)) ||
+      (isa<IntegerType>(value.getType()) && isa<IndexType>(targetType)))
+    return arith::IndexCastOp::create(builder, loc, targetType, value);
+  return Value();
+}
+
 struct MmaContractionSpec {
   AffineMap mapA;
   AffineMap mapB;
@@ -224,9 +213,6 @@ buildMmaContractionSpec(MLIRContext *ctx, int64_t resultRank) {
 
 //===----------------------------------------------------------------------===//
 // Conversion Patterns
-//
-// Conversion patterns for MakeTensorView and MakePartitionView are not needed.
-// These ops are kept legal during dialect conversion and cleaned up afterward.
 //===----------------------------------------------------------------------===//
 
 /// Convert cuda_tile.constant to arith/vector constants.
@@ -234,9 +220,8 @@ buildMmaContractionSpec(MLIRContext *ctx, int64_t resultRank) {
 ///   - Ranked tiles: Convert to vector constants
 ///     - Splat values -> vector.broadcast
 ///     - Dense values -> arith.constant with DenseElementsAttr
-///   - Scalar integer conversion must check if target type is IndexType, as
-///   MLIR
-///     uses IndexType for loop bounds and array subscripts.
+///   - Scalar integer conversion preserves the integer type; explicit casts to
+///     `index` are inserted later at the ops that require them.
 ///   - Pointer types in scalar tiles are intermediate and will become dead
 ///   after
 ///     make_tensor_view ops are erased; conversion preserves them as-is.
@@ -261,13 +246,8 @@ struct ConvertConstant : public OpConversionPattern<cuda_tile::ConstantOp> {
       auto elemTy = tileType.getElementType();
       if (isa<IntegerType>(elemTy)) {
         auto splat = denseVal.getSplatValue<APInt>();
-        if (isa<IndexType>(resultType)) {
-          rewriter.replaceOpWithNewOp<arith::ConstantIndexOp>(
-              op, splat.getSExtValue());
-        } else {
-          rewriter.replaceOpWithNewOp<arith::ConstantIntOp>(
-              op, resultType, splat.getSExtValue());
-        }
+        rewriter.replaceOpWithNewOp<arith::ConstantIntOp>(
+            op, resultType, splat.getSExtValue());
       } else if (isa<FloatType>(elemTy)) {
         auto splat = denseVal.getSplatValue<APFloat>();
         rewriter.replaceOpWithNewOp<arith::ConstantFloatOp>(
@@ -315,9 +295,21 @@ struct ConvertGetTileBlockId
   matchAndRewrite(cuda_tile::GetTileBlockIdOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    Value bx = gpu::BlockIdOp::create(rewriter, loc, gpu::Dimension::x);
-    Value by = gpu::BlockIdOp::create(rewriter, loc, gpu::Dimension::y);
-    Value bz = gpu::BlockIdOp::create(rewriter, loc, gpu::Dimension::z);
+    Type resultTy = getTypeConverter()->convertType(op.getResult(0).getType());
+    if (!resultTy)
+      return rewriter.notifyMatchFailure(op, "cannot convert get_tile_block_id result type");
+    Value bx = castValueToType(
+        rewriter, loc,
+        gpu::BlockIdOp::create(rewriter, loc, gpu::Dimension::x), resultTy);
+    Value by = castValueToType(
+        rewriter, loc,
+        gpu::BlockIdOp::create(rewriter, loc, gpu::Dimension::y), resultTy);
+    Value bz = castValueToType(
+        rewriter, loc,
+        gpu::BlockIdOp::create(rewriter, loc, gpu::Dimension::z), resultTy);
+    if (!bx || !by || !bz)
+      return rewriter.notifyMatchFailure(op,
+                                         "cannot cast block ids to result type");
     rewriter.replaceOp(op, {bx, by, bz});
     return success();
   }
@@ -556,9 +548,18 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
   LogicalResult
   matchAndRewrite(cuda_tile::ForOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    Value lb = castValueToType(rewriter, op.getLoc(), adaptor.getLowerBound(),
+                               rewriter.getIndexType());
+    Value ub = castValueToType(rewriter, op.getLoc(), adaptor.getUpperBound(),
+                               rewriter.getIndexType());
+    Value step = castValueToType(rewriter, op.getLoc(), adaptor.getStep(),
+                                 rewriter.getIndexType());
+    if (!lb || !ub || !step)
+      return rewriter.notifyMatchFailure(op,
+                                         "for bounds could not be converted to index");
+
     auto newForOp = scf::ForOp::create(
-        rewriter, op.getLoc(), adaptor.getLowerBound(), adaptor.getUpperBound(),
-        adaptor.getStep(), adaptor.getInitValues());
+        rewriter, op.getLoc(), lb, ub, step, adaptor.getInitValues());
 
     // Convert region types
     if (failed(
@@ -574,7 +575,14 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
       rewriter.eraseOp(newBody->getTerminator());
 
     SmallVector<Value> replacingValues;
-    replacingValues.push_back(newForOp.getInductionVar());
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(newBody);
+    Value iv = castValueToType(rewriter, op.getLoc(), newForOp.getInductionVar(),
+                               oldBody->getArgument(0).getType());
+    if (!iv)
+      return rewriter.notifyMatchFailure(
+          op, "for induction variable could not be converted to body type");
+    replacingValues.push_back(iv);
     for (auto arg : newForOp.getRegionIterArgs())
       replacingValues.push_back(arg);
 
@@ -700,38 +708,40 @@ struct ConvertAssume : public OpConversionPattern<cuda_tile::AssumeOp> {
 /// index_space_shape[i] = ceildiv(tensor_shape[dimMap[i]], tileShape[i]).
 struct ConvertGetIndexSpaceShape
     : public OpConversionPattern<cuda_tile::GetIndexSpaceShapeOp> {
-  const TensorViewMap &tvMap;
-
-  ConvertGetIndexSpaceShape(TypeConverter &tc, MLIRContext *ctx,
-                            const TensorViewMap &tvMap)
-      : OpConversionPattern(tc, ctx), tvMap(tvMap) {}
+  using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::GetIndexSpaceShapeOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    Value srcView = op.getSrc();
-    auto pvInfo = getPartitionViewInfo(rewriter, op, srcView, tvMap);
-    if (failed(pvInfo))
-      return failure();
+    auto pvInfo = getPartitionViewInfo(op.getSrc(), adaptor.getSrc());
 
     Location loc = op.getLoc();
-    unsigned rank = pvInfo->tileShape.size();
+    unsigned rank = pvInfo.tileShape.size();
 
     // For each tile dimension i:
     // - The corresponding tensor_view dimension is dimMap[i]
     // - index_space_dim_i = ceildiv(memref.dim(dimMap[i]), tileShape[i])
     SmallVector<Value> results;
     for (unsigned i = 0; i < rank; ++i) {
-      int64_t tileSize = pvInfo->tileShape[i];
-      unsigned tensorDim = pvInfo->dimMap[i];
+      int64_t tileSize = pvInfo.tileShape[i];
+      unsigned tensorDim = pvInfo.dimMap[i];
       Value dimVal = memref::DimOp::create(
-          rewriter, loc, pvInfo->memref,
+          rewriter, loc, pvInfo.memref,
           arith::ConstantIndexOp::create(rewriter, loc, tensorDim));
       Value tileSizeVal =
           arith::ConstantIndexOp::create(rewriter, loc, tileSize);
       Value divResult =
           arith::CeilDivUIOp::create(rewriter, loc, dimVal, tileSizeVal);
-      results.push_back(divResult);
+        Type resultTy =
+          getTypeConverter()->convertType(op->getResult(i).getType());
+      if (!resultTy)
+        return rewriter.notifyMatchFailure(
+            op, "cannot convert get_index_space_shape result type");
+      Value castedResult = castValueToType(rewriter, loc, divResult, resultTy);
+      if (!castedResult)
+        return rewriter.notifyMatchFailure(
+            op, "cannot cast index_space_shape result to converted type");
+      results.push_back(castedResult);
     }
 
     rewriter.replaceOp(op, results);
@@ -793,6 +803,8 @@ static LogicalResult checkCommonTkoGuards(TkoOp op,
   return success();
 }
 
+/// Keeps the information needed by vector.transfer_read / transfer_write to
+/// access a memref through a partition_view.
 struct TransferViewAccessPlan {
   PartitionViewInfo pvInfo;
   SmallVector<Value> memrefIndices;
@@ -800,15 +812,22 @@ struct TransferViewAccessPlan {
   SmallVector<bool> inBounds;
 };
 
+/// Build a TransferViewAccessPlan for a load_view_tko or store_view_tko.
+///
+/// Translate partition-view tile indices into the concrete memref indices,
+/// permutation map, and in-bounds flags required by vector.transfer_read/write.
+/// 1. Cast each tile-level index to `index` and scale by the tile extent.
+/// 2. Place the scaled index into the memref-dimension slot given by dim_map.
+/// 3. Build a permutation_map that maps memref dims back to tile dims.
+/// 4. Set inBounds[i] = true only when the tensor extent is static and evenly
+///    divisible by the tile extent along that dimension.
 static FailureOr<TransferViewAccessPlan> buildTransferViewAccessPlan(
     ConversionPatternRewriter &rewriter, Operation *op, Value view,
-    VectorType vecTy, ValueRange convertedIndices, const TensorViewMap &tvMap) {
-  auto pvInfo = getPartitionViewInfo(rewriter, op, view, tvMap);
-  if (failed(pvInfo))
-    return failure();
+    Value convertedView, VectorType vecTy, ValueRange convertedIndices) {
+  auto pvInfo = getPartitionViewInfo(view, convertedView);
 
-  unsigned tileRank = pvInfo->tileShape.size();
-  unsigned tensorRank = pvInfo->tensorViewRank;
+  unsigned tileRank = pvInfo.tileShape.size();
+  unsigned tensorRank = pvInfo.tensorViewRank;
 
   if ((unsigned)vecTy.getRank() != tileRank)
     return rewriter.notifyMatchFailure(
@@ -821,30 +840,35 @@ static FailureOr<TransferViewAccessPlan> buildTransferViewAccessPlan(
   Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
   SmallVector<Value> memrefIndices(tensorRank, zero);
   for (unsigned i = 0; i < tileRank; ++i) {
-    unsigned tensorDim = pvInfo->dimMap[i];
-    int64_t tileSize = pvInfo->tileShape[i];
+    unsigned tensorDim = pvInfo.dimMap[i];
+    int64_t tileSize = pvInfo.tileShape[i];
+    Value tileIndex =
+        castValueToType(rewriter, loc, convertedIndices[i], rewriter.getIndexType());
+    if (!tileIndex)
+      return rewriter.notifyMatchFailure(
+          op, "view index could not be converted to index");
     Value tileSizeVal = arith::ConstantIndexOp::create(rewriter, loc, tileSize);
     Value elemOffset =
-        arith::MulIOp::create(rewriter, loc, convertedIndices[i], tileSizeVal);
+        arith::MulIOp::create(rewriter, loc, tileIndex, tileSizeVal);
     memrefIndices[tensorDim] = elemOffset;
   }
 
   SmallVector<AffineExpr> permExprs;
   permExprs.reserve(tileRank);
-  for (int32_t td : pvInfo->dimMap)
+  for (int32_t td : pvInfo.dimMap)
     permExprs.push_back(getAffineDimExpr(td, ctx));
   auto permutationMap = AffineMap::get(tensorRank, 0, permExprs, ctx);
 
-  auto memrefTy = cast<MemRefType>(pvInfo->memref.getType());
+  auto memrefTy = cast<MemRefType>(pvInfo.memref.getType());
   auto memrefShape = memrefTy.getShape();
   SmallVector<bool> inBounds(tileRank, false);
   for (unsigned i = 0; i < tileRank; ++i) {
-    int64_t ms = memrefShape[pvInfo->dimMap[i]];
-    int64_t ts = pvInfo->tileShape[i];
+    int64_t ms = memrefShape[pvInfo.dimMap[i]];
+    int64_t ts = pvInfo.tileShape[i];
     inBounds[i] = (ms != ShapedType::kDynamic && ts > 0 && (ms % ts) == 0);
   }
 
-  return TransferViewAccessPlan{*pvInfo, std::move(memrefIndices),
+  return TransferViewAccessPlan{std::move(pvInfo), std::move(memrefIndices),
                                 permutationMap, std::move(inBounds)};
 }
 
@@ -871,11 +895,7 @@ static FailureOr<TransferViewAccessPlan> buildTransferViewAccessPlan(
 ///     the conversion runs.)
 struct ConvertLoadViewTko
     : public OpConversionPattern<cuda_tile::LoadViewTkoOp> {
-  const TensorViewMap &tvMap;
-
-  ConvertLoadViewTko(TypeConverter &tc, MLIRContext *ctx,
-                     const TensorViewMap &tvMap)
-      : OpConversionPattern(tc, ctx), tvMap(tvMap) {}
+  using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::LoadViewTkoOp op, OpAdaptor adaptor,
@@ -887,8 +907,9 @@ struct ConvertLoadViewTko
     auto vecTy = cast<VectorType>(
         getTypeConverter()->convertType(op.getTile().getType()));
 
-    auto plan = buildTransferViewAccessPlan(rewriter, op, op.getView(), vecTy,
-                                            adaptor.getIndex(), tvMap);
+    auto plan =
+        buildTransferViewAccessPlan(rewriter, op, op.getView(),
+                                    adaptor.getView(), vecTy, adaptor.getIndex());
     if (failed(plan))
       return failure();
 
@@ -923,11 +944,7 @@ struct ConvertLoadViewTko
 ///   - `result_token` must be unused (we drop the token).
 struct ConvertStoreViewTko
     : public OpConversionPattern<cuda_tile::StoreViewTkoOp> {
-  const TensorViewMap &tvMap;
-
-  ConvertStoreViewTko(TypeConverter &tc, MLIRContext *ctx,
-                      const TensorViewMap &tvMap)
-      : OpConversionPattern(tc, ctx), tvMap(tvMap) {}
+  using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::StoreViewTkoOp op, OpAdaptor adaptor,
@@ -939,8 +956,9 @@ struct ConvertStoreViewTko
     auto vecTy = cast<VectorType>(
         getTypeConverter()->convertType(op.getTile().getType()));
 
-    auto plan = buildTransferViewAccessPlan(rewriter, op, op.getView(), vecTy,
-                                            adaptor.getIndex(), tvMap);
+    auto plan =
+        buildTransferViewAccessPlan(rewriter, op, op.getView(),
+                                    adaptor.getView(), vecTy, adaptor.getIndex());
     if (failed(plan))
       return failure();
 
@@ -957,91 +975,107 @@ struct ConvertStoreViewTko
 };
 
 //===----------------------------------------------------------------------===//
-// Preprocessing: cuda_tile.module/entry -> gpu.module/gpu.func
+// View construction: make_tensor_view / make_partition_view
 //===----------------------------------------------------------------------===//
 
-/// Analyze all make_tensor_view ops in the module and populate the
-/// TensorViewMap with their root base values and derived memref types.
-/// The memref value will be set in later conversions when they get
-/// instantiated. This is a read-only analysis step that does not mutate the IR.
-static void buildTensorViewMap(ModuleOp module, TensorViewMap &tvMap) {
-  MLIRContext *ctx = module.getContext();
+/// Convert cuda_tile.make_tensor_view to memref.reinterpret_cast.
+///
+/// The base operand is a scalar `tile<ptr<T>>`, which the type converter maps
+/// to `memref<*xT>`. The tensor_view result type maps to a ranked memref.
+/// Dynamic shape/stride operands of the source op are scalar `tile<i32>`, so
+/// this lowering inserts explicit casts to `index` before building the
+/// memref.reinterpret_cast operands; static dims come from the tensor_view
+/// type.
+struct ConvertMakeTensorView
+    : public OpConversionPattern<cuda_tile::MakeTensorViewOp> {
+  using OpConversionPattern::OpConversionPattern;
 
-  module.walk([&](cuda_tile::MakeTensorViewOp tvOp) {
-    Value base = traceToDefThroughAssumes(tvOp.getBase());
-    // Trace through casts to find the root base value.
-    Value rootBase = base;
-    while (rootBase) {
-      if (isa<BlockArgument>(rootBase))
-        break;
-      if (auto castOp = dyn_cast_or_null<UnrealizedConversionCastOp>(
-              rootBase.getDefiningOp())) {
-        if (castOp.getNumOperands() == 1) {
-          rootBase = castOp.getOperand(0);
-          continue;
-        }
-      }
-      break;
-    }
+  LogicalResult
+  matchAndRewrite(cuda_tile::MakeTensorViewOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto resultTy =
+        dyn_cast_or_null<MemRefType>(getTypeConverter()->convertType(op.getType()));
+    if (!resultTy)
+      return rewriter.notifyMatchFailure(
+          op, "tensor_view did not convert to a ranked memref");
 
-    // Get element type from the base pointer type.
-    auto baseTy = cast<cuda_tile::TileType>(tvOp.getBase().getType());
-    auto ptrTy = cast<cuda_tile::PointerType>(baseTy.getElementType());
-    Type elemTy = ptrTy.getPointeeType();
-
-    auto tvType = cast<cuda_tile::TensorViewType>(tvOp.getType());
+    auto tvType = cast<cuda_tile::TensorViewType>(op.getType());
     auto tvShape = tvType.getShape();
     auto tvStrides = tvType.getStrides();
     unsigned rank = tvShape.size();
 
-    // Build shape/strides for memref type from tensor_view.
-    SmallVector<int64_t> memrefShape(tvShape.begin(), tvShape.end());
-    SmallVector<int64_t> memrefStrides(tvStrides.begin(), tvStrides.end());
+    // Variadic operands hold only the values for the dynamic dims, in
+    // dimension order.
+    auto dynShape = adaptor.getDynamicShape();
+    auto dynStrides = adaptor.getDynamicStrides();
+    unsigned dynShapeIdx = 0, dynStrideIdx = 0;
 
-    // Check if the layout is the default contiguous row-major layout.
-    // If so, use a plain memref without explicit strides.
-    bool isDefaultLayout = true;
-    if (rank > 0) {
-      for (unsigned i = 0; i < rank; ++i) {
-        if (memrefStrides[i] == ShapedType::kDynamic ||
-            memrefShape[i] == ShapedType::kDynamic) {
-          isDefaultLayout = false;
-          break;
-        }
+    SmallVector<OpFoldResult> sizes;
+    sizes.reserve(rank);
+    for (unsigned d = 0; d < rank; ++d) {
+      if (tvShape[d] == ShapedType::kDynamic) {
+        Value size = castValueToType(rewriter, op.getLoc(),
+                                     dynShape[dynShapeIdx++],
+                                     rewriter.getIndexType());
+        if (!size)
+          return rewriter.notifyMatchFailure(
+              op, "dynamic tensor_view shape could not be converted to index");
+        sizes.push_back(size);
       }
-      if (isDefaultLayout) {
-        int64_t expected = 1;
-        for (int i = rank - 1; i >= 0; --i) {
-          if (memrefStrides[i] != expected) {
-            isDefaultLayout = false;
-            break;
-          }
-          expected *= memrefShape[i];
-        }
-      }
+      else
+        sizes.push_back(rewriter.getIndexAttr(tvShape[d]));
     }
 
-    MemRefType memrefTy;
-    if (isDefaultLayout) {
-      memrefTy = MemRefType::get(memrefShape, elemTy);
-    } else {
-      auto layout = StridedLayoutAttr::get(ctx, /*offset=*/0, memrefStrides);
-      memrefTy = MemRefType::get(memrefShape, elemTy, layout);
+    SmallVector<OpFoldResult> strides;
+    strides.reserve(rank);
+    for (unsigned d = 0; d < rank; ++d) {
+      if (tvStrides[d] == ShapedType::kDynamic) {
+        Value stride = castValueToType(rewriter, op.getLoc(),
+                                       dynStrides[dynStrideIdx++],
+                                       rewriter.getIndexType());
+        if (!stride)
+          return rewriter.notifyMatchFailure(
+              op, "dynamic tensor_view stride could not be converted to index");
+        strides.push_back(stride);
+      }
+      else
+        strides.push_back(rewriter.getIndexAttr(tvStrides[d]));
     }
 
-    tvMap[tvOp.getOperation()] = TensorViewMetadata{rootBase, memrefTy, {}};
-  });
-}
+    rewriter.replaceOpWithNewOp<memref::ReinterpretCastOp>(
+        op, resultTy, adaptor.getBase(), /*offset=*/rewriter.getIndexAttr(0),
+        sizes, strides);
+    return success();
+  }
+};
 
-/// Convert cuda_tile.entry to gpu.func. For each tensor_view whose base is an
-/// entry block argument, a memref function parameter is created; the
-/// TensorViewMap's memref field is filled in here. Other patterns that depend
-/// on `meta.memref` will retry until this pattern runs.
+/// Convert cuda_tile.make_partition_view: the partition_view type maps to the
+/// same ranked memref as its underlying tensor_view, so this pattern just
+/// forwards the already-converted memref.
+struct ConvertMakePartitionView
+    : public OpConversionPattern<cuda_tile::MakePartitionViewOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::MakePartitionViewOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOp(op, adaptor.getTensorView());
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// cuda_tile.module / cuda_tile.entry -> gpu.module / gpu.func
+//===----------------------------------------------------------------------===//
+
+/// Convert cuda_tile.entry to gpu.func.
+///
+/// The gpu.func signature is derived by applying the type converter to each
+/// entry argument type (e.g. `tile<ptr<T>>` -> `memref<*xT>`, `tile<i32>` ->
+/// `i32`). The entry body is then signature-converted in place and merged into
+/// the gpu.func body.
 struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
-  TensorViewMap &tvMap;
-
-  ConvertEntry(TypeConverter &tc, MLIRContext *ctx, TensorViewMap &tvMap)
-      : OpConversionPattern(tc, ctx), tvMap(tvMap) {}
+  using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::EntryOp entryOp, OpAdaptor adaptor,
@@ -1049,110 +1083,41 @@ struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
     MLIRContext *ctx = entryOp.getContext();
     Location loc = entryOp.getLoc();
     Block *entryBlock = &entryOp.getBody().front();
+    unsigned numArgs = entryBlock->getNumArguments();
 
-    // Collect the tensor_view ops in this entry whose base is an entry block
-    // argument, and the set of pointer-arg indices they cover.
-    SmallVector<Operation *> blockArgTvOps;
-    DenseSet<unsigned> mappedArgIndices;
-    for (auto &[op, meta] : tvMap) {
-      if (op->getParentRegion() != &entryOp.getBody())
-        continue;
-      if (auto blockArg = dyn_cast<BlockArgument>(meta.baseValue)) {
-        if (blockArg.getOwner() == entryBlock) {
-          blockArgTvOps.push_back(op);
-          mappedArgIndices.insert(blockArg.getArgNumber());
-        }
-      }
-    }
-
-    // Sort by entry arg index for deterministic gpu.func parameter ordering.
-    llvm::sort(blockArgTvOps, [&](Operation *a, Operation *b) {
-      return cast<BlockArgument>(tvMap[a].baseValue).getArgNumber() <
-             cast<BlockArgument>(tvMap[b].baseValue).getArgNumber();
-    });
-
-    // Verify that every pointer-typed entry block arg is covered.
-    for (unsigned i = 0; i < entryBlock->getNumArguments(); ++i) {
-      auto argTy = entryBlock->getArgument(i).getType();
-      if (auto tileTy = dyn_cast<cuda_tile::TileType>(argTy)) {
-        if (isa<cuda_tile::PointerType>(tileTy.getElementType())) {
-          if (!mappedArgIndices.contains(i))
-            return rewriter.notifyMatchFailure(
-                entryOp, "pointer entry arg has no corresponding "
-                         "make_tensor_view");
-        }
-      }
-    }
-
-    // Build gpu.func argument types (one memref per block-arg-based view).
+    // Compute gpu.func arg types and prepare a signature conversion for the
+    // entry block.
+    const TypeConverter *tc = getTypeConverter();
+    TypeConverter::SignatureConversion sigConv(numArgs);
     SmallVector<Type> gpuFuncArgTypes;
-    for (auto *op : blockArgTvOps)
-      gpuFuncArgTypes.push_back(tvMap[op].memrefTy);
+    gpuFuncArgTypes.reserve(numArgs);
+    for (unsigned i = 0; i < numArgs; ++i) {
+      Type origTy = entryBlock->getArgument(i).getType();
+      Type converted = tc->convertType(origTy);
+      if (!converted)
+        return rewriter.notifyMatchFailure(entryOp,
+                                           "cannot convert entry arg type");
+      gpuFuncArgTypes.push_back(converted);
+      sigConv.addInputs(i, converted);
+    }
 
-    // Create the gpu.func before the entry op.
-    auto gpuFuncType = FunctionType::get(ctx, gpuFuncArgTypes, {});
-    auto gpuFunc = gpu::GPUFuncOp::create(rewriter, loc, entryOp.getSymName(),
-                                          gpuFuncType);
+    auto gpuFunc = gpu::GPUFuncOp::create(
+        rewriter, loc, entryOp.getSymName(),
+        FunctionType::get(ctx, gpuFuncArgTypes, {}));
     gpuFunc->setAttr(gpu::GPUDialect::getKernelFuncAttrName(),
                      rewriter.getUnitAttr());
 
+    // Convert the entry block's arg types; this replaces the block with a
+    // new one having the converted signature and rewires uses via source
+    // materializations.
+    FailureOr<Block *> convertedBlock =
+        rewriter.convertRegionTypes(&entryOp.getBody(), *tc, &sigConv);
+    if (failed(convertedBlock))
+      return failure();
+
+    // Merge the (now type-converted) entry block into the gpu.func body.
     Block *gpuBlock = &gpuFunc.getBody().front();
-    if (gpuBlock->getNumArguments() == 0) {
-      for (auto ty : gpuFuncArgTypes)
-        gpuBlock->addArgument(ty, loc);
-    }
-
-    rewriter.setInsertionPointToStart(gpuBlock);
-
-    // Build replacement values for each entry block arg.
-    // - For pointer args used by make_tensor_view: cast memref -> tile<ptr<T>>
-    //   (deduped so multiple views sharing one ptr arg reuse the cast).
-    // - For other args (dims/strides) used by make_tensor_view/assume:
-    //   placeholder cast (will become dead after view ops are cleaned up).
-    SmallVector<Value> argReplacements(entryBlock->getNumArguments());
-    for (unsigned i = 0; i < blockArgTvOps.size(); ++i) {
-      auto &meta = tvMap[blockArgTvOps[i]];
-      unsigned ptrArgIdx = cast<BlockArgument>(meta.baseValue).getArgNumber();
-      Value memrefArg = gpuBlock->getArgument(i);
-
-      // Fill in the memref value so the remaining patterns can use it.
-      meta.memref = memrefArg;
-
-      if (argReplacements[ptrArgIdx])
-        continue; // already produced cast for this ptr arg
-
-      auto elemTy = meta.memrefTy.getElementType();
-      auto ptrTy = cuda_tile::PointerType::get(elemTy);
-      auto tilePtrTy = cuda_tile::TileType::get({}, ptrTy);
-      argReplacements[ptrArgIdx] = UnrealizedConversionCastOp::create(
-                                       rewriter, loc, tilePtrTy, memrefArg)
-                                       .getResult(0);
-    }
-
-    for (unsigned i = 0; i < entryBlock->getNumArguments(); ++i) {
-      if (argReplacements[i])
-        continue;
-      Value arg = entryBlock->getArgument(i);
-
-      // Verify all uses are by view-construction or assume ops (kept legal).
-      for (OpOperand &use : arg.getUses()) {
-        if (!isa<cuda_tile::MakeTensorViewOp, cuda_tile::AssumeOp>(
-                use.getOwner()))
-          return rewriter.notifyMatchFailure(entryOp,
-                                             "entry arg has unexpected use");
-      }
-
-      argReplacements[i] =
-          UnrealizedConversionCastOp::create(rewriter, loc, arg.getType(),
-                                             gpuBlock->getArgument(0))
-              .getResult(0);
-    }
-
-    // Move ops from entry block into gpu.func block, replacing entry block
-    // args with the constructed replacements.
-    rewriter.inlineBlockBefore(entryBlock, gpuBlock, gpuBlock->end(),
-                               argReplacements);
-
+    rewriter.mergeBlocks(*convertedBlock, gpuBlock, gpuBlock->getArguments());
     rewriter.eraseOp(entryOp);
     return success();
   }
@@ -1197,40 +1162,36 @@ static void populateTileIRToGPUTypeConverter(TypeConverter &converter,
 
   // cuda_tile.tile<MxNxelemTy> -> vector<MxNxelemTy> (ranked tiles)
   // cuda_tile.tile<elemTy> (scalar, rank 0):
-  //   - i32 -> index (index-like scalar in tile IR)
-  //   - other integers/floats -> preserved scalar type
-  // cuda_tile.tile<ptr<elemTy>> (scalar, pointer) -> kept as-is (intermediate)
+  //   - ints        -> preserved scalar integer type
+  //   - float       -> preserved scalar type
+  //   - ptr<T>      -> memref<*xT> (unranked memref backing the pointer)
   converter.addConversion([ctx](cuda_tile::TileType tileTy) -> Type {
     auto shape = tileTy.getShape();
     auto elemTy = tileTy.getElementType();
 
     if (shape.empty()) {
-      // Scalar tile
-      if (auto intTy = dyn_cast<IntegerType>(elemTy)) {
-        // Keep i32 as index because tile-level loop bounds/indices lower to
-        // SCF/memref index arithmetic, but preserve all other integer widths.
-        if (intTy.getWidth() == 32)
-          return IndexType::get(ctx);
+      if (isa<IntegerType>(elemTy)) {
         return elemTy;
       }
       if (isa<FloatType>(elemTy))
         return elemTy;
-      // Pointer types in scalar tiles -> keep as-is (will be dead after
-      // make_tensor_view is erased)
-      if (isa<cuda_tile::PointerType>(elemTy))
-        return tileTy;
+      if (auto ptrTy = dyn_cast<cuda_tile::PointerType>(elemTy))
+        return UnrankedMemRefType::get(ptrTy.getPointeeType(), {});
       return Type();
     }
-    // Ranked tile -> vector
     return VectorType::get(shape, elemTy);
   });
 
-  // View types are kept as-is during conversion. The load/store patterns
-  // need to inspect the original view types. They'll be dead after conversion.
-  converter.addConversion(
-      [](cuda_tile::TensorViewType tvTy) -> Type { return tvTy; });
-  converter.addConversion(
-      [](cuda_tile::PartitionViewType pvTy) -> Type { return pvTy; });
+  // tensor_view / partition_view -> ranked memref describing the same buffer.
+  // (partition_view inherits its memref layout from the underlying tensor_view;
+  // tile_shape / dim_map / padding_value are read off the source op's type at
+  // each use site.)
+  converter.addConversion([](cuda_tile::TensorViewType tvTy) -> Type {
+    return tensorViewToMemRefType(tvTy);
+  });
+  converter.addConversion([](cuda_tile::PartitionViewType pvTy) -> Type {
+    return tensorViewToMemRefType(pvTy.getTensorView());
+  });
   converter.addConversion(
       [](cuda_tile::TokenType tokTy) -> Type { return tokTy; });
 
@@ -1245,34 +1206,29 @@ static void populateTileIRToGPUTypeConverter(TypeConverter &converter,
 }
 
 static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
-                                                  RewritePatternSet &patterns,
-                                                  TensorViewMap &tvMap) {
+                                                  RewritePatternSet &patterns) {
   MLIRContext *ctx = patterns.getContext();
-  // Patterns that don't need the tvMap.
-  patterns
-     .add<ConvertModule, ConvertConstant, ConvertGetTileBlockId,
-       ConvertBinaryLhsRhsOp<cuda_tile::MulIOp, arith::MulIOp>,
-           ConvertAtan2, ConvertUnarySourceOp<cuda_tile::CeilOp, math::CeilOp>,
-           ConvertCmpF, ConvertUnarySourceOp<cuda_tile::CosOp, math::CosOp>,
-           ConvertExp2, ConvertUnarySourceOp<cuda_tile::ExpOp, math::ExpOp>,
-           ConvertUnarySourceOp<cuda_tile::FloorOp, math::FloorOp>,
-           ConvertUnarySourceOp<cuda_tile::Log2Op, math::Log2Op>,
-           ConvertMinMaxFOp<cuda_tile::MaxFOp, /*IsMax=*/true>,
-           ConvertMinMaxFOp<cuda_tile::MinFOp, /*IsMax=*/false>,
-           ConvertUnarySourceOp<cuda_tile::NegFOp, arith::NegFOp>,
-           ConvertPow, ConvertRsqrt,
-           ConvertUnarySourceOp<cuda_tile::SinOp, math::SinOp>, ConvertTanH,
-           ConvertCmpI,
-           ConvertMinMaxIOp<cuda_tile::MaxIOp, /*IsMax=*/true>,
-           ConvertMinMaxIOp<cuda_tile::MinIOp, /*IsMax=*/false>, ConvertMmaI,
-           ConvertMulhiI,
-           ConvertNegI,
-           ConvertBinaryLhsRhsOp<cuda_tile::XOrIOp, arith::XOrIOp>, ConvertFor,
-           ConvertContinue, ConvertReturn,
-           ConvertMmaF, ConvertAssume>(converter, ctx);
-  // Patterns that need the tvMap.
-  patterns.add<ConvertEntry, ConvertGetIndexSpaceShape, ConvertLoadViewTko,
-               ConvertStoreViewTko>(converter, ctx, tvMap);
+  patterns.add<
+      ConvertModule, ConvertEntry, ConvertMakeTensorView,
+      ConvertMakePartitionView, ConvertConstant, ConvertGetTileBlockId,
+      ConvertBinaryLhsRhsOp<cuda_tile::MulIOp, arith::MulIOp>, ConvertAtan2,
+      ConvertUnarySourceOp<cuda_tile::CeilOp, math::CeilOp>, ConvertCmpF,
+      ConvertUnarySourceOp<cuda_tile::CosOp, math::CosOp>, ConvertExp2,
+      ConvertUnarySourceOp<cuda_tile::ExpOp, math::ExpOp>,
+      ConvertUnarySourceOp<cuda_tile::FloorOp, math::FloorOp>,
+      ConvertUnarySourceOp<cuda_tile::Log2Op, math::Log2Op>,
+      ConvertMinMaxFOp<cuda_tile::MaxFOp, /*IsMax=*/true>,
+      ConvertMinMaxFOp<cuda_tile::MinFOp, /*IsMax=*/false>,
+      ConvertUnarySourceOp<cuda_tile::NegFOp, arith::NegFOp>, ConvertPow,
+      ConvertRsqrt, ConvertUnarySourceOp<cuda_tile::SinOp, math::SinOp>,
+      ConvertTanH, ConvertCmpI,
+      ConvertMinMaxIOp<cuda_tile::MaxIOp, /*IsMax=*/true>,
+      ConvertMinMaxIOp<cuda_tile::MinIOp, /*IsMax=*/false>, ConvertMmaI,
+      ConvertMulhiI, ConvertNegI,
+      ConvertBinaryLhsRhsOp<cuda_tile::XOrIOp, arith::XOrIOp>, ConvertFor,
+      ConvertContinue, ConvertReturn, ConvertMmaF, ConvertAssume,
+      ConvertGetIndexSpaceShape, ConvertLoadViewTko, ConvertStoreViewTko>(
+      converter, ctx);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1304,20 +1260,11 @@ struct ConvertTileIRToGPUPass
     MLIRContext *ctx = &getContext();
     ModuleOp module = getOperation();
 
-    // Step 1: Analyze all make_tensor_view ops and build the full map.
-    // This is a read-only pass over the IR before any mutations.
-    TensorViewMap tvMap;
-    buildTensorViewMap(module, tvMap);
-
-    // Step 2: Run dialect conversion. ConvertModule rewrites
-    // cuda_tile.module -> gpu.module; ConvertEntry rewrites
-    // cuda_tile.entry -> gpu.func and fills in tvMap[].memref;
-    // Other patterns that depend on it will retry until then.
     TypeConverter typeConverter;
     populateTileIRToGPUTypeConverter(typeConverter, ctx);
 
     RewritePatternSet patterns(ctx);
-    populateTileIRToGPUConversionPatterns(typeConverter, patterns, tvMap);
+    populateTileIRToGPUConversionPatterns(typeConverter, patterns);
 
     ConversionTarget target(*ctx);
 
@@ -1331,26 +1278,17 @@ struct ConvertTileIRToGPUPass
     // CudaTile ops are illegal (target of conversion).
     target.addIllegalDialect<cuda_tile::CudaTileDialect>();
 
-    // Keep view-construction ops legal during conversion so load/store
-    // patterns can trace through them.
-    target.addLegalOp<cuda_tile::MakeTensorViewOp,
-                      cuda_tile::MakePartitionViewOp>();
-
     if (failed(applyPartialConversion(module, target, std::move(patterns))))
       return signalPassFailure();
 
-    // Step 3: Remove dead ops (unrealized_conversion_casts, view ops, assumes).
-    // Iterate until fixpoint to handle dependencies.
+    // Clean up any leftover unrealized_conversion_casts that became dead.
     bool changed = true;
     while (changed) {
       changed = false;
       SmallVector<Operation *> toErase;
-      module.walk([&](Operation *op) {
-        if ((isa<UnrealizedConversionCastOp, cuda_tile::MakeTensorViewOp,
-                 cuda_tile::MakePartitionViewOp, cuda_tile::AssumeOp>(op)) &&
-            op->use_empty()) {
+      module.walk([&](UnrealizedConversionCastOp op) {
+        if (op->use_empty())
           toErase.push_back(op);
-        }
       });
       for (auto *op : toErase) {
         op->erase();

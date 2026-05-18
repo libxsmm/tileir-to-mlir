@@ -7,19 +7,14 @@
 // CHECK: #map3 = affine_map<(d0, d1, d2) -> (d0, d1)>
 // CHECK-LABEL: gpu.module @gemm_kloop_module {
 
-// An implementation of GEMM in cuda_tile.
-//
-// Kernel computes MxNxK with 128x128x64 Tile Size.
-// Computes F32 += f16 * f16 + 0.0
-//
-// This implementation does tiling, and reduction over
-// K for dynamic sizes.
-// Input A, B, C are expected in (K x M), (N x K), (M x N), so the kernel needs to flip input dimensions.
+// Section 11.1.7
+// Example: GEMM Tiled with tensor_view
+// Description: Tiles dynamic GEMM inputs and lowers view-based loads, mma, and stores.
 cuda_tile.module @gemm_kloop_module {
     // CHECK-LABEL: gpu.func @gemm_kloop_kernel(
-    // CHECK-SAME: %[[A_ARG:[a-zA-Z0-9_]+]]: memref<?x?xf16, strided<[?, 1]>>
-    // CHECK-SAME: %[[B_ARG:[a-zA-Z0-9_]+]]: memref<?x?xf16, strided<[?, 1]>>
-    // CHECK-SAME: %[[C_ARG:[a-zA-Z0-9_]+]]: memref<?x?xf32, strided<[?, 1]>>
+    // CHECK-SAME: memref<*xf16>
+    // CHECK-SAME: memref<*xf16>
+    // CHECK-SAME: memref<*xf32>
     entry @gemm_kloop_kernel(
         %A_ptr: !cuda_tile.tile<!cuda_tile.ptr<f16>>,
         %B_ptr: !cuda_tile.tile<!cuda_tile.ptr<f16>>,
@@ -45,6 +40,9 @@ cuda_tile.module @gemm_kloop_module {
 
         // Convert the unstructured pointers `ptr` to `tensor_view`.
         //
+        // CHECK: %[[A_ARG:.*]] = memref.reinterpret_cast {{.*}} memref<*xf16> to memref<?x?xf16, strided<[?, 1]>>
+        // CHECK: %[[B_ARG:.*]] = memref.reinterpret_cast {{.*}} memref<*xf16> to memref<?x?xf16, strided<[?, 1]>>
+        // CHECK: %[[C_ARG:.*]] = memref.reinterpret_cast {{.*}} memref<*xf32> to memref<?x?xf32, strided<[?, 1]>>
         // A reference to the A tensor pointed to by A_ptr, (K x M)
         %A = make_tensor_view %A_ptr_assume, shape = [%K, %M], strides = [%stride_ak, 1] : tile<i32> -> tensor_view<?x?xf16, strides=[?,1]>
         // A reference to the B tensor pointed to by B_ptr, (N x K)
@@ -74,15 +72,18 @@ cuda_tile.module @gemm_kloop_module {
         // CHECK: %[[D0:.*]] = memref.dim %[[A_ARG]], %{{.*}} : memref<?x?xf16, strided<[?, 1]>>
         // CHECK: %[[C256:.*]] = arith.constant 256 : index
         // CHECK: %[[CEIL0:.*]] = arith.ceildivui %[[D0]], %[[C256]] : index
+        // CHECK: arith.index_cast %[[CEIL0]] : index to i32
         // CHECK: %[[D1:.*]] = memref.dim %[[A_ARG]], %{{.*}} : memref<?x?xf16, strided<[?, 1]>>
         // CHECK: %[[C64:.*]] = arith.constant 64 : index
         // CHECK: %[[CEIL1:.*]] = arith.ceildivui %[[D1]], %[[C64]] : index
+        // CHECK: %[[CEIL1_I32:.*]] = arith.index_cast %[[CEIL1]] : index to i32
         %mk_len_i32:2 = get_index_space_shape %A_block : partition_view<tile=(256x64), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]> -> tile<i32>
 
         // Now that we have done all the setup, we can finally perform the  computation itself.
         //
         // We simply loop over the K dimension computing: dot(A_block[0, k], B_block[k, 0]).
-        // CHECK: scf.for %{{.*}} = %{{.*}} to %[[CEIL1]] step %{{.*}}
+        // CHECK: %[[LOOP_UB:.*]] = arith.index_cast %[[CEIL1_I32]] : i32 to index
+        // CHECK: scf.for %{{.*}} = %{{.*}} to %[[LOOP_UB]] step %{{.*}}
         %result = for %k in (%i0 to %mk_len_i32#1, step %i1) : tile<i32>
             iter_values(%acc_prev = %cst) -> (tile<256x128xf32>)
         {
@@ -110,12 +111,14 @@ cuda_tile.module @gemm_kloop_module {
     }
 }
 
-// Section 11.2.2: https://docs.nvidia.com/cuda/tile-ir/latest/sections/appendix.html#cuda-tile-constant-0
+// Section 11.2.2
+// Example: constant
+// Description: Materializes scalar and vector constants.
 // CHECK-LABEL: gpu.module @appendix_constant_0_module {
 cuda_tile.module @appendix_constant_0_module {
     // CHECK-LABEL: gpu.func @appendix_constant_0_kernel
     entry @appendix_constant_0_kernel() {
-        // CHECK: arith.constant 0 : index
+        // CHECK: arith.constant 0 : i32
         %c0 = constant <i32: 0> : tile<i32>
 
         // CHECK: arith.constant 1 : i64
@@ -136,7 +139,9 @@ cuda_tile.module @appendix_constant_0_module {
     }
 }
 
-// Section 11.2.16: https://docs.nvidia.com/cuda/tile-ir/latest/sections/appendix.html#cuda-tile-for-0
+// Section 11.2.16
+// Example: for
+// Description: Lowers simple and loop-carried counted loops.
 // CHECK-LABEL: gpu.module @appendix_for_0_module {
 cuda_tile.module @appendix_for_0_module {
     // CHECK-LABEL: gpu.func @appendix_for_0_kernel
@@ -145,9 +150,12 @@ cuda_tile.module @appendix_for_0_module {
         %upperBound = constant <i32: 10> : tile<i32>
         %step = constant <i32: 1> : tile<i32>
 
-        // CHECK: %[[LB:.*]] = arith.constant 0 : index
-        // CHECK: %[[UB:.*]] = arith.constant 10 : index
-        // CHECK: %[[STEP:.*]] = arith.constant 1 : index
+        // CHECK: %[[LB_I32:.*]] = arith.constant 0 : i32
+        // CHECK: %[[UB_I32:.*]] = arith.constant 10 : i32
+        // CHECK: %[[STEP_I32:.*]] = arith.constant 1 : i32
+        // CHECK: %[[LB:.*]] = arith.index_cast %[[LB_I32]] : i32 to index
+        // CHECK: %[[UB:.*]] = arith.index_cast %[[UB_I32]] : i32 to index
+        // CHECK: %[[STEP:.*]] = arith.index_cast %[[STEP_I32]] : i32 to index
         // CHECK: scf.for %{{.*}} = %[[LB]] to %[[UB]] step %[[STEP]] {
         for %iv in (%lowerBound to %upperBound, step %step) : tile<i32> {
             continue
@@ -168,3 +176,93 @@ cuda_tile.module @appendix_for_0_module {
         return
     }
 }
+
+// Section 11.2.53
+// Example: make_partition_view
+// Description: Builds static partition views and lowers view-based load and store operations.
+// CHECK-LABEL: gpu.module @make_partition_view_0_module {
+cuda_tile.module @make_partition_view_0_module {
+    // CHECK-LABEL: gpu.func @make_partition_view_0_kernel(
+    // CHECK-SAME: %[[UPTR:[a-zA-Z0-9_]+]]: memref<*xf32>
+    // CHECK-SAME: %[[UPTR2:[a-zA-Z0-9_]+]]: memref<*xf32>
+    entry @make_partition_view_0_kernel(
+            %ptr0: !cuda_tile.tile<!cuda_tile.ptr<f32>>,
+            %ptr1: !cuda_tile.tile<!cuda_tile.ptr<f32>>) {
+        // CHECK: %[[PTR:.*]] = memref.reinterpret_cast %[[UPTR]] to offset: [0], sizes: [8192, 128], strides: [128, 1] : memref<*xf32> to memref<8192x128xf32>
+        // CHECK: %[[PTR2:.*]] = memref.reinterpret_cast %[[UPTR2]] to offset: [0], sizes: [8192, 128], strides: [128, 1] : memref<*xf32> to memref<8192x128xf32>
+        %tv0 = make_tensor_view %ptr0, shape = [8192, 128], strides = [128, 1]
+            : tensor_view<8192x128xf32, strides=[128,1]>
+        %tv1 = make_tensor_view %ptr1, shape = [8192, 128], strides = [128, 1]
+            : tensor_view<8192x128xf32, strides=[128,1]>
+
+        %view0 = make_partition_view %tv0
+            : partition_view<tile=(64x64), tensor_view<8192x128xf32, strides=[128,1]>>
+        %view1 = make_partition_view %tv1
+            : partition_view<tile=(64x64), tensor_view<8192x128xf32, strides=[128,1]>>
+
+        %c0 = constant <i32: 0> : !cuda_tile.tile<i32>
+        %c1 = constant <i32: 1> : !cuda_tile.tile<i32>
+
+        // CHECK: ub.poison : f32
+        // CHECK: vector.transfer_read %[[PTR]][%{{.*}}, %{{.*}}], %{{.*}} {in_bounds = [true, true]} : memref<8192x128xf32>, vector<64x64xf32>
+        %tile0, %t0 = load_view_tko weak %view0[%c0, %c0]
+            : partition_view<tile=(64x64), tensor_view<8192x128xf32, strides=[128,1]>>,
+              tile<i32> -> tile<64x64xf32>, token
+
+        // CHECK: ub.poison : f32
+        // CHECK: vector.transfer_read %[[PTR2]][%{{.*}}, %{{.*}}], %{{.*}} {in_bounds = [true, true]} : memref<8192x128xf32>, vector<64x64xf32>
+        %tile1, %t1 = load_view_tko weak %view1[%c0, %c0]
+            : partition_view<tile=(64x64), tensor_view<8192x128xf32, strides=[128,1]>>,
+              tile<i32> -> tile<64x64xf32>, token
+
+        // CHECK: vector.transfer_write %{{.*}}, %[[PTR]][%{{.*}}, %{{.*}}] {in_bounds = [true, true]} : vector<64x64xf32>, memref<8192x128xf32>
+        %t2 = store_view_tko weak %tile1, %view0[%c0, %c1]
+            : tile<64x64xf32>,
+              partition_view<tile=(64x64), tensor_view<8192x128xf32, strides=[128,1]>>,
+              tile<i32> -> token
+
+        // CHECK: gpu.return
+        return
+    }
+}
+
+// Section 11.2.54
+// Example: make_tensor_view
+// Description: Builds scalar, static, and dynamic tensor views from a base pointer.
+// CHECK-LABEL: gpu.module @make_tensor_view_examples_module {
+cuda_tile.module @make_tensor_view_examples_module {
+    // CHECK-LABEL: gpu.func @make_tensor_view_examples(
+    // CHECK-SAME: %[[BASE:[a-zA-Z0-9_]+]]: memref<*xf32>
+    entry @make_tensor_view_examples(%base: !cuda_tile.tile<!cuda_tile.ptr<f32>>) {
+        // CHECK: memref.reinterpret_cast %[[BASE]] to offset: [0], sizes: [], strides: [] : memref<*xf32> to memref<f32>
+        %a0 = make_tensor_view %base,
+            shape = [], strides = [] : tensor_view<f32>
+
+        // CHECK: memref.reinterpret_cast %[[BASE]] to offset: [0], sizes: [32, 32], strides: [32, 1] : memref<*xf32> to memref<32x32xf32>
+        %a1 = make_tensor_view %base,
+            shape = [32, 32], strides = [32, 1]
+            : tensor_view<32x32xf32, strides=[32,1]>
+
+        %sh0 = constant <i32: 32> : !cuda_tile.tile<i32>
+        %sh1 = constant <i32: 32> : !cuda_tile.tile<i32>
+        %st0 = constant <i32: 32> : !cuda_tile.tile<i32>
+        %st1 = constant <i32: 1> : !cuda_tile.tile<i32>
+
+        // CHECK: %[[C32A_I32:.*]] = arith.constant 32 : i32
+        // CHECK: %[[C32B_I32:.*]] = arith.constant 32 : i32
+        // CHECK: %[[C32C_I32:.*]] = arith.constant 32 : i32
+        // CHECK: %[[C1_I32:.*]] = arith.constant 1 : i32
+        // CHECK: %[[C32A:.*]] = arith.index_cast %[[C32A_I32]] : i32 to index
+        // CHECK: %[[C32B:.*]] = arith.index_cast %[[C32B_I32]] : i32 to index
+        // CHECK: %[[C32C:.*]] = arith.index_cast %[[C32C_I32]] : i32 to index
+        // CHECK: %[[C1:.*]] = arith.index_cast %[[C1_I32]] : i32 to index
+        // CHECK: memref.reinterpret_cast %[[BASE]] to offset: [0], sizes: [%[[C32A]], %[[C32B]]], strides: [%[[C32C]], %[[C1]]] : memref<*xf32> to memref<?x?xf32, strided<[?, ?]>>
+        %a2 = make_tensor_view %base,
+            shape = [%sh0, %sh1], strides = [%st0, %st1]
+            : tile<i32> -> tensor_view<?x?xf32, strides=[?,?]>
+
+        // CHECK: gpu.return
+        return
+    }
+}
+
