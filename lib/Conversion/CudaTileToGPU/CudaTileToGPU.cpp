@@ -246,8 +246,8 @@ struct ConvertConstant : public OpConversionPattern<cuda_tile::ConstantOp> {
       auto elemTy = tileType.getElementType();
       if (isa<IntegerType>(elemTy)) {
         auto splat = denseVal.getSplatValue<APInt>();
-        rewriter.replaceOpWithNewOp<arith::ConstantIntOp>(
-            op, resultType, splat.getSExtValue());
+        rewriter.replaceOpWithNewOp<arith::ConstantIntOp>(op, resultType,
+                                                          splat.getSExtValue());
       } else if (isa<FloatType>(elemTy)) {
         auto splat = denseVal.getSplatValue<APFloat>();
         rewriter.replaceOpWithNewOp<arith::ConstantFloatOp>(
@@ -297,19 +297,20 @@ struct ConvertGetTileBlockId
     Location loc = op.getLoc();
     Type resultTy = getTypeConverter()->convertType(op.getResult(0).getType());
     if (!resultTy)
-      return rewriter.notifyMatchFailure(op, "cannot convert get_tile_block_id result type");
+      return rewriter.notifyMatchFailure(
+          op, "cannot convert get_tile_block_id result type");
     Value bx = castValueToType(
-        rewriter, loc,
-        gpu::BlockIdOp::create(rewriter, loc, gpu::Dimension::x), resultTy);
+        rewriter, loc, gpu::BlockIdOp::create(rewriter, loc, gpu::Dimension::x),
+        resultTy);
     Value by = castValueToType(
-        rewriter, loc,
-        gpu::BlockIdOp::create(rewriter, loc, gpu::Dimension::y), resultTy);
+        rewriter, loc, gpu::BlockIdOp::create(rewriter, loc, gpu::Dimension::y),
+        resultTy);
     Value bz = castValueToType(
-        rewriter, loc,
-        gpu::BlockIdOp::create(rewriter, loc, gpu::Dimension::z), resultTy);
+        rewriter, loc, gpu::BlockIdOp::create(rewriter, loc, gpu::Dimension::z),
+        resultTy);
     if (!bx || !by || !bz)
-      return rewriter.notifyMatchFailure(op,
-                                         "cannot cast block ids to result type");
+      return rewriter.notifyMatchFailure(
+          op, "cannot cast block ids to result type");
     rewriter.replaceOp(op, {bx, by, bz});
     return success();
   }
@@ -364,9 +365,10 @@ struct ConvertMinMaxFOp : public OpConversionPattern<SrcOp> {
                   ConversionPatternRewriter &rewriter) const override {
     if (op.getFlushToZero())
       return rewriter.notifyMatchFailure(
-          op, IsMax
-                  ? "maxf flush_to_zero is not representable in arith max operations"
-                  : "minf flush_to_zero is not representable in arith min operations");
+          op, IsMax ? "maxf flush_to_zero is not representable in arith max "
+                      "operations"
+                    : "minf flush_to_zero is not representable in arith min "
+                      "operations");
 
     if (op.getPropagateNan()) {
       if constexpr (IsMax) {
@@ -555,11 +557,11 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
     Value step = castValueToType(rewriter, op.getLoc(), adaptor.getStep(),
                                  rewriter.getIndexType());
     if (!lb || !ub || !step)
-      return rewriter.notifyMatchFailure(op,
-                                         "for bounds could not be converted to index");
+      return rewriter.notifyMatchFailure(
+          op, "for bounds could not be converted to index");
 
-    auto newForOp = scf::ForOp::create(
-        rewriter, op.getLoc(), lb, ub, step, adaptor.getInitValues());
+    auto newForOp = scf::ForOp::create(rewriter, op.getLoc(), lb, ub, step,
+                                       adaptor.getInitValues());
 
     // Convert region types
     if (failed(
@@ -577,8 +579,9 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
     SmallVector<Value> replacingValues;
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToStart(newBody);
-    Value iv = castValueToType(rewriter, op.getLoc(), newForOp.getInductionVar(),
-                               oldBody->getArgument(0).getType());
+    Value iv =
+        castValueToType(rewriter, op.getLoc(), newForOp.getInductionVar(),
+                        oldBody->getArgument(0).getType());
     if (!iv)
       return rewriter.notifyMatchFailure(
           op, "for induction variable could not be converted to body type");
@@ -732,7 +735,7 @@ struct ConvertGetIndexSpaceShape
           arith::ConstantIndexOp::create(rewriter, loc, tileSize);
       Value divResult =
           arith::CeilDivUIOp::create(rewriter, loc, dimVal, tileSizeVal);
-        Type resultTy =
+      Type resultTy =
           getTypeConverter()->convertType(op->getResult(i).getType());
       if (!resultTy)
         return rewriter.notifyMatchFailure(
@@ -821,9 +824,10 @@ struct TransferViewAccessPlan {
 /// 3. Build a permutation_map that maps memref dims back to tile dims.
 /// 4. Set inBounds[i] = true only when the tensor extent is static and evenly
 ///    divisible by the tile extent along that dimension.
-static FailureOr<TransferViewAccessPlan> buildTransferViewAccessPlan(
-    ConversionPatternRewriter &rewriter, Operation *op, Value view,
-    Value convertedView, VectorType vecTy, ValueRange convertedIndices) {
+static FailureOr<TransferViewAccessPlan>
+buildTransferViewAccessPlan(ConversionPatternRewriter &rewriter, Operation *op,
+                            Value view, Value convertedView, VectorType vecTy,
+                            ValueRange convertedIndices) {
   auto pvInfo = getPartitionViewInfo(view, convertedView);
 
   unsigned tileRank = pvInfo.tileShape.size();
@@ -842,8 +846,8 @@ static FailureOr<TransferViewAccessPlan> buildTransferViewAccessPlan(
   for (unsigned i = 0; i < tileRank; ++i) {
     unsigned tensorDim = pvInfo.dimMap[i];
     int64_t tileSize = pvInfo.tileShape[i];
-    Value tileIndex =
-        castValueToType(rewriter, loc, convertedIndices[i], rewriter.getIndexType());
+    Value tileIndex = castValueToType(rewriter, loc, convertedIndices[i],
+                                      rewriter.getIndexType());
     if (!tileIndex)
       return rewriter.notifyMatchFailure(
           op, "view index could not be converted to index");
@@ -907,9 +911,9 @@ struct ConvertLoadViewTko
     auto vecTy = cast<VectorType>(
         getTypeConverter()->convertType(op.getTile().getType()));
 
-    auto plan =
-        buildTransferViewAccessPlan(rewriter, op, op.getView(),
-                                    adaptor.getView(), vecTy, adaptor.getIndex());
+    auto plan = buildTransferViewAccessPlan(rewriter, op, op.getView(),
+                                            adaptor.getView(), vecTy,
+                                            adaptor.getIndex());
     if (failed(plan))
       return failure();
 
@@ -956,9 +960,9 @@ struct ConvertStoreViewTko
     auto vecTy = cast<VectorType>(
         getTypeConverter()->convertType(op.getTile().getType()));
 
-    auto plan =
-        buildTransferViewAccessPlan(rewriter, op, op.getView(),
-                                    adaptor.getView(), vecTy, adaptor.getIndex());
+    auto plan = buildTransferViewAccessPlan(rewriter, op, op.getView(),
+                                            adaptor.getView(), vecTy,
+                                            adaptor.getIndex());
     if (failed(plan))
       return failure();
 
@@ -993,8 +997,8 @@ struct ConvertMakeTensorView
   LogicalResult
   matchAndRewrite(cuda_tile::MakeTensorViewOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto resultTy =
-        dyn_cast_or_null<MemRefType>(getTypeConverter()->convertType(op.getType()));
+    auto resultTy = dyn_cast_or_null<MemRefType>(
+        getTypeConverter()->convertType(op.getType()));
     if (!resultTy)
       return rewriter.notifyMatchFailure(
           op, "tensor_view did not convert to a ranked memref");
@@ -1014,15 +1018,14 @@ struct ConvertMakeTensorView
     sizes.reserve(rank);
     for (unsigned d = 0; d < rank; ++d) {
       if (tvShape[d] == ShapedType::kDynamic) {
-        Value size = castValueToType(rewriter, op.getLoc(),
-                                     dynShape[dynShapeIdx++],
-                                     rewriter.getIndexType());
+        Value size =
+            castValueToType(rewriter, op.getLoc(), dynShape[dynShapeIdx++],
+                            rewriter.getIndexType());
         if (!size)
           return rewriter.notifyMatchFailure(
               op, "dynamic tensor_view shape could not be converted to index");
         sizes.push_back(size);
-      }
-      else
+      } else
         sizes.push_back(rewriter.getIndexAttr(tvShape[d]));
     }
 
@@ -1030,15 +1033,14 @@ struct ConvertMakeTensorView
     strides.reserve(rank);
     for (unsigned d = 0; d < rank; ++d) {
       if (tvStrides[d] == ShapedType::kDynamic) {
-        Value stride = castValueToType(rewriter, op.getLoc(),
-                                       dynStrides[dynStrideIdx++],
-                                       rewriter.getIndexType());
+        Value stride =
+            castValueToType(rewriter, op.getLoc(), dynStrides[dynStrideIdx++],
+                            rewriter.getIndexType());
         if (!stride)
           return rewriter.notifyMatchFailure(
               op, "dynamic tensor_view stride could not be converted to index");
         strides.push_back(stride);
-      }
-      else
+      } else
         strides.push_back(rewriter.getIndexAttr(tvStrides[d]));
     }
 
@@ -1101,9 +1103,9 @@ struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
       sigConv.addInputs(i, converted);
     }
 
-    auto gpuFunc = gpu::GPUFuncOp::create(
-        rewriter, loc, entryOp.getSymName(),
-        FunctionType::get(ctx, gpuFuncArgTypes, {}));
+    auto gpuFunc =
+        gpu::GPUFuncOp::create(rewriter, loc, entryOp.getSymName(),
+                               FunctionType::get(ctx, gpuFuncArgTypes, {}));
     gpuFunc->setAttr(gpu::GPUDialect::getKernelFuncAttrName(),
                      rewriter.getUnitAttr());
 
@@ -1208,27 +1210,27 @@ static void populateTileIRToGPUTypeConverter(TypeConverter &converter,
 static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
                                                   RewritePatternSet &patterns) {
   MLIRContext *ctx = patterns.getContext();
-  patterns.add<
-      ConvertModule, ConvertEntry, ConvertMakeTensorView,
-      ConvertMakePartitionView, ConvertConstant, ConvertGetTileBlockId,
-      ConvertBinaryLhsRhsOp<cuda_tile::MulIOp, arith::MulIOp>, ConvertAtan2,
-      ConvertUnarySourceOp<cuda_tile::CeilOp, math::CeilOp>, ConvertCmpF,
-      ConvertUnarySourceOp<cuda_tile::CosOp, math::CosOp>, ConvertExp2,
-      ConvertUnarySourceOp<cuda_tile::ExpOp, math::ExpOp>,
-      ConvertUnarySourceOp<cuda_tile::FloorOp, math::FloorOp>,
-      ConvertUnarySourceOp<cuda_tile::Log2Op, math::Log2Op>,
-      ConvertMinMaxFOp<cuda_tile::MaxFOp, /*IsMax=*/true>,
-      ConvertMinMaxFOp<cuda_tile::MinFOp, /*IsMax=*/false>,
-      ConvertUnarySourceOp<cuda_tile::NegFOp, arith::NegFOp>, ConvertPow,
-      ConvertRsqrt, ConvertUnarySourceOp<cuda_tile::SinOp, math::SinOp>,
-      ConvertTanH, ConvertCmpI,
-      ConvertMinMaxIOp<cuda_tile::MaxIOp, /*IsMax=*/true>,
-      ConvertMinMaxIOp<cuda_tile::MinIOp, /*IsMax=*/false>, ConvertMmaI,
-      ConvertMulhiI, ConvertNegI,
-      ConvertBinaryLhsRhsOp<cuda_tile::XOrIOp, arith::XOrIOp>, ConvertFor,
-      ConvertContinue, ConvertReturn, ConvertMmaF, ConvertAssume,
-      ConvertGetIndexSpaceShape, ConvertLoadViewTko, ConvertStoreViewTko>(
-      converter, ctx);
+  patterns
+      .add<ConvertModule, ConvertEntry, ConvertMakeTensorView,
+           ConvertMakePartitionView, ConvertConstant, ConvertGetTileBlockId,
+           ConvertBinaryLhsRhsOp<cuda_tile::MulIOp, arith::MulIOp>,
+           ConvertAtan2, ConvertUnarySourceOp<cuda_tile::CeilOp, math::CeilOp>,
+           ConvertCmpF, ConvertUnarySourceOp<cuda_tile::CosOp, math::CosOp>,
+           ConvertExp2, ConvertUnarySourceOp<cuda_tile::ExpOp, math::ExpOp>,
+           ConvertUnarySourceOp<cuda_tile::FloorOp, math::FloorOp>,
+           ConvertUnarySourceOp<cuda_tile::Log2Op, math::Log2Op>,
+           ConvertMinMaxFOp<cuda_tile::MaxFOp, /*IsMax=*/true>,
+           ConvertMinMaxFOp<cuda_tile::MinFOp, /*IsMax=*/false>,
+           ConvertUnarySourceOp<cuda_tile::NegFOp, arith::NegFOp>, ConvertPow,
+           ConvertRsqrt, ConvertUnarySourceOp<cuda_tile::SinOp, math::SinOp>,
+           ConvertTanH, ConvertCmpI,
+           ConvertMinMaxIOp<cuda_tile::MaxIOp, /*IsMax=*/true>,
+           ConvertMinMaxIOp<cuda_tile::MinIOp, /*IsMax=*/false>, ConvertMmaI,
+           ConvertMulhiI, ConvertNegI,
+           ConvertBinaryLhsRhsOp<cuda_tile::XOrIOp, arith::XOrIOp>, ConvertFor,
+           ConvertContinue, ConvertReturn, ConvertMmaF, ConvertAssume,
+           ConvertGetIndexSpaceShape, ConvertLoadViewTko, ConvertStoreViewTko>(
+          converter, ctx);
 }
 
 //===----------------------------------------------------------------------===//
