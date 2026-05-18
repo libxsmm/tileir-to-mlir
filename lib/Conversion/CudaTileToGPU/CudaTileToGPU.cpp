@@ -285,33 +285,35 @@ struct ConvertConstant : public OpConversionPattern<cuda_tile::ConstantOp> {
   }
 };
 
-/// Convert cuda_tile.get_tile_block_id to gpu.block_id x/y/z.
-///   - Creates three gpu.block_id operations, one per dimension (x, y, z).
-struct ConvertGetTileBlockId
-    : public OpConversionPattern<cuda_tile::GetTileBlockIdOp> {
-  using OpConversionPattern::OpConversionPattern;
+/// Convert a cuda_tile op that returns three i32 values (one per grid
+/// dimension) into three GPU dimension-query ops (x, y, z) with index_cast.
+/// Used for both get_tile_block_id -> gpu.block_id and
+/// get_num_tile_blocks -> gpu.grid_dim.
+template <typename SrcOp, typename GpuDimOp>
+struct ConvertDimQueryOp : public OpConversionPattern<SrcOp> {
+  using OpConversionPattern<SrcOp>::OpConversionPattern;
 
   LogicalResult
-  matchAndRewrite(cuda_tile::GetTileBlockIdOp op, OpAdaptor adaptor,
+  matchAndRewrite(SrcOp op, typename OpConversionPattern<SrcOp>::OpAdaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    Type resultTy = getTypeConverter()->convertType(op.getResult(0).getType());
+    Type resultTy =
+        this->getTypeConverter()->convertType(op.getResult(0).getType());
     if (!resultTy)
+      return rewriter.notifyMatchFailure(op, "cannot convert result type");
+    Value x = castValueToType(
+        rewriter, loc, GpuDimOp::create(rewriter, loc, gpu::Dimension::x),
+        resultTy);
+    Value y = castValueToType(
+        rewriter, loc, GpuDimOp::create(rewriter, loc, gpu::Dimension::y),
+        resultTy);
+    Value z = castValueToType(
+        rewriter, loc, GpuDimOp::create(rewriter, loc, gpu::Dimension::z),
+        resultTy);
+    if (!x || !y || !z)
       return rewriter.notifyMatchFailure(
-          op, "cannot convert get_tile_block_id result type");
-    Value bx = castValueToType(
-        rewriter, loc, gpu::BlockIdOp::create(rewriter, loc, gpu::Dimension::x),
-        resultTy);
-    Value by = castValueToType(
-        rewriter, loc, gpu::BlockIdOp::create(rewriter, loc, gpu::Dimension::y),
-        resultTy);
-    Value bz = castValueToType(
-        rewriter, loc, gpu::BlockIdOp::create(rewriter, loc, gpu::Dimension::z),
-        resultTy);
-    if (!bx || !by || !bz)
-      return rewriter.notifyMatchFailure(
-          op, "cannot cast block ids to result type");
-    rewriter.replaceOp(op, {bx, by, bz});
+          op, "cannot cast dim query results to target type");
+    rewriter.replaceOp(op, {x, y, z});
     return success();
   }
 };
@@ -1228,7 +1230,9 @@ static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
   MLIRContext *ctx = patterns.getContext();
   patterns
       .add<ConvertModule, ConvertEntry, ConvertMakeTensorView,
-           ConvertMakePartitionView, ConvertConstant, ConvertGetTileBlockId,
+           ConvertMakePartitionView, ConvertConstant,
+           ConvertDimQueryOp<cuda_tile::GetTileBlockIdOp, gpu::BlockIdOp>,
+           ConvertDimQueryOp<cuda_tile::GetNumTileBlocksOp, gpu::GridDimOp>,
            ConvertBinaryLhsRhsOp<cuda_tile::MulIOp, arith::MulIOp>,
            ConvertAtan2, ConvertUnarySourceOp<cuda_tile::CeilOp, math::CeilOp>,
            ConvertCmpF, ConvertUnarySourceOp<cuda_tile::CosOp, math::CosOp>,

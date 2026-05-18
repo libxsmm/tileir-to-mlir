@@ -390,6 +390,19 @@ cuda_tile.module @ops_module {
     return
   }
 
+  // --- get_num_tile_blocks ---
+  // CHECK-LABEL: gpu.func @test_get_num_tile_blocks
+  entry @test_get_num_tile_blocks() {
+    // CHECK: %[[GD_X:.*]] = gpu.grid_dim x
+    // CHECK: %[[GD_XI:.*]] = arith.index_cast %[[GD_X]] : index to i32
+    // CHECK: %[[GD_Y:.*]] = gpu.grid_dim y
+    // CHECK: %[[GD_YI:.*]] = arith.index_cast %[[GD_Y]] : index to i32
+    // CHECK: %[[GD_Z:.*]] = gpu.grid_dim z
+    // CHECK: %[[GD_ZI:.*]] = arith.index_cast %[[GD_Z]] : index to i32
+    %x, %y, %z = get_num_tile_blocks : tile<i32>
+    return
+  }
+
   // --- for / continue ---
   // CHECK-LABEL: gpu.func @test_for
   entry @test_for() {
