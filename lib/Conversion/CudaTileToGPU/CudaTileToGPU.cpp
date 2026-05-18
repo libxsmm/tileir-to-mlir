@@ -724,23 +724,39 @@ struct ConvertGetIndexSpaceShape
     // For each tile dimension i:
     // - The corresponding tensor_view dimension is dimMap[i]
     // - index_space_dim_i = ceildiv(memref.dim(dimMap[i]), tileShape[i])
+    // When the memref dimension is statically known, fold to a constant.
+    auto memrefTy = cast<MemRefType>(pvInfo.memref.getType());
+    auto memrefShape = memrefTy.getShape();
+
     SmallVector<Value> results;
     for (unsigned i = 0; i < rank; ++i) {
       int64_t tileSize = pvInfo.tileShape[i];
       unsigned tensorDim = pvInfo.dimMap[i];
-      Value dimVal = memref::DimOp::create(
-          rewriter, loc, pvInfo.memref,
-          arith::ConstantIndexOp::create(rewriter, loc, tensorDim));
-      Value tileSizeVal =
-          arith::ConstantIndexOp::create(rewriter, loc, tileSize);
-      Value divResult =
-          arith::CeilDivUIOp::create(rewriter, loc, dimVal, tileSizeVal);
       Type resultTy =
           getTypeConverter()->convertType(op->getResult(i).getType());
       if (!resultTy)
         return rewriter.notifyMatchFailure(
             op, "cannot convert get_index_space_shape result type");
-      Value castedResult = castValueToType(rewriter, loc, divResult, resultTy);
+
+      int64_t dimSize = memrefShape[tensorDim];
+      Value castedResult;
+      if (dimSize != ShapedType::kDynamic) {
+        // Static dimension: compute ceildiv at compile time.
+        int64_t numTiles = (dimSize + tileSize - 1) / tileSize;
+        Value cst = arith::ConstantIndexOp::create(rewriter, loc, numTiles);
+        castedResult = castValueToType(rewriter, loc, cst, resultTy);
+      } else {
+        // Dynamic dimension: emit memref.dim + ceildivui.
+        Value dimVal = memref::DimOp::create(
+            rewriter, loc, pvInfo.memref,
+            arith::ConstantIndexOp::create(rewriter, loc, tensorDim));
+        Value tileSizeVal =
+            arith::ConstantIndexOp::create(rewriter, loc, tileSize);
+        Value divResult =
+            arith::CeilDivUIOp::create(rewriter, loc, dimVal, tileSizeVal);
+        castedResult = castValueToType(rewriter, loc, divResult, resultTy);
+      }
+
       if (!castedResult)
         return rewriter.notifyMatchFailure(
             op, "cannot cast index_space_shape result to converted type");
