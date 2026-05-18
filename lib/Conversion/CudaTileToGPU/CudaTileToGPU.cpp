@@ -707,6 +707,40 @@ struct ConvertAssume : public OpConversionPattern<cuda_tile::AssumeOp> {
   }
 };
 
+/// Convert cuda_tile.reshape to vector.shape_cast / vector.broadcast /
+/// vector.extract depending on source/result ranks.
+///   - vector -> vector: vector.shape_cast
+///   - scalar -> vector: vector.broadcast (scalar to single-element vector)
+///   - vector -> scalar: vector.extract at [0,...,0]
+///   - scalar -> scalar: identity
+struct ConvertReshape : public OpConversionPattern<cuda_tile::ReshapeOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::ReshapeOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type resultTy = getTypeConverter()->convertType(op.getType());
+    if (!resultTy)
+      return rewriter.notifyMatchFailure(op, "cannot convert result type");
+
+    Value source = adaptor.getSource();
+    auto srcVecTy = dyn_cast<VectorType>(source.getType());
+    auto dstVecTy = dyn_cast<VectorType>(resultTy);
+
+    if (srcVecTy && dstVecTy) {
+      rewriter.replaceOpWithNewOp<vector::ShapeCastOp>(op, dstVecTy, source);
+    } else if (!srcVecTy && dstVecTy) {
+      rewriter.replaceOpWithNewOp<vector::BroadcastOp>(op, dstVecTy, source);
+    } else if (srcVecTy && !dstVecTy) {
+      SmallVector<int64_t> indices(srcVecTy.getRank(), 0);
+      rewriter.replaceOpWithNewOp<vector::ExtractOp>(op, source, indices);
+    } else {
+      rewriter.replaceOp(op, source);
+    }
+    return success();
+  }
+};
+
 /// Convert cuda_tile.get_index_space_shape.
 /// For
 /// partition_view<tile=(T0xT1x...), tensor_view<?x?x...>, dim_map=[d0,d1,...]>
@@ -1249,7 +1283,8 @@ static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
            ConvertMulhiI, ConvertNegI,
            ConvertBinaryLhsRhsOp<cuda_tile::XOrIOp, arith::XOrIOp>, ConvertFor,
            ConvertContinue, ConvertReturn, ConvertMmaF, ConvertAssume,
-           ConvertGetIndexSpaceShape, ConvertLoadViewTko, ConvertStoreViewTko>(
+           ConvertReshape, ConvertGetIndexSpaceShape, ConvertLoadViewTko,
+           ConvertStoreViewTko>(
           converter, ctx);
 }
 

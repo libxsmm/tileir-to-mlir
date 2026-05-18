@@ -437,4 +437,37 @@ cuda_tile.module @ops_module {
     }
     return
   }
+
+  // --- reshape ---
+  // CHECK-LABEL: gpu.func @test_reshape
+  entry @test_reshape() {
+    // scalar -> vector (broadcast): tile<i8> -> tile<1x1x1xi8>
+    // CHECK: %[[S0:.*]] = arith.constant 0 : i8
+    %cst = constant <i8: 0> : tile<i8>
+    // CHECK: %[[R0:.*]] = vector.broadcast %[[S0]] : i8 to vector<1x1x1xi8>
+    %0 = reshape %cst : tile<i8> -> tile<1x1x1xi8>
+
+    // vector -> vector (shape_cast): tile<8x2xf32> -> tile<2x2x4x1xf32>
+    // CHECK: %[[S1_SCALAR:.*]] = arith.constant 0.000000e+00 : f32
+    // CHECK: %[[S1:.*]] = vector.broadcast %[[S1_SCALAR]] : f32 to vector<8x2xf32>
+    %t = constant <f32: 0.0> : tile<8x2xf32>
+    // CHECK: %[[R1:.*]] = vector.shape_cast %[[S1]] : vector<8x2xf32> to vector<2x2x4x1xf32>
+    %1 = reshape %t : tile<8x2xf32> -> tile<2x2x4x1xf32>
+
+    // vector -> vector (shape_cast): tile<2x4xi32> -> tile<2x2x2xi32>
+    // CHECK: %[[S2:.*]] = arith.constant dense<{{\[}}[0, 1, 2, 3], [4, 5, 6, 7]]> : vector<2x4xi32>
+    %cst2 = constant <i32: [[0, 1, 2, 3], [4, 5, 6, 7]]> : tile<2x4xi32>
+    // CHECK: %[[R2:.*]] = vector.shape_cast %[[S2]] : vector<2x4xi32> to vector<2x2x2xi32>
+    %2 = reshape %cst2 : tile<2x4xi32> -> tile<2x2x2xi32>
+
+    // vector -> vector (flatten): tile<2x4xi32> -> tile<8xi32>
+    // CHECK: %[[R3:.*]] = vector.shape_cast %[[S2]] : vector<2x4xi32> to vector<8xi32>
+    %3 = reshape %cst2 : tile<2x4xi32> -> tile<8xi32>
+
+    // vector -> vector (unflatten): tile<8xi32> -> tile<2x2x2xi32>
+    // CHECK: %[[R4:.*]] = vector.shape_cast %[[R3]] : vector<8xi32> to vector<2x2x2xi32>
+    %4 = reshape %3 : tile<8xi32> -> tile<2x2x2xi32>
+
+    return
+  }
 }
