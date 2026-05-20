@@ -1465,6 +1465,10 @@ struct ConvertTileIRToGPUPass
         changed = true;
       }
     }
+
+    // Mark the module as a GPU container module.
+    module->setAttr(gpu::GPUDialect::getContainerModuleAttrName(),
+                    UnitAttr::get(ctx));
   }
 };
 

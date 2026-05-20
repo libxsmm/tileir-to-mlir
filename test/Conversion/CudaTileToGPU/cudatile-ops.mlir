@@ -4,6 +4,7 @@
 // Tests derived from cuda_tile IR op definition examples in Ops.td.
 // Each entry exercises one or more supported ops.
 
+// CHECK: module attributes {gpu.container_module}
 // CHECK-LABEL: gpu.module @ops_module {
 cuda_tile.module @ops_module {
 
