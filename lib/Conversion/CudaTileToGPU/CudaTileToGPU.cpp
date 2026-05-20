@@ -540,29 +540,56 @@ struct ConvertNegI : public OpConversionPattern<cuda_tile::NegIOp> {
 };
 
 /// Convert cuda_tile.for to scf.for.
-///   1. Create scf.ForOp with converted bounds and initial values.
-///   2. Convert region types in old body using type converter.
-///   3. Remove auto-generated yield in new body.
-///   4. Merge old body into new body, replacing block args (induction var +
-///      iter args).
-///   5. Replace old op with new ForOp results.
+///   - Create scf.ForOp with converted bounds and initial values.
+///     Use bounds in index space, not tile space; 
+///   - Convert region types in old body using type converter.
+///   - Merge old body into new body, replacing block args (induction var +
+///     iter args).
+///   - Replace old op with new ForOp results.
 struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
   using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::ForOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    Value lb = castValueToType(rewriter, op.getLoc(), adaptor.getLowerBound(),
+    Location loc = op.getLoc();
+    Value lb = castValueToType(rewriter, loc, adaptor.getLowerBound(),
                                rewriter.getIndexType());
-    Value ub = castValueToType(rewriter, op.getLoc(), adaptor.getUpperBound(),
+    Value ub = castValueToType(rewriter, loc, adaptor.getUpperBound(),
                                rewriter.getIndexType());
-    Value step = castValueToType(rewriter, op.getLoc(), adaptor.getStep(),
+    Value step = castValueToType(rewriter, loc, adaptor.getStep(),
                                  rewriter.getIndexType());
     if (!lb || !ub || !step)
       return rewriter.notifyMatchFailure(
           op, "for bounds could not be converted to index");
 
-    auto newForOp = scf::ForOp::create(rewriter, op.getLoc(), lb, ub, step,
+    // Check if the upper bound originates from get_index_space_shape.
+    // If so, rescale the loop to iterate in element-index space and introduce
+    // a divui at the top of the body to recover the tile-space index for
+    // existing consumers.
+    int64_t tileSize = 0;
+    if (auto issOp = op.getUpperBound()
+                         .getDefiningOp<cuda_tile::GetIndexSpaceShapeOp>()) {
+      unsigned resultIdx = 0;
+      for (auto result : issOp->getResults()) {
+        if (result == op.getUpperBound())
+          break;
+        ++resultIdx;
+      }
+      auto pvType =
+          cast<cuda_tile::PartitionViewType>(issOp.getSrc().getType());
+      tileSize = pvType.getTileShape().asArrayRef()[resultIdx];
+    }
+
+    if (tileSize > 0) {
+      Value tileSizeVal =
+          arith::ConstantIndexOp::create(rewriter, loc, tileSize);
+      lb = arith::MulIOp::create(rewriter, loc, lb, tileSizeVal);
+      ub = arith::MulIOp::create(rewriter, loc, ub, tileSizeVal);
+      step = arith::MulIOp::create(rewriter, loc, step, tileSizeVal);
+    }
+
+    auto newForOp = scf::ForOp::create(rewriter, loc, lb, ub, step,
                                        adaptor.getInitValues());
 
     // Convert region types
@@ -581,9 +608,21 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
     SmallVector<Value> replacingValues;
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToStart(newBody);
-    Value iv =
-        castValueToType(rewriter, op.getLoc(), newForOp.getInductionVar(),
-                        oldBody->getArgument(0).getType());
+
+    Value iv;
+    if (tileSize > 0) {
+      // The loop now iterates in element space. Introduce a divui to recover
+      // the tile-space index that existing body ops expect.
+      Value tileSizeVal =
+          arith::ConstantIndexOp::create(rewriter, loc, tileSize);
+      Value tileIdx = arith::DivUIOp::create(
+          rewriter, loc, newForOp.getInductionVar(), tileSizeVal);
+      iv = castValueToType(rewriter, loc, tileIdx,
+                           oldBody->getArgument(0).getType());
+    } else {
+      iv = castValueToType(rewriter, loc, newForOp.getInductionVar(),
+                           oldBody->getArgument(0).getType());
+    }
     if (!iv)
       return rewriter.notifyMatchFailure(
           op, "for induction variable could not be converted to body type");
@@ -1379,6 +1418,38 @@ struct ConvertTileIRToGPUPass
 
     if (failed(applyPartialConversion(module, target, std::move(patterns))))
       return signalPassFailure();
+
+    // Post-conversion cleanup: fold muli(divui(x, c), c) → x.
+    // The divui result may pass through index_cast ops before reaching the
+    // muli, so we look through index_casts to find the underlying divui.
+    // The divisor and multiplier may be separate constant ops with the same
+    // value, so we compare constant attribute values.
+    module.walk([](arith::MulIOp op) {
+      for (auto [mulOperand, otherOperand] :
+           {std::pair(op.getLhs(), op.getRhs()),
+            std::pair(op.getRhs(), op.getLhs())}) {
+        // Look through index_casts.
+        Value v = mulOperand;
+        while (auto cast = v.getDefiningOp<arith::IndexCastOp>())
+          v = cast.getIn();
+        auto divOp = v.getDefiningOp<arith::DivUIOp>();
+        if (!divOp)
+          continue;
+        if (divOp.getRhs() == otherOperand) {
+          op.replaceAllUsesWith(divOp.getLhs());
+          op->erase();
+          return;
+        }
+        // Check if they are distinct constants with the same value.
+        auto divCst = divOp.getRhs().getDefiningOp<arith::ConstantIndexOp>();
+        auto mulCst = otherOperand.getDefiningOp<arith::ConstantIndexOp>();
+        if (divCst && mulCst && divCst.value() == mulCst.value()) {
+          op.replaceAllUsesWith(divOp.getLhs());
+          op->erase();
+          return;
+        }
+      }
+    });
 
     // Clean up any leftover unrealized_conversion_casts that became dead.
     bool changed = true;

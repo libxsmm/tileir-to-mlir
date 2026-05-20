@@ -5,7 +5,6 @@
 //
 // This implementation does tiling, and reduction over
 // K for dynamic sizes.
-// Input A, B, C are expected in (K x M), (N x K), (M x N), so the kernel needs to flip input dimensions.
 cuda_tile.module @gemm_kloop_module {
     entry @gemm_kloop_kernel(
         %A_ptr: !cuda_tile.tile<!cuda_tile.ptr<f16>>,

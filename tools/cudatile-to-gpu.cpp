@@ -19,6 +19,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
+#include "mlir/Transforms/Passes.h"
 
 #include "llvm/ADT/StringRef.h"
 
@@ -35,6 +36,8 @@ int main(int argc, char **argv) {
     return mlir::createConvertTileIRToGPUPass();
   });
 
+  mlir::registerTransformsPasses();
+
   // If no pass/pipeline flags are given, default to
   // --convert-cuda-tile-to-gpu.
   bool hasPassFlag = false;
@@ -46,8 +49,13 @@ int main(int argc, char **argv) {
   }
 
   std::vector<const char *> newArgv(argv, argv + argc);
-  if (!hasPassFlag)
-    newArgv.push_back("--convert-cuda-tile-to-gpu");
+  if (!hasPassFlag) {
+    newArgv.push_back("--pass-pipeline=builtin.module("
+                      "convert-cuda-tile-to-gpu,"
+                      "loop-invariant-code-motion,"
+                      "canonicalize,"
+                      "cse)");
+  }
   int newArgc = static_cast<int>(newArgv.size());
 
   return mlir::asMainReturnCode(

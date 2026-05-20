@@ -82,17 +82,19 @@ cuda_tile.module @gemm_kloop_module {
         // Now that we have done all the setup, we can finally perform the  computation itself.
         //
         // We simply loop over the K dimension computing: dot(A_block[0, k], B_block[k, 0]).
-        // CHECK: %[[LOOP_UB:.*]] = arith.index_cast %[[CEIL1_I32]] : i32 to index
-        // CHECK: scf.for %{{.*}} = %{{.*}} to %[[LOOP_UB]] step %{{.*}}
+        // CHECK: %[[LOOP_UB_TILE:.*]] = arith.index_cast %[[CEIL1_I32]] : i32 to index
+        // CHECK: %[[C64_SCALE:.*]] = arith.constant 64 : index
+        // CHECK: %[[LOOP_UB:.*]] = arith.muli %[[LOOP_UB_TILE]], %[[C64_SCALE]] : index
+        // CHECK: scf.for %[[IV:.*]] = %{{.*}} to %[[LOOP_UB]] step %{{.*}}
         %result = for %k in (%i0 to %mk_len_i32#1, step %i1) : tile<i32>
             iter_values(%acc_prev = %cst) -> (tile<256x128xf32>)
         {
             // Load a single 256x64 matrix from the tile.
-            // CHECK: %[[A_FRAG:.*]] = vector.transfer_read %[[A_ARG]][%{{.*}}, %{{.*}}], %{{.*}} {permutation_map = #map} : memref<?x?xf16, strided<[?, 1]>>, vector<256x64xf16>
+            // CHECK: %[[A_FRAG:.*]] = vector.transfer_read %[[A_ARG]][%[[IV]], %{{.*}}], %{{.*}} {permutation_map = #map} : memref<?x?xf16, strided<[?, 1]>>, vector<256x64xf16>
             %A_frag, %t1 = load_view_tko weak %A_block[%bidx, %k] : partition_view<tile=(256x64), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>, tile<i32> -> tile<256x64xf16>, token
 
             // Load a single 64x128 matrix from the tile.
-            // CHECK: %[[B_FRAG:.*]] = vector.transfer_read %[[B_ARG]][%{{.*}}, %{{.*}}], %{{.*}} {permutation_map = #map} : memref<?x?xf16, strided<[?, 1]>>, vector<64x128xf16>
+            // CHECK: %[[B_FRAG:.*]] = vector.transfer_read %[[B_ARG]][%{{.*}}, %[[IV]]], %{{.*}} {permutation_map = #map} : memref<?x?xf16, strided<[?, 1]>>, vector<64x128xf16>
             %B_frag, %t2 = load_view_tko weak %B_block [%k, %bidy] : partition_view<tile=(64x128), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>, tile<i32> -> tile<64x128xf16>, token
 
             // Compute the mma(A_frag, B_frag) + acc_prev.
@@ -113,6 +115,7 @@ cuda_tile.module @gemm_kloop_module {
     // Section 11.1.7 (static variant)
     // Example: GEMM with statically shaped tensor_view arguments (M=N=K=4096)
     // Description: Same GEMM loop structure but tensor_views with known shapes replace ptr + make_tensor_view.
+    // A and B inputs are not permuted.
     // CHECK-LABEL: gpu.func @gemm_kloop_static(
     // CHECK-SAME: %[[SA:[a-zA-Z0-9_]+]]: memref<4096x4096xf16>, %[[SB:[a-zA-Z0-9_]+]]: memref<4096x4096xf16>, %[[SC:[a-zA-Z0-9_]+]]: memref<4096x4096xf32>
     entry @gemm_kloop_static(
@@ -126,9 +129,9 @@ cuda_tile.module @gemm_kloop_module {
 
         // Partition the static tensor_views directly (no make_tensor_view needed).
         // A is (K x M) = (4096 x 4096), blocked as block_m x block_k with dim_map=[1,0].
-        %A_block = make_partition_view %A : partition_view<tile=(256x64), tensor_view<4096x4096xf16, strides=[4096,1]>, dim_map=[1, 0]>
+        %A_block = make_partition_view %A : partition_view<tile=(256x32), tensor_view<4096x4096xf16, strides=[4096,1]>, dim_map=[0, 1]>
         // B is (N x K) = (4096 x 4096), blocked as block_k x block_n with dim_map=[1,0].
-        %B_block = make_partition_view %B : partition_view<tile=(64x128), tensor_view<4096x4096xf16, strides=[4096,1]>, dim_map=[1, 0]>
+        %B_block = make_partition_view %B : partition_view<tile=(32x128), tensor_view<4096x4096xf16, strides=[4096,1]>, dim_map=[0, 1]>
         // C is (M x N) = (4096 x 4096), blocked as block_m x block_n with dim_map=[0,1].
         %C_block = make_partition_view %C : partition_view<tile=(256x128), tensor_view<4096x4096xf32, strides=[4096,1]>, dim_map=[0, 1]>
 
@@ -136,22 +139,22 @@ cuda_tile.module @gemm_kloop_module {
 
         // CHECK: %[[SC16:.*]] = arith.constant 16 : index
         // CHECK: arith.index_cast %[[SC16]] : index to i32
-        // CHECK: %[[SC64:.*]] = arith.constant 64 : index
-        // CHECK: %[[SK_LEN:.*]] = arith.index_cast %[[SC64]] : index to i32
-        %mk_len_i32:2 = get_index_space_shape %A_block : partition_view<tile=(256x64), tensor_view<4096x4096xf16, strides=[4096,1]>, dim_map=[1, 0]> -> tile<i32>
+        // CHECK: %[[SC128:.*]] = arith.constant 128 : index
+        // CHECK: %[[SK_LEN:.*]] = arith.index_cast %[[SC128]] : index to i32
+        %mk_len_i32:2 = get_index_space_shape %A_block : partition_view<tile=(256x32), tensor_view<4096x4096xf16, strides=[4096,1]>, dim_map=[0, 1]> -> tile<i32>
 
-        // CHECK: scf.for
+        // CHECK: scf.for %[[SIV:.*]] = %{{.*}} to %{{.*}} step %{{.*}}
         %result = for %k in (%i0 to %mk_len_i32#1, step %i1) : tile<i32>
             iter_values(%acc_prev = %cst) -> (tile<256x128xf32>)
         {
-            // CHECK: %[[SA_FRAG:.*]] = vector.transfer_read %[[SA]][%{{.*}}, %{{.*}}], %{{.*}} {in_bounds = [true, true], permutation_map = #map} : memref<4096x4096xf16>, vector<256x64xf16>
-            %A_frag, %t1 = load_view_tko weak %A_block[%bidx, %k] : partition_view<tile=(256x64), tensor_view<4096x4096xf16, strides=[4096,1]>, dim_map=[1, 0]>, tile<i32> -> tile<256x64xf16>, token
+            // CHECK: %[[SA_FRAG:.*]] = vector.transfer_read %[[SA]][%{{.*}}, %[[SIV]]], %{{.*}} {in_bounds = [true, true]} : memref<4096x4096xf16>, vector<256x32xf16>
+            %A_frag, %t1 = load_view_tko weak %A_block[%bidx, %k] : partition_view<tile=(256x32), tensor_view<4096x4096xf16, strides=[4096,1]>, dim_map=[0, 1]>, tile<i32> -> tile<256x32xf16>, token
 
-            // CHECK: %[[SB_FRAG:.*]] = vector.transfer_read %[[SB]][%{{.*}}, %{{.*}}], %{{.*}} {in_bounds = [true, true], permutation_map = #map} : memref<4096x4096xf16>, vector<64x128xf16>
-            %B_frag, %t2 = load_view_tko weak %B_block[%k, %bidy] : partition_view<tile=(64x128), tensor_view<4096x4096xf16, strides=[4096,1]>, dim_map=[1, 0]>, tile<i32> -> tile<64x128xf16>, token
+            // CHECK: %[[SB_FRAG:.*]] = vector.transfer_read %[[SB]][%[[SIV]], %{{.*}}], %{{.*}} {in_bounds = [true, true]} : memref<4096x4096xf16>, vector<32x128xf16>
+            %B_frag, %t2 = load_view_tko weak %B_block[%k, %bidy] : partition_view<tile=(32x128), tensor_view<4096x4096xf16, strides=[4096,1]>, dim_map=[0, 1]>, tile<i32> -> tile<32x128xf16>, token
 
-            // CHECK: %[[SACC:.*]] = vector.contract {indexing_maps = [#map1, #map2, #map3], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %[[SA_FRAG]], %[[SB_FRAG]], %{{.*}} : vector<256x64xf16>, vector<64x128xf16> into vector<256x128xf32>
-            %acc = mmaf %A_frag, %B_frag, %acc_prev: tile<256x64xf16>, tile<64x128xf16>, tile<256x128xf32>
+            // CHECK: %[[SACC:.*]] = vector.contract {indexing_maps = [#map1, #map2, #map3], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %[[SA_FRAG]], %[[SB_FRAG]], %{{.*}} : vector<256x32xf16>, vector<32x128xf16> into vector<256x128xf32>
+            %acc = mmaf %A_frag, %B_frag, %acc_prev: tile<256x32xf16>, tile<32x128xf16>, tile<256x128xf32>
             // CHECK: scf.yield %[[SACC]] : vector<256x128xf32>
             continue %acc : tile<256x128xf32>
         }
