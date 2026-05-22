@@ -20,6 +20,8 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 
+#include "llvm/ADT/TypeSwitch.h"
+
 #include "cuda_tile/Dialect/CudaTile/IR/Dialect.h"
 #include "cuda_tile/Dialect/CudaTile/IR/Ops.h"
 #include "cuda_tile/Dialect/CudaTile/IR/Types.h"
@@ -822,6 +824,106 @@ struct ConvertReshape : public OpConversionPattern<cuda_tile::ReshapeOp> {
   }
 };
 
+/// Match the body of a cuda_tile.reduce to determine the CombiningKind.
+/// The body is expected to have exactly one combining op (ignoring the yield).
+static FailureOr<vector::CombiningKind> matchReduceBody(Region &body) {
+  Block &block = body.front();
+  // The body should contain exactly one op besides the terminator (yield).
+  Operation *combiningOp = nullptr;
+  for (Operation &op : block.without_terminator()) {
+    if (combiningOp)
+      return failure(); // more than one op
+    combiningOp = &op;
+  }
+  if (!combiningOp)
+    return failure();
+
+  return llvm::TypeSwitch<Operation *, FailureOr<vector::CombiningKind>>(
+             combiningOp)
+      .Case<cuda_tile::AddFOp, cuda_tile::AddIOp>(
+          [](auto) { return vector::CombiningKind::ADD; })
+      .Case<cuda_tile::MulFOp, cuda_tile::MulIOp>(
+          [](auto) { return vector::CombiningKind::MUL; })
+      .Case<cuda_tile::MaxFOp>([](cuda_tile::MaxFOp op) {
+        return op.getPropagateNan() ? vector::CombiningKind::MAXIMUMF
+                                    : vector::CombiningKind::MAXNUMF;
+      })
+      .Case<cuda_tile::MinFOp>([](cuda_tile::MinFOp op) {
+        return op.getPropagateNan() ? vector::CombiningKind::MINIMUMF
+                                    : vector::CombiningKind::MINNUMF;
+      })
+      .Case<cuda_tile::MaxIOp>([](cuda_tile::MaxIOp op) {
+        return op.getSignedness() == cuda_tile::Signedness::Unsigned
+                   ? vector::CombiningKind::MAXUI
+                   : vector::CombiningKind::MAXSI;
+      })
+      .Case<cuda_tile::MinIOp>([](cuda_tile::MinIOp op) {
+        return op.getSignedness() == cuda_tile::Signedness::Unsigned
+                   ? vector::CombiningKind::MINUI
+                   : vector::CombiningKind::MINSI;
+      })
+      .Case<cuda_tile::AndIOp>([](auto) { return vector::CombiningKind::AND; })
+      .Case<cuda_tile::OrIOp>([](auto) { return vector::CombiningKind::OR; })
+      .Case<cuda_tile::XOrIOp>([](auto) { return vector::CombiningKind::XOR; })
+      .Default([](Operation *) { return failure(); });
+}
+
+/// Convert cuda_tile.reduce to vector.reduction (1D->scalar) or
+/// vector.multi_reduction (ND->(N-1)D).
+///
+/// Only supports single-operand reductions where the body contains exactly
+/// one recognized combining op.
+struct ConvertReduce : public OpConversionPattern<cuda_tile::ReduceOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::ReduceOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    // Only support single-operand reductions for now.
+    if (op.getOperands().size() != 1)
+      return rewriter.notifyMatchFailure(op,
+                                         "multi-operand reduce not supported");
+
+    auto kind = matchReduceBody(op.getBody());
+    if (failed(kind))
+      return rewriter.notifyMatchFailure(
+          op, "cannot determine combining kind from reduce body");
+
+    Value source = adaptor.getOperands().front();
+    auto srcVecTy = dyn_cast<VectorType>(source.getType());
+    if (!srcVecTy)
+      return rewriter.notifyMatchFailure(op, "source is not a vector");
+
+    Type resultTy = getTypeConverter()->convertType(op.getResult(0).getType());
+    if (!resultTy)
+      return rewriter.notifyMatchFailure(op, "cannot convert result type");
+
+    Location loc = op.getLoc();
+    uint32_t dim = op.getDim();
+
+    // Get the identity value from the identities attribute.
+    auto identityAttr = op.getIdentities()[0];
+
+    if (auto dstVecTy = dyn_cast<VectorType>(resultTy)) {
+      // Multi-dim case: vector.multi_reduction
+      // Build the accumulator from the identity value via splat.
+      Value acc = arith::ConstantOp::create(
+          rewriter, loc, dstVecTy,
+          SplatElementsAttr::get(dstVecTy, identityAttr));
+      rewriter.replaceOpWithNewOp<vector::MultiDimReductionOp>(
+          op, *kind, source, acc,
+          rewriter.getDenseI64ArrayAttr({static_cast<int64_t>(dim)}));
+    } else {
+      // 1D -> scalar case: vector.reduction
+      // Build the accumulator from the identity.
+      Value acc = arith::ConstantOp::create(rewriter, loc, resultTy,
+                                            cast<TypedAttr>(identityAttr));
+      rewriter.replaceOpWithNewOp<vector::ReductionOp>(op, *kind, source, acc);
+    }
+    return success();
+  }
+};
+
 /// Convert cuda_tile.get_index_space_shape.
 /// For
 /// partition_view<tile=(T0xT1x...), tensor_view<?x?x...>, dim_map=[d0,d1,...]>
@@ -1365,8 +1467,9 @@ static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
            ConvertBinaryLhsRhsOp<cuda_tile::XOrIOp, arith::XOrIOp>, ConvertFor,
            ConvertIf, ConvertToScfYield<cuda_tile::ContinueOp>,
            ConvertToScfYield<cuda_tile::YieldOp>, ConvertReturn, ConvertMmaF,
-           ConvertAssume, ConvertReshape, ConvertGetIndexSpaceShape,
-           ConvertLoadViewTko, ConvertStoreViewTko>(converter, ctx);
+           ConvertAssume, ConvertReshape, ConvertReduce,
+           ConvertGetIndexSpaceShape, ConvertLoadViewTko, ConvertStoreViewTko>(
+          converter, ctx);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1419,7 +1522,7 @@ struct ConvertTileIRToGPUPass
     if (failed(applyPartialConversion(module, target, std::move(patterns))))
       return signalPassFailure();
 
-    // Post-conversion cleanup: fold muli(divui(x, c), c) → x.
+    // Post-conversion cleanup: fold muli(divui(x, c), c) -> x.
     // The divui result may pass through index_cast ops before reaching the
     // muli, so we look through index_casts to find the underlying divui.
     // The divisor and multiplier may be separate constant ops with the same

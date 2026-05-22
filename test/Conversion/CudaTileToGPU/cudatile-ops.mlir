@@ -514,4 +514,31 @@ cuda_tile.module @ops_module {
 
     return
   }
+
+  // --- reduce (1D -> scalar, addf) ---
+  // CHECK-LABEL: gpu.func @test_reduce_addf_1d
+  entry @test_reduce_addf_1d() {
+    %input = constant <f32: 0.0> : tile<8xf32>
+    // CHECK: vector.reduction <add>, %{{.*}}, %{{.*}} : vector<8xf32> into f32
+    %0 = reduce %input dim=0 identities=[0.000000e+00 : f32] : tile<8xf32> -> tile<f32>
+      (%input_arg: tile<f32>, %input_accum: tile<f32>) {
+        %add_result = addf %input_arg, %input_accum : tile<f32>
+        yield %add_result : tile<f32>
+      }
+    return
+  }
+
+  // --- reduce (2D -> 1D, addf along dim 0) ---
+  // CHECK-LABEL: gpu.func @test_reduce_addf_2d
+  entry @test_reduce_addf_2d() {
+    %input = constant <f32: 0.0> : tile<8x64xf32>
+    // CHECK: vector.multi_reduction <add>, %{{.*}}, %{{.*}} [0] : vector<8x64xf32> to vector<64xf32>
+    %0 = reduce %input dim=0 identities=[0.000000e+00 : f32] : tile<8x64xf32> -> tile<64xf32>
+      (%input_arg: tile<f32>, %input_accum: tile<f32>) {
+        %add_result = addf %input_arg, %input_accum : tile<f32>
+        yield %add_result : tile<f32>
+      }
+    return
+  }
+
 }

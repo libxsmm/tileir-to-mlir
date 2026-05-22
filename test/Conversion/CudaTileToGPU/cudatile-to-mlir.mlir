@@ -143,4 +143,96 @@ cuda_tile.module @m {
     // CHECK: vector.transfer_write %[[STS_BCAST]], %[[STS_PTR]][%{{.*}}, %{{.*}}] {permutation_map = #{{.*}}} : vector<4x2xf16>, memref<?x?xf16, strided<[?, 1]>>
     %tok = store_view_tko weak %tile, %pv[%c0, %c1] : tile<4x2xf16>, partition_view<tile=(4x2), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>, tile<i32> -> token
   }
+
+  // --- reduce (1D -> scalar, mulf) ---
+  // CHECK-LABEL: gpu.func @test_reduce_mulf_1d
+  entry @test_reduce_mulf_1d() {
+    %input = constant <f32: 1.0> : tile<4xf32>
+    // CHECK: vector.reduction <mul>, %{{.*}}, %{{.*}} : vector<4xf32> into f32
+    %0 = reduce %input dim=0 identities=[1.000000e+00 : f32] : tile<4xf32> -> tile<f32>
+      (%input_arg: tile<f32>, %input_accum: tile<f32>) {
+        %mul_result = mulf %input_arg, %input_accum : tile<f32>
+        yield %mul_result : tile<f32>
+      }
+    return
+  }
+
+  // --- reduce (1D -> scalar, maxf with propagate_nan) ---
+  // CHECK-LABEL: gpu.func @test_reduce_maxf_1d
+  entry @test_reduce_maxf_1d() {
+    %input = constant <f32: 0.0> : tile<8xf32>
+    // CHECK: vector.reduction <maximumf>
+    %0 = reduce %input dim=0 identities=[0xFF800000 : f32] : tile<8xf32> -> tile<f32>
+      (%input_arg: tile<f32>, %input_accum: tile<f32>) {
+        %max_result = maxf %input_arg, %input_accum propagate_nan : tile<f32>
+        yield %max_result : tile<f32>
+      }
+    return
+  }
+
+  // --- reduce (1D -> scalar, minf without propagate_nan) ---
+  // CHECK-LABEL: gpu.func @test_reduce_minf_1d
+  entry @test_reduce_minf_1d() {
+    %input = constant <f32: 0.0> : tile<8xf32>
+    // CHECK: vector.reduction <minnumf>
+    %0 = reduce %input dim=0 identities=[0x7F800000 : f32] : tile<8xf32> -> tile<f32>
+      (%input_arg: tile<f32>, %input_accum: tile<f32>) {
+        %min_result = minf %input_arg, %input_accum : tile<f32>
+        yield %min_result : tile<f32>
+      }
+    return
+  }
+
+  // --- reduce (1D -> scalar, addi) ---
+  // CHECK-LABEL: gpu.func @test_reduce_addi_1d
+  entry @test_reduce_addi_1d() {
+    %input = constant <i32: 0> : tile<8xi32>
+    // CHECK: vector.reduction <add>, %{{.*}}, %{{.*}} : vector<8xi32> into i32
+    %0 = reduce %input dim=0 identities=[0 : i32] : tile<8xi32> -> tile<i32>
+      (%input_arg: tile<i32>, %input_accum: tile<i32>) {
+        %add_result = addi %input_arg, %input_accum : tile<i32>
+        yield %add_result : tile<i32>
+      }
+    return
+  }
+
+  // --- reshape (vector -> scalar via vector.extract) ---
+  // CHECK-LABEL: gpu.func @test_reshape_vector_to_scalar
+  entry @test_reshape_vector_to_scalar() {
+    %t = constant <i32: [[7]]> : tile<1x1xi32>
+    // CHECK: vector.extract %{{.*}}[0, 0] : i32 from vector<1x1xi32>
+    %s = reshape %t : tile<1x1xi32> -> tile<i32>
+    return
+  }
+
+  // --- reshape (scalar -> scalar identity) ---
+  // CHECK-LABEL: gpu.func @test_reshape_scalar_to_scalar
+  entry @test_reshape_scalar_to_scalar() {
+    // CHECK: %[[S:.*]] = arith.constant 7 : i32
+    %t = constant <i32: 7> : tile<i32>
+    // CHECK-NOT: vector.
+    // CHECK-NOT: reshape
+    %r = reshape %t : tile<i32> -> tile<i32>
+    return
+  }
+
+  // --- maxf with propagate_nan -> arith.maximumf ---
+  // CHECK-LABEL: gpu.func @test_maxf_propagate_nan
+  entry @test_maxf_propagate_nan() {
+    %a = constant <f32: 0.0> : tile<4xf32>
+    %b = constant <f32: 1.0> : tile<4xf32>
+    // CHECK: arith.maximumf %{{.*}}, %{{.*}} : vector<4xf32>
+    %r = maxf %a, %b propagate_nan : tile<4xf32>
+    return
+  }
+
+  // --- minf with propagate_nan -> arith.minimumf ---
+  // CHECK-LABEL: gpu.func @test_minf_propagate_nan
+  entry @test_minf_propagate_nan() {
+    %a = constant <f32: 0.0> : tile<4xf32>
+    %b = constant <f32: 1.0> : tile<4xf32>
+    // CHECK: arith.minimumf %{{.*}}, %{{.*}} : vector<4xf32>
+    %r = minf %a, %b propagate_nan : tile<4xf32>
+    return
+  }
 }
