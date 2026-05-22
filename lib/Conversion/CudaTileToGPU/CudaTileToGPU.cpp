@@ -219,16 +219,14 @@ buildMmaContractionSpec(MLIRContext *ctx, int64_t resultRank) {
 
 /// Convert cuda_tile.constant to arith/vector constants.
 ///   - Scalar tiles (rank 0): Convert to scalar arith ops
-///   - Ranked tiles: Convert to vector constants
-///     - Splat values -> vector.broadcast
-///     - Dense values -> arith.constant with DenseElementsAttr
+///   - Ranked tiles: Convert to an arith.constant with a DenseElementsAttr of
+///     the target vector type (splat values use the splat form, e.g.
+///     `arith.constant dense<7> : vector<1x1xi32>`).
 ///   - Scalar integer conversion preserves the integer type; explicit casts to
 ///     `index` are inserted later at the ops that require them.
 ///   - Pointer types in scalar tiles are intermediate and will become dead
 ///   after
 ///     make_tensor_view ops are erased; conversion preserves them as-is.
-///   - Dense non-splat vectors require extracting all attributes and
-///     reconstructing.
 struct ConvertConstant : public OpConversionPattern<cuda_tile::ConstantOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -258,30 +256,19 @@ struct ConvertConstant : public OpConversionPattern<cuda_tile::ConstantOp> {
         return failure();
       }
     } else {
-      // Tile -> vector splat or dense constant
+      // Tile -> vector constant (splat or dense), emitted directly as
+      // arith.constant with a DenseElementsAttr of the target vector type.
       auto vecTy = cast<VectorType>(resultType);
+      DenseElementsAttr vecAttr;
       if (denseVal.isSplat()) {
-        auto elemTy = tileType.getElementType();
-        Value splatVal;
-        if (isa<IntegerType>(elemTy)) {
-          auto splat = denseVal.getSplatValue<APInt>();
-          splatVal = arith::ConstantIntOp::create(rewriter, loc, elemTy,
-                                                  splat.getSExtValue());
-        } else if (isa<FloatType>(elemTy)) {
-          auto splat = denseVal.getSplatValue<APFloat>();
-          splatVal = arith::ConstantFloatOp::create(
-              rewriter, loc, cast<FloatType>(elemTy), splat);
-        } else {
-          return failure();
-        }
-        rewriter.replaceOpWithNewOp<vector::BroadcastOp>(op, vecTy, splatVal);
+        vecAttr =
+            DenseElementsAttr::get(vecTy, denseVal.getSplatValue<Attribute>());
       } else {
-        // Non-splat dense: create a vector constant directly
         SmallVector<Attribute> attrs(denseVal.getValues<Attribute>().begin(),
                                      denseVal.getValues<Attribute>().end());
-        rewriter.replaceOpWithNewOp<arith::ConstantOp>(
-            op, vecTy, DenseElementsAttr::get(vecTy, attrs));
+        vecAttr = DenseElementsAttr::get(vecTy, attrs);
       }
+      rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, vecTy, vecAttr);
     }
     return success();
   }

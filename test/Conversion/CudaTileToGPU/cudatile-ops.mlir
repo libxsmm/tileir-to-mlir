@@ -17,8 +17,7 @@ cuda_tile.module @ops_module {
     %c1 = constant <i64: 1> : tile<i64>
     // CHECK: %[[C2:.*]] = arith.constant dense<[0, 1, 2, 3]> : vector<4xi32>
     %c2 = constant <i32: [0, 1, 2, 3]> : tile<4xi32>
-    // CHECK: %[[C3_SCALAR:.*]] = arith.constant 0.000000e+00 : f32
-    // CHECK: %[[C3:.*]] = vector.broadcast %[[C3_SCALAR]] : f32 to vector<2x4xf32>
+    // CHECK: %[[C3:.*]] = arith.constant dense<0.000000e+00> : vector<2x4xf32>
     %c3 = constant <f32: 0.0> : tile<2x4xf32>
     // CHECK: %[[C4:.*]] = arith.constant dense<[0.000000e+00, 1.000000e+00, 2.000000e+00, 3.000000e+00]> : vector<4xf64>
     %c4 = constant <f64: [0.0, 1.0, 2.0, 3.0]> : tile<4xf64>
@@ -57,11 +56,9 @@ cuda_tile.module @ops_module {
     // CHECK: %[[CMP0:.*]] = arith.cmpf oeq, %[[LHS0]], %[[RHS0]] : f16
     %x0 = cmpf equal ordered %lhs0, %rhs0 : tile<f16> -> tile<i1>
 
-    // CHECK: %[[LHS1_S:.*]] = arith.constant 0.000000e+00 : f16
-    // CHECK: %[[LHS1:.*]] = vector.broadcast %[[LHS1_S]] : f16 to vector<2x2xf16>
+    // CHECK: %[[LHS1:.*]] = arith.constant dense<0.000000e+00> : vector<2x2xf16>
     %lhs1 = constant <f16: 0.0> : tile<2x2xf16>
-    // CHECK: %[[RHS1_S:.*]] = arith.constant 0.000000e+00 : f16
-    // CHECK: %[[RHS1:.*]] = vector.broadcast %[[RHS1_S]] : f16 to vector<2x2xf16>
+    // CHECK: %[[RHS1:.*]] = arith.constant dense<0.000000e+00> : vector<2x2xf16>
     %rhs1 = constant <f16: 0.0> : tile<2x2xf16>
     // CHECK: %[[CMP1:.*]] = arith.cmpf ult, %[[LHS1]], %[[RHS1]] : vector<2x2xf16>
     %x2 = cmpf less_than unordered %lhs1, %rhs1 : tile<2x2xf16> -> tile<2x2xi1>
@@ -78,11 +75,9 @@ cuda_tile.module @ops_module {
     // CHECK: %[[ICMP0:.*]] = arith.cmpi slt, %[[ILHS0]], %[[IRHS0]] : i16
     %x0 = cmpi less_than %lhs0, %rhs0, signed : tile<i16> -> tile<i1>
 
-    // CHECK: %[[ILHS1_S:.*]] = arith.constant 0 : i64
-    // CHECK: %[[ILHS1:.*]] = vector.broadcast %[[ILHS1_S]] : i64 to vector<2x2xi64>
+    // CHECK: %[[ILHS1:.*]] = arith.constant dense<0> : vector<2x2xi64>
     %lhs1 = constant <i64: 0> : tile<2x2xi64>
-    // CHECK: %[[IRHS1_S:.*]] = arith.constant 0 : i64
-    // CHECK: %[[IRHS1:.*]] = vector.broadcast %[[IRHS1_S]] : i64 to vector<2x2xi64>
+    // CHECK: %[[IRHS1:.*]] = arith.constant dense<0> : vector<2x2xi64>
     %rhs1 = constant <i64: 0> : tile<2x2xi64>
     // CHECK: %[[ICMP1:.*]] = arith.cmpi eq, %[[ILHS1]], %[[IRHS1]] : vector<2x2xi64>
     %x1 = cmpi equal %lhs1, %rhs1, signed : tile<2x2xi64> -> tile<2x2xi1>
@@ -222,20 +217,20 @@ cuda_tile.module @ops_module {
   // --- mmaf ---
   // CHECK-LABEL: gpu.func @test_mmaf
   entry @test_mmaf() {
-    // CHECK: %[[MMAF_LHS0:.*]] = vector.broadcast %{{.*}} : f16 to vector<4x8xf16>
+    // CHECK: %[[MMAF_LHS0:.*]] = arith.constant dense<0.000000e+00> : vector<4x8xf16>
     %lhs0 = constant <f16: 0.0> : tile<4x8xf16>
-    // CHECK: %[[MMAF_RHS0:.*]] = vector.broadcast %{{.*}} : f16 to vector<8x2xf16>
+    // CHECK: %[[MMAF_RHS0:.*]] = arith.constant dense<0.000000e+00> : vector<8x2xf16>
     %rhs0 = constant <f16: 0.0> : tile<8x2xf16>
-    // CHECK: %[[MMAF_ACC0:.*]] = vector.broadcast %{{.*}} : f32 to vector<4x2xf32>
+    // CHECK: %[[MMAF_ACC0:.*]] = arith.constant dense<0.000000e+00> : vector<4x2xf32>
     %acc0 = constant <f32: 0.0> : tile<4x2xf32>
     // CHECK: %[[MMAF_R0:.*]] = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %[[MMAF_LHS0]], %[[MMAF_RHS0]], %[[MMAF_ACC0]] : vector<4x8xf16>, vector<8x2xf16> into vector<4x2xf32>
     %0 = mmaf %lhs0, %rhs0, %acc0 : tile<4x8xf16>, tile<8x2xf16>, tile<4x2xf32>
 
-    // CHECK: %[[MMAF_LHS1:.*]] = vector.broadcast %{{.*}} : f16 to vector<2x4x8xf16>
+    // CHECK: %[[MMAF_LHS1:.*]] = arith.constant dense<0.000000e+00> : vector<2x4x8xf16>
     %lhs1 = constant <f16: 0.0> : tile<2x4x8xf16>
-    // CHECK: %[[MMAF_RHS1:.*]] = vector.broadcast %{{.*}} : f16 to vector<2x8x2xf16>
+    // CHECK: %[[MMAF_RHS1:.*]] = arith.constant dense<0.000000e+00> : vector<2x8x2xf16>
     %rhs1 = constant <f16: 0.0> : tile<2x8x2xf16>
-    // CHECK: %[[MMAF_ACC1:.*]] = vector.broadcast %{{.*}} : f32 to vector<2x4x2xf32>
+    // CHECK: %[[MMAF_ACC1:.*]] = arith.constant dense<0.000000e+00> : vector<2x4x2xf32>
     %acc1 = constant <f32: 0.0> : tile<2x4x2xf32>
     // CHECK: %[[MMAF_R1:.*]] = vector.contract {indexing_maps = [#map3, #map4, #map5], iterator_types = ["parallel", "parallel", "parallel", "reduction"], kind = #vector.kind<add>} %[[MMAF_LHS1]], %[[MMAF_RHS1]], %[[MMAF_ACC1]] : vector<2x4x8xf16>, vector<2x8x2xf16> into vector<2x4x2xf32>
     %1 = mmaf %lhs1, %rhs1, %acc1 : tile<2x4x8xf16>, tile<2x8x2xf16>, tile<2x4x2xf32>
@@ -245,20 +240,20 @@ cuda_tile.module @ops_module {
   // --- mmai ---
   // CHECK-LABEL: gpu.func @test_mmai
   entry @test_mmai() {
-    // CHECK: %[[MMAI_LHS0:.*]] = vector.broadcast %{{.*}} : i8 to vector<4x8xi8>
+    // CHECK: %[[MMAI_LHS0:.*]] = arith.constant dense<0> : vector<4x8xi8>
     %lhs0 = constant <i8: 0> : tile<4x8xi8>
-    // CHECK: %[[MMAI_RHS0:.*]] = vector.broadcast %{{.*}} : i8 to vector<8x2xi8>
+    // CHECK: %[[MMAI_RHS0:.*]] = arith.constant dense<0> : vector<8x2xi8>
     %rhs0 = constant <i8: 0> : tile<8x2xi8>
-    // CHECK: %[[MMAI_ACC0:.*]] = vector.broadcast %{{.*}} : i32 to vector<4x2xi32>
+    // CHECK: %[[MMAI_ACC0:.*]] = arith.constant dense<0> : vector<4x2xi32>
     %acc0 = constant <i32: 0> : tile<4x2xi32>
     // CHECK: %[[MMAI_R0:.*]] = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %[[MMAI_LHS0]], %[[MMAI_RHS0]], %[[MMAI_ACC0]] : vector<4x8xi8>, vector<8x2xi8> into vector<4x2xi32>
     %0 = mmai %lhs0, %rhs0, %acc0 signed signed : tile<4x8xi8>, tile<8x2xi8>, tile<4x2xi32>
 
-    // CHECK: %[[MMAI_LHS1:.*]] = vector.broadcast %{{.*}} : i8 to vector<2x4x8xi8>
+    // CHECK: %[[MMAI_LHS1:.*]] = arith.constant dense<0> : vector<2x4x8xi8>
     %lhs1 = constant <i8: 0> : tile<2x4x8xi8>
-    // CHECK: %[[MMAI_RHS1:.*]] = vector.broadcast %{{.*}} : i8 to vector<2x8x2xi8>
+    // CHECK: %[[MMAI_RHS1:.*]] = arith.constant dense<0> : vector<2x8x2xi8>
     %rhs1 = constant <i8: 0> : tile<2x8x2xi8>
-    // CHECK: %[[MMAI_ACC1:.*]] = vector.broadcast %{{.*}} : i32 to vector<2x4x2xi32>
+    // CHECK: %[[MMAI_ACC1:.*]] = arith.constant dense<0> : vector<2x4x2xi32>
     %acc1 = constant <i32: 0> : tile<2x4x2xi32>
     // CHECK: %[[MMAI_R1:.*]] = vector.contract {indexing_maps = [#map3, #map4, #map5], iterator_types = ["parallel", "parallel", "parallel", "reduction"], kind = #vector.kind<add>} %[[MMAI_LHS1]], %[[MMAI_RHS1]], %[[MMAI_ACC1]] : vector<2x4x8xi8>, vector<2x8x2xi8> into vector<2x4x2xi32>
     %1 = mmai %lhs1, %rhs1, %acc1 unsigned unsigned : tile<2x4x8xi8>, tile<2x8x2xi8>, tile<2x4x2xi32>
@@ -292,8 +287,7 @@ cuda_tile.module @ops_module {
   // --- negf ---
   // CHECK-LABEL: gpu.func @test_negf
   entry @test_negf() {
-    // CHECK: %[[NEGF_S:.*]] = arith.constant 0.000000e+00 : f32
-    // CHECK: %[[NEGF_IN:.*]] = vector.broadcast %[[NEGF_S]] : f32 to vector<4xf32>
+    // CHECK: %[[NEGF_IN:.*]] = arith.constant dense<0.000000e+00> : vector<4xf32>
     %source = constant <f32: 0.0> : tile<4xf32>
     // CHECK: %[[NEGF_R:.*]] = arith.negf %[[NEGF_IN]] : vector<4xf32>
     %result = negf %source : tile<4xf32>
@@ -314,11 +308,9 @@ cuda_tile.module @ops_module {
   // --- pow ---
   // CHECK-LABEL: gpu.func @test_pow
   entry @test_pow() {
-    // CHECK: %[[POW_S:.*]] = arith.constant 0.000000e+00 : f32
-    // CHECK: %[[POW_BASE:.*]] = vector.broadcast %[[POW_S]] : f32 to vector<4xf32>
+    // CHECK: %[[POW_BASE:.*]] = arith.constant dense<0.000000e+00> : vector<4xf32>
     %source = constant <f32: 0.0> : tile<4xf32>
-    // CHECK: %[[POW_E:.*]] = arith.constant 2.000000e+00 : f32
-    // CHECK: %[[POW_EXP:.*]] = vector.broadcast %[[POW_E]] : f32 to vector<4xf32>
+    // CHECK: %[[POW_EXP:.*]] = arith.constant dense<2.000000e+00> : vector<4xf32>
     %exponent = constant <f32: 2.0> : tile<4xf32>
     // CHECK: %[[POW_R:.*]] = math.powf %[[POW_BASE]], %[[POW_EXP]] : vector<4xf32>
     %result = pow %source, %exponent : tile<4xf32>
@@ -449,8 +441,7 @@ cuda_tile.module @ops_module {
     %0 = reshape %cst : tile<i8> -> tile<1x1x1xi8>
 
     // vector -> vector (shape_cast): tile<8x2xf32> -> tile<2x2x4x1xf32>
-    // CHECK: %[[S1_SCALAR:.*]] = arith.constant 0.000000e+00 : f32
-    // CHECK: %[[S1:.*]] = vector.broadcast %[[S1_SCALAR]] : f32 to vector<8x2xf32>
+    // CHECK: %[[S1:.*]] = arith.constant dense<0.000000e+00> : vector<8x2xf32>
     %t = constant <f32: 0.0> : tile<8x2xf32>
     // CHECK: %[[R1:.*]] = vector.shape_cast %[[S1]] : vector<8x2xf32> to vector<2x2x4x1xf32>
     %1 = reshape %t : tile<8x2xf32> -> tile<2x2x4x1xf32>
@@ -518,8 +509,7 @@ cuda_tile.module @ops_module {
   // --- reduce (1D -> scalar, addf) ---
   // CHECK-LABEL: gpu.func @test_reduce_addf_1d
   entry @test_reduce_addf_1d() {
-    // CHECK: %[[RED1_S:.*]] = arith.constant 0.000000e+00 : f32
-    // CHECK: %[[RED1_IN:.*]] = vector.broadcast %[[RED1_S]] : f32 to vector<8xf32>
+    // CHECK: %[[RED1_IN:.*]] = arith.constant dense<0.000000e+00> : vector<8xf32>
     %input = constant <f32: 0.0> : tile<8xf32>
     // CHECK: %[[RED1_ACC:.*]] = arith.constant 0.000000e+00 : f32
     // CHECK: %[[RED1_R:.*]] = vector.reduction <add>, %[[RED1_IN]], %[[RED1_ACC]] : vector<8xf32> into f32
@@ -534,8 +524,7 @@ cuda_tile.module @ops_module {
   // --- reduce (2D -> 1D, addf along dim 0) ---
   // CHECK-LABEL: gpu.func @test_reduce_addf_2d
   entry @test_reduce_addf_2d() {
-    // CHECK: %[[RED2_S:.*]] = arith.constant 0.000000e+00 : f32
-    // CHECK: %[[RED2_IN:.*]] = vector.broadcast %[[RED2_S]] : f32 to vector<8x64xf32>
+    // CHECK: %[[RED2_IN:.*]] = arith.constant dense<0.000000e+00> : vector<8x64xf32>
     %input = constant <f32: 0.0> : tile<8x64xf32>
     // CHECK: %[[RED2_ACC:.*]] = arith.constant dense<0.000000e+00> : vector<64xf32>
     // CHECK: %[[RED2_R:.*]] = vector.multi_reduction <add>, %[[RED2_IN]], %[[RED2_ACC]] [0] : vector<8x64xf32> to vector<64xf32>
@@ -550,8 +539,7 @@ cuda_tile.module @ops_module {
   // --- scan (2D inclusive product along dim 1) ---
   // CHECK-LABEL: gpu.func @test_scan_mulf_2d
   entry @test_scan_mulf_2d() {
-    // CHECK: %[[SCAN_S:.*]] = arith.constant 0.000000e+00 : f32
-    // CHECK: %[[SCAN_IN:.*]] = vector.broadcast %[[SCAN_S]] : f32 to vector<8x16xf32>
+    // CHECK: %[[SCAN_IN:.*]] = arith.constant dense<0.000000e+00> : vector<8x16xf32>
     %input = constant <f32: 0.0> : tile<8x16xf32>
     // CHECK: %[[SCAN_INIT:.*]] = arith.constant dense<1.000000e+00> : vector<8xf32>
     // CHECK: %[[SCAN_R:.*]], %{{.*}} = vector.scan <mul>, %[[SCAN_IN]], %[[SCAN_INIT]] {inclusive = true, reduction_dim = 1 : i64} : vector<8x16xf32>, vector<8xf32>
