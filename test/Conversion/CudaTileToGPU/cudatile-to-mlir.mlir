@@ -235,4 +235,69 @@ cuda_tile.module @m {
     %r = minf %a, %b propagate_nan : tile<4xf32>
     return
   }
+
+  // --- scan: 1D inclusive add (initial_value is rank-0 vector) ---
+  // CHECK-LABEL: gpu.func @test_scan_addf_1d
+  entry @test_scan_addf_1d() {
+    %input = constant <f32: 0.0> : tile<8xf32>
+    // CHECK: vector.scan <add>, %{{.*}}, %{{.*}} {inclusive = true, reduction_dim = 0 : i64} : vector<8xf32>, vector<f32>
+    %0 = scan %input dim=0 reverse=false identities=[0.000000e+00 : f32] : tile<8xf32> -> tile<8xf32>
+      (%a: tile<f32>, %b: tile<f32>) {
+        %s = addf %a, %b : tile<f32>
+        yield %s : tile<f32>
+      }
+    return
+  }
+
+  // --- scan: 2D inclusive add along dim 0 ---
+  // CHECK-LABEL: gpu.func @test_scan_addf_2d_dim0
+  entry @test_scan_addf_2d_dim0() {
+    %input = constant <f32: 0.0> : tile<8x16xf32>
+    // CHECK: vector.scan <add>, %{{.*}}, %{{.*}} {inclusive = true, reduction_dim = 0 : i64} : vector<8x16xf32>, vector<16xf32>
+    %0 = scan %input dim=0 reverse=false identities=[0.000000e+00 : f32] : tile<8x16xf32> -> tile<8x16xf32>
+      (%a: tile<f32>, %b: tile<f32>) {
+        %s = addf %a, %b : tile<f32>
+        yield %s : tile<f32>
+      }
+    return
+  }
+
+  // --- scan: 1D integer add ---
+  // CHECK-LABEL: gpu.func @test_scan_addi_1d
+  entry @test_scan_addi_1d() {
+    %input = constant <i32: 0> : tile<8xi32>
+    // CHECK: vector.scan <add>, %{{.*}}, %{{.*}} {inclusive = true, reduction_dim = 0 : i64} : vector<8xi32>, vector<i32>
+    %0 = scan %input dim=0 reverse=false identities=[0 : i32] : tile<8xi32> -> tile<8xi32>
+      (%a: tile<i32>, %b: tile<i32>) {
+        %s = addi %a, %b : tile<i32>
+        yield %s : tile<i32>
+      }
+    return
+  }
+
+  // --- scan: 2D max along dim 1 (propagate_nan -> maximumf) ---
+  // CHECK-LABEL: gpu.func @test_scan_maxf_propagate_nan
+  entry @test_scan_maxf_propagate_nan() {
+    %input = constant <f32: 0.0> : tile<4x8xf32>
+    // CHECK: vector.scan <maximumf>, %{{.*}}, %{{.*}} {inclusive = true, reduction_dim = 1 : i64} : vector<4x8xf32>, vector<4xf32>
+    %0 = scan %input dim=1 reverse=false identities=[0xFF800000 : f32] : tile<4x8xf32> -> tile<4x8xf32>
+      (%a: tile<f32>, %b: tile<f32>) {
+        %s = maxf %a, %b propagate_nan : tile<f32>
+        yield %s : tile<f32>
+      }
+    return
+  }
+
+  // --- scan: signed integer min ---
+  // CHECK-LABEL: gpu.func @test_scan_minsi_1d
+  entry @test_scan_minsi_1d() {
+    %input = constant <i32: 0> : tile<8xi32>
+    // CHECK: vector.scan <minsi>, %{{.*}}, %{{.*}} {inclusive = true, reduction_dim = 0 : i64} : vector<8xi32>, vector<i32>
+    %0 = scan %input dim=0 reverse=false identities=[2147483647 : i32] : tile<8xi32> -> tile<8xi32>
+      (%a: tile<i32>, %b: tile<i32>) {
+        %s = mini %a, %b signed : tile<i32>
+        yield %s : tile<i32>
+      }
+    return
+  }
 }

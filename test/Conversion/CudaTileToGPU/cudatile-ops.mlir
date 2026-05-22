@@ -541,4 +541,18 @@ cuda_tile.module @ops_module {
     return
   }
 
+  // --- scan (2D inclusive product along dim 1) ---
+  // From the spec example for cuda_tile.scan.
+  // CHECK-LABEL: gpu.func @test_scan_mulf_2d
+  entry @test_scan_mulf_2d() {
+    %input = constant <f32: 0.0> : tile<8x16xf32>
+    // CHECK: vector.scan <mul>, %{{.*}}, %{{.*}} {inclusive = true, reduction_dim = 1 : i64} : vector<8x16xf32>, vector<8xf32>
+    %result = scan %input dim=1 reverse=false identities=[1.0 : f32] : tile<8x16xf32> -> tile<8x16xf32>
+      (%acc: tile<f32>, %elem: tile<f32>) {
+        %prod = mulf %acc, %elem rounding<nearest_even>: tile<f32>
+        yield %prod : tile<f32>
+      }
+    return
+  }
+
 }

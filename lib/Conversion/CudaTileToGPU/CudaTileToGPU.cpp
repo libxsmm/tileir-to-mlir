@@ -868,6 +868,39 @@ static FailureOr<vector::CombiningKind> matchReduceBody(Region &body) {
       .Default([](Operation *) { return failure(); });
 }
 
+/// Common pre-flight checks for cuda_tile.reduce/scan lowerings.
+///
+/// Extracts the combining kind from the body, validates that the op has a
+/// single operand and a vector-typed converted source, and returns the
+/// identity attribute. On failure, calls `notifyMatchFailure` with an
+/// appropriate reason.
+template <typename OpT>
+static FailureOr<
+    std::tuple<vector::CombiningKind, Value, VectorType, TypedAttr>>
+matchSingleOperandCombiningOp(OpT op, ValueRange convertedOperands,
+                              ConversionPatternRewriter &rewriter,
+                              StringRef opName) {
+  if (op.getOperands().size() != 1)
+    return rewriter.notifyMatchFailure(op, Twine("multi-operand ") + opName +
+                                               " not supported");
+
+  auto kind = matchReduceBody(op.getBody());
+  if (failed(kind))
+    return rewriter.notifyMatchFailure(
+        op, Twine("cannot determine combining kind from ") + opName + " body");
+
+  Value source = convertedOperands.front();
+  auto srcVecTy = dyn_cast<VectorType>(source.getType());
+  if (!srcVecTy)
+    return rewriter.notifyMatchFailure(op, "source is not a vector");
+
+  auto identityAttr = dyn_cast<TypedAttr>(op.getIdentities()[0]);
+  if (!identityAttr)
+    return rewriter.notifyMatchFailure(op, "identity is not a typed attribute");
+
+  return std::make_tuple(*kind, source, srcVecTy, identityAttr);
+}
+
 /// Convert cuda_tile.reduce to vector.reduction (1D->scalar) or
 /// vector.multi_reduction (ND->(N-1)D).
 ///
@@ -879,20 +912,11 @@ struct ConvertReduce : public OpConversionPattern<cuda_tile::ReduceOp> {
   LogicalResult
   matchAndRewrite(cuda_tile::ReduceOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // Only support single-operand reductions for now.
-    if (op.getOperands().size() != 1)
-      return rewriter.notifyMatchFailure(op,
-                                         "multi-operand reduce not supported");
-
-    auto kind = matchReduceBody(op.getBody());
-    if (failed(kind))
-      return rewriter.notifyMatchFailure(
-          op, "cannot determine combining kind from reduce body");
-
-    Value source = adaptor.getOperands().front();
-    auto srcVecTy = dyn_cast<VectorType>(source.getType());
-    if (!srcVecTy)
-      return rewriter.notifyMatchFailure(op, "source is not a vector");
+    auto pre = matchSingleOperandCombiningOp(op, adaptor.getOperands(),
+                                             rewriter, "reduce");
+    if (failed(pre))
+      return failure();
+    auto [kind, source, srcVecTy, identityAttr] = *pre;
 
     Type resultTy = getTypeConverter()->convertType(op.getResult(0).getType());
     if (!resultTy)
@@ -901,25 +925,65 @@ struct ConvertReduce : public OpConversionPattern<cuda_tile::ReduceOp> {
     Location loc = op.getLoc();
     uint32_t dim = op.getDim();
 
-    // Get the identity value from the identities attribute.
-    auto identityAttr = op.getIdentities()[0];
-
     if (auto dstVecTy = dyn_cast<VectorType>(resultTy)) {
       // Multi-dim case: vector.multi_reduction
-      // Build the accumulator from the identity value via splat.
       Value acc = arith::ConstantOp::create(
           rewriter, loc, dstVecTy,
           SplatElementsAttr::get(dstVecTy, identityAttr));
       rewriter.replaceOpWithNewOp<vector::MultiDimReductionOp>(
-          op, *kind, source, acc,
+          op, kind, source, acc,
           rewriter.getDenseI64ArrayAttr({static_cast<int64_t>(dim)}));
     } else {
       // 1D -> scalar case: vector.reduction
-      // Build the accumulator from the identity.
-      Value acc = arith::ConstantOp::create(rewriter, loc, resultTy,
-                                            cast<TypedAttr>(identityAttr));
-      rewriter.replaceOpWithNewOp<vector::ReductionOp>(op, *kind, source, acc);
+      Value acc =
+          arith::ConstantOp::create(rewriter, loc, resultTy, identityAttr);
+      rewriter.replaceOpWithNewOp<vector::ReductionOp>(op, kind, source, acc);
     }
+    return success();
+  }
+};
+
+/// Convert cuda_tile.scan to vector.scan.
+///
+/// Only supports single-operand scans where the body contains exactly one
+/// recognized combining op. cuda_tile.scan semantics are inclusive (result[j]
+/// = f(result[j-1], X[j]) starting with the identity), so we lower with
+/// `inclusive = true`. The `reverse = true` case is not representable in
+/// vector.scan and is rejected.
+struct ConvertScan : public OpConversionPattern<cuda_tile::ScanOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::ScanOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    // vector.scan has no reverse mode.
+    if (op.getReverse())
+      return rewriter.notifyMatchFailure(
+          op, "reverse scan is not representable in vector.scan");
+
+    auto pre = matchSingleOperandCombiningOp(op, adaptor.getOperands(),
+                                             rewriter, "scan");
+    if (failed(pre))
+      return failure();
+    auto [kind, source, srcVecTy, identityAttr] = *pre;
+
+    Location loc = op.getLoc();
+    int64_t dim = static_cast<int64_t>(op.getDim());
+
+    // Build the initial_value: an (n-1)-D vector splat with the identity
+    // (dim `dim` of the source removed).
+    SmallVector<int64_t> initShape(srcVecTy.getShape().begin(),
+                                   srcVecTy.getShape().end());
+    initShape.erase(initShape.begin() + dim);
+    auto initTy = VectorType::get(initShape, srcVecTy.getElementType());
+
+    Value initVal = arith::ConstantOp::create(
+        rewriter, loc, initTy, SplatElementsAttr::get(initTy, identityAttr));
+
+    auto scanOp = vector::ScanOp::create(rewriter, loc, kind, source, initVal,
+                                         /*reduction_dim=*/dim,
+                                         /*inclusive=*/true);
+    rewriter.replaceOp(op, scanOp.getDest());
     return success();
   }
 };
@@ -1467,7 +1531,7 @@ static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
            ConvertBinaryLhsRhsOp<cuda_tile::XOrIOp, arith::XOrIOp>, ConvertFor,
            ConvertIf, ConvertToScfYield<cuda_tile::ContinueOp>,
            ConvertToScfYield<cuda_tile::YieldOp>, ConvertReturn, ConvertMmaF,
-           ConvertAssume, ConvertReshape, ConvertReduce,
+           ConvertAssume, ConvertReshape, ConvertReduce, ConvertScan,
            ConvertGetIndexSpaceShape, ConvertLoadViewTko, ConvertStoreViewTko>(
           converter, ctx);
 }
