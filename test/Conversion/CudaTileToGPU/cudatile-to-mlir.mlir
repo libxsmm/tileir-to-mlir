@@ -147,8 +147,11 @@ cuda_tile.module @m {
   // --- reduce (1D -> scalar, mulf) ---
   // CHECK-LABEL: gpu.func @test_reduce_mulf_1d
   entry @test_reduce_mulf_1d() {
+    // CHECK: %[[RMUL_S:.*]] = arith.constant 1.000000e+00 : f32
+    // CHECK: %[[RMUL_IN:.*]] = vector.broadcast %[[RMUL_S]] : f32 to vector<4xf32>
     %input = constant <f32: 1.0> : tile<4xf32>
-    // CHECK: vector.reduction <mul>, %{{.*}}, %{{.*}} : vector<4xf32> into f32
+    // CHECK: %[[RMUL_ACC:.*]] = arith.constant 1.000000e+00 : f32
+    // CHECK: %[[RMUL_R:.*]] = vector.reduction <mul>, %[[RMUL_IN]], %[[RMUL_ACC]] : vector<4xf32> into f32
     %0 = reduce %input dim=0 identities=[1.000000e+00 : f32] : tile<4xf32> -> tile<f32>
       (%input_arg: tile<f32>, %input_accum: tile<f32>) {
         %mul_result = mulf %input_arg, %input_accum : tile<f32>
@@ -160,8 +163,11 @@ cuda_tile.module @m {
   // --- reduce (1D -> scalar, maxf with propagate_nan) ---
   // CHECK-LABEL: gpu.func @test_reduce_maxf_1d
   entry @test_reduce_maxf_1d() {
+    // CHECK: %[[RMAX_S:.*]] = arith.constant 0.000000e+00 : f32
+    // CHECK: %[[RMAX_IN:.*]] = vector.broadcast %[[RMAX_S]] : f32 to vector<8xf32>
     %input = constant <f32: 0.0> : tile<8xf32>
-    // CHECK: vector.reduction <maximumf>
+    // CHECK: %[[RMAX_ACC:.*]] = arith.constant 0xFF800000 : f32
+    // CHECK: %[[RMAX_R:.*]] = vector.reduction <maximumf>, %[[RMAX_IN]], %[[RMAX_ACC]] : vector<8xf32> into f32
     %0 = reduce %input dim=0 identities=[0xFF800000 : f32] : tile<8xf32> -> tile<f32>
       (%input_arg: tile<f32>, %input_accum: tile<f32>) {
         %max_result = maxf %input_arg, %input_accum propagate_nan : tile<f32>
@@ -173,8 +179,11 @@ cuda_tile.module @m {
   // --- reduce (1D -> scalar, minf without propagate_nan) ---
   // CHECK-LABEL: gpu.func @test_reduce_minf_1d
   entry @test_reduce_minf_1d() {
+    // CHECK: %[[RMIN_S:.*]] = arith.constant 0.000000e+00 : f32
+    // CHECK: %[[RMIN_IN:.*]] = vector.broadcast %[[RMIN_S]] : f32 to vector<8xf32>
     %input = constant <f32: 0.0> : tile<8xf32>
-    // CHECK: vector.reduction <minnumf>
+    // CHECK: %[[RMIN_ACC:.*]] = arith.constant 0x7F800000 : f32
+    // CHECK: %[[RMIN_R:.*]] = vector.reduction <minnumf>, %[[RMIN_IN]], %[[RMIN_ACC]] : vector<8xf32> into f32
     %0 = reduce %input dim=0 identities=[0x7F800000 : f32] : tile<8xf32> -> tile<f32>
       (%input_arg: tile<f32>, %input_accum: tile<f32>) {
         %min_result = minf %input_arg, %input_accum : tile<f32>
@@ -186,8 +195,11 @@ cuda_tile.module @m {
   // --- reduce (1D -> scalar, addi) ---
   // CHECK-LABEL: gpu.func @test_reduce_addi_1d
   entry @test_reduce_addi_1d() {
+    // CHECK: %[[RADDI_S:.*]] = arith.constant 0 : i32
+    // CHECK: %[[RADDI_IN:.*]] = vector.broadcast %[[RADDI_S]] : i32 to vector<8xi32>
     %input = constant <i32: 0> : tile<8xi32>
-    // CHECK: vector.reduction <add>, %{{.*}}, %{{.*}} : vector<8xi32> into i32
+    // CHECK: %[[RADDI_ACC:.*]] = arith.constant 0 : i32
+    // CHECK: %[[RADDI_R:.*]] = vector.reduction <add>, %[[RADDI_IN]], %[[RADDI_ACC]] : vector<8xi32> into i32
     %0 = reduce %input dim=0 identities=[0 : i32] : tile<8xi32> -> tile<i32>
       (%input_arg: tile<i32>, %input_accum: tile<i32>) {
         %add_result = addi %input_arg, %input_accum : tile<i32>
@@ -199,8 +211,10 @@ cuda_tile.module @m {
   // --- reshape (vector -> scalar via vector.extract) ---
   // CHECK-LABEL: gpu.func @test_reshape_vector_to_scalar
   entry @test_reshape_vector_to_scalar() {
+    // CHECK: %[[RV2S_S:.*]] = arith.constant 7 : i32
+    // CHECK: %[[RV2S_IN:.*]] = vector.broadcast %[[RV2S_S]] : i32 to vector<1x1xi32>
     %t = constant <i32: [[7]]> : tile<1x1xi32>
-    // CHECK: vector.extract %{{.*}}[0, 0] : i32 from vector<1x1xi32>
+    // CHECK: %[[RV2S_R:.*]] = vector.extract %[[RV2S_IN]][0, 0] : i32 from vector<1x1xi32>
     %s = reshape %t : tile<1x1xi32> -> tile<i32>
     return
   }
@@ -219,9 +233,13 @@ cuda_tile.module @m {
   // --- maxf with propagate_nan -> arith.maximumf ---
   // CHECK-LABEL: gpu.func @test_maxf_propagate_nan
   entry @test_maxf_propagate_nan() {
+    // CHECK: %[[MAXP_A_S:.*]] = arith.constant 0.000000e+00 : f32
+    // CHECK: %[[MAXP_A:.*]] = vector.broadcast %[[MAXP_A_S]] : f32 to vector<4xf32>
     %a = constant <f32: 0.0> : tile<4xf32>
+    // CHECK: %[[MAXP_B_S:.*]] = arith.constant 1.000000e+00 : f32
+    // CHECK: %[[MAXP_B:.*]] = vector.broadcast %[[MAXP_B_S]] : f32 to vector<4xf32>
     %b = constant <f32: 1.0> : tile<4xf32>
-    // CHECK: arith.maximumf %{{.*}}, %{{.*}} : vector<4xf32>
+    // CHECK: %[[MAXP_R:.*]] = arith.maximumf %[[MAXP_A]], %[[MAXP_B]] : vector<4xf32>
     %r = maxf %a, %b propagate_nan : tile<4xf32>
     return
   }
@@ -229,9 +247,13 @@ cuda_tile.module @m {
   // --- minf with propagate_nan -> arith.minimumf ---
   // CHECK-LABEL: gpu.func @test_minf_propagate_nan
   entry @test_minf_propagate_nan() {
+    // CHECK: %[[MINP_A_S:.*]] = arith.constant 0.000000e+00 : f32
+    // CHECK: %[[MINP_A:.*]] = vector.broadcast %[[MINP_A_S]] : f32 to vector<4xf32>
     %a = constant <f32: 0.0> : tile<4xf32>
+    // CHECK: %[[MINP_B_S:.*]] = arith.constant 1.000000e+00 : f32
+    // CHECK: %[[MINP_B:.*]] = vector.broadcast %[[MINP_B_S]] : f32 to vector<4xf32>
     %b = constant <f32: 1.0> : tile<4xf32>
-    // CHECK: arith.minimumf %{{.*}}, %{{.*}} : vector<4xf32>
+    // CHECK: %[[MINP_R:.*]] = arith.minimumf %[[MINP_A]], %[[MINP_B]] : vector<4xf32>
     %r = minf %a, %b propagate_nan : tile<4xf32>
     return
   }
@@ -239,8 +261,11 @@ cuda_tile.module @m {
   // --- scan: 1D inclusive add (initial_value is rank-0 vector) ---
   // CHECK-LABEL: gpu.func @test_scan_addf_1d
   entry @test_scan_addf_1d() {
+    // CHECK: %[[SADD1_S:.*]] = arith.constant 0.000000e+00 : f32
+    // CHECK: %[[SADD1_IN:.*]] = vector.broadcast %[[SADD1_S]] : f32 to vector<8xf32>
     %input = constant <f32: 0.0> : tile<8xf32>
-    // CHECK: vector.scan <add>, %{{.*}}, %{{.*}} {inclusive = true, reduction_dim = 0 : i64} : vector<8xf32>, vector<f32>
+    // CHECK: %[[SADD1_INIT:.*]] = arith.constant dense<0.000000e+00> : vector<f32>
+    // CHECK: %[[SADD1_R:.*]], %{{.*}} = vector.scan <add>, %[[SADD1_IN]], %[[SADD1_INIT]] {inclusive = true, reduction_dim = 0 : i64} : vector<8xf32>, vector<f32>
     %0 = scan %input dim=0 reverse=false identities=[0.000000e+00 : f32] : tile<8xf32> -> tile<8xf32>
       (%a: tile<f32>, %b: tile<f32>) {
         %s = addf %a, %b : tile<f32>
@@ -252,8 +277,11 @@ cuda_tile.module @m {
   // --- scan: 2D inclusive add along dim 0 ---
   // CHECK-LABEL: gpu.func @test_scan_addf_2d_dim0
   entry @test_scan_addf_2d_dim0() {
+    // CHECK: %[[SADD2_S:.*]] = arith.constant 0.000000e+00 : f32
+    // CHECK: %[[SADD2_IN:.*]] = vector.broadcast %[[SADD2_S]] : f32 to vector<8x16xf32>
     %input = constant <f32: 0.0> : tile<8x16xf32>
-    // CHECK: vector.scan <add>, %{{.*}}, %{{.*}} {inclusive = true, reduction_dim = 0 : i64} : vector<8x16xf32>, vector<16xf32>
+    // CHECK: %[[SADD2_INIT:.*]] = arith.constant dense<0.000000e+00> : vector<16xf32>
+    // CHECK: %[[SADD2_R:.*]], %{{.*}} = vector.scan <add>, %[[SADD2_IN]], %[[SADD2_INIT]] {inclusive = true, reduction_dim = 0 : i64} : vector<8x16xf32>, vector<16xf32>
     %0 = scan %input dim=0 reverse=false identities=[0.000000e+00 : f32] : tile<8x16xf32> -> tile<8x16xf32>
       (%a: tile<f32>, %b: tile<f32>) {
         %s = addf %a, %b : tile<f32>
@@ -265,8 +293,11 @@ cuda_tile.module @m {
   // --- scan: 1D integer add ---
   // CHECK-LABEL: gpu.func @test_scan_addi_1d
   entry @test_scan_addi_1d() {
+    // CHECK: %[[SADDI_S:.*]] = arith.constant 0 : i32
+    // CHECK: %[[SADDI_IN:.*]] = vector.broadcast %[[SADDI_S]] : i32 to vector<8xi32>
     %input = constant <i32: 0> : tile<8xi32>
-    // CHECK: vector.scan <add>, %{{.*}}, %{{.*}} {inclusive = true, reduction_dim = 0 : i64} : vector<8xi32>, vector<i32>
+    // CHECK: %[[SADDI_INIT:.*]] = arith.constant dense<0> : vector<i32>
+    // CHECK: %[[SADDI_R:.*]], %{{.*}} = vector.scan <add>, %[[SADDI_IN]], %[[SADDI_INIT]] {inclusive = true, reduction_dim = 0 : i64} : vector<8xi32>, vector<i32>
     %0 = scan %input dim=0 reverse=false identities=[0 : i32] : tile<8xi32> -> tile<8xi32>
       (%a: tile<i32>, %b: tile<i32>) {
         %s = addi %a, %b : tile<i32>
@@ -278,8 +309,11 @@ cuda_tile.module @m {
   // --- scan: 2D max along dim 1 (propagate_nan -> maximumf) ---
   // CHECK-LABEL: gpu.func @test_scan_maxf_propagate_nan
   entry @test_scan_maxf_propagate_nan() {
+    // CHECK: %[[SMAX_S:.*]] = arith.constant 0.000000e+00 : f32
+    // CHECK: %[[SMAX_IN:.*]] = vector.broadcast %[[SMAX_S]] : f32 to vector<4x8xf32>
     %input = constant <f32: 0.0> : tile<4x8xf32>
-    // CHECK: vector.scan <maximumf>, %{{.*}}, %{{.*}} {inclusive = true, reduction_dim = 1 : i64} : vector<4x8xf32>, vector<4xf32>
+    // CHECK: %[[SMAX_INIT:.*]] = arith.constant dense<0xFF800000> : vector<4xf32>
+    // CHECK: %[[SMAX_R:.*]], %{{.*}} = vector.scan <maximumf>, %[[SMAX_IN]], %[[SMAX_INIT]] {inclusive = true, reduction_dim = 1 : i64} : vector<4x8xf32>, vector<4xf32>
     %0 = scan %input dim=1 reverse=false identities=[0xFF800000 : f32] : tile<4x8xf32> -> tile<4x8xf32>
       (%a: tile<f32>, %b: tile<f32>) {
         %s = maxf %a, %b propagate_nan : tile<f32>
@@ -291,13 +325,69 @@ cuda_tile.module @m {
   // --- scan: signed integer min ---
   // CHECK-LABEL: gpu.func @test_scan_minsi_1d
   entry @test_scan_minsi_1d() {
+    // CHECK: %[[SMINSI_S:.*]] = arith.constant 0 : i32
+    // CHECK: %[[SMINSI_IN:.*]] = vector.broadcast %[[SMINSI_S]] : i32 to vector<8xi32>
     %input = constant <i32: 0> : tile<8xi32>
-    // CHECK: vector.scan <minsi>, %{{.*}}, %{{.*}} {inclusive = true, reduction_dim = 0 : i64} : vector<8xi32>, vector<i32>
+    // CHECK: %[[SMINSI_INIT:.*]] = arith.constant dense<2147483647> : vector<i32>
+    // CHECK: %[[SMINSI_R:.*]], %{{.*}} = vector.scan <minsi>, %[[SMINSI_IN]], %[[SMINSI_INIT]] {inclusive = true, reduction_dim = 0 : i64} : vector<8xi32>, vector<i32>
     %0 = scan %input dim=0 reverse=false identities=[2147483647 : i32] : tile<8xi32> -> tile<8xi32>
       (%a: tile<i32>, %b: tile<i32>) {
         %s = mini %a, %b signed : tile<i32>
         yield %s : tile<i32>
       }
+    return
+  }
+
+  // --- select: scalar (rank-0) cond and values ---
+  // CHECK-LABEL: gpu.func @test_select_scalar
+  entry @test_select_scalar() {
+    // CHECK: %[[SELS_BID:.*]] = gpu.block_id x
+    // CHECK: %[[SELS_BIDI:.*]] = arith.index_cast %[[SELS_BID]] : index to i32
+    %bidx, %bidy, %bidz = get_tile_block_id : tile<i32>
+    // CHECK: %[[SELS_ZERO:.*]] = arith.constant 0 : i32
+    %zero = constant <i32: 0> : tile<i32>
+    // Derive a non-constant i1 so arith.select is not folded away.
+    // CHECK: %[[SELS_COND:.*]] = arith.cmpi eq, %[[SELS_BIDI]], %[[SELS_ZERO]] : i32
+    %cond = cmpi equal %bidx, %zero, signed : tile<i32> -> tile<i1>
+    // CHECK: %[[SELS_T:.*]] = arith.constant 42 : i32
+    %t = constant <i32: 42> : tile<i32>
+    // CHECK: %[[SELS_F:.*]] = arith.constant 7 : i32
+    %f = constant <i32: 7> : tile<i32>
+    // CHECK: %[[SELS_R:.*]] = arith.select %[[SELS_COND]], %[[SELS_T]], %[[SELS_F]] : i32
+    %r = select %cond, %t, %f : tile<i1>, tile<i32>
+    return
+  }
+
+  // --- select: 2D integer ---
+  // CHECK-LABEL: gpu.func @test_select_2d_i32
+  entry @test_select_2d_i32() {
+    // Non-splat cond avoids arith.select folding to a single operand.
+    // CHECK: %[[SEL2D_COND:.*]] = arith.constant dense<{{\[}}[true, false, true, false], [false, true, false, true]]> : vector<2x4xi1>
+    %cond = constant <i1: [[1, 0, 1, 0], [0, 1, 0, 1]]> : tile<2x4xi1>
+    // CHECK: %[[SEL2D_T_S:.*]] = arith.constant 0 : i32
+    // CHECK: %[[SEL2D_T:.*]] = vector.broadcast %[[SEL2D_T_S]] : i32 to vector<2x4xi32>
+    %t = constant <i32: 0> : tile<2x4xi32>
+    // CHECK: %[[SEL2D_F_S:.*]] = arith.constant 1 : i32
+    // CHECK: %[[SEL2D_F:.*]] = vector.broadcast %[[SEL2D_F_S]] : i32 to vector<2x4xi32>
+    %f = constant <i32: 1> : tile<2x4xi32>
+    // CHECK: %[[SEL2D_R:.*]] = arith.select %[[SEL2D_COND]], %[[SEL2D_T]], %[[SEL2D_F]] : vector<2x4xi1>, vector<2x4xi32>
+    %r = select %cond, %t, %f : tile<2x4xi1>, tile<2x4xi32>
+    return
+  }
+
+  // --- select: 1D f16 (different element type) ---
+  // CHECK-LABEL: gpu.func @test_select_1d_f16
+  entry @test_select_1d_f16() {
+    // CHECK: %[[SEL16_COND:.*]] = arith.constant dense<[false, true, false, true, false, true, false, true]> : vector<8xi1>
+    %cond = constant <i1: [0, 1, 0, 1, 0, 1, 0, 1]> : tile<8xi1>
+    // CHECK: %[[SEL16_T_S:.*]] = arith.constant 1.000000e+00 : f16
+    // CHECK: %[[SEL16_T:.*]] = vector.broadcast %[[SEL16_T_S]] : f16 to vector<8xf16>
+    %t = constant <f16: 1.0> : tile<8xf16>
+    // CHECK: %[[SEL16_F_S:.*]] = arith.constant 2.000000e+00 : f16
+    // CHECK: %[[SEL16_F:.*]] = vector.broadcast %[[SEL16_F_S]] : f16 to vector<8xf16>
+    %f = constant <f16: 2.0> : tile<8xf16>
+    // CHECK: %[[SEL16_R:.*]] = arith.select %[[SEL16_COND]], %[[SEL16_T]], %[[SEL16_F]] : vector<8xi1>, vector<8xf16>
+    %r = select %cond, %t, %f : tile<8xi1>, tile<8xf16>
     return
   }
 }

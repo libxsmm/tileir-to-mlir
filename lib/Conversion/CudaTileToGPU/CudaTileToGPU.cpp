@@ -824,6 +824,26 @@ struct ConvertReshape : public OpConversionPattern<cuda_tile::ReshapeOp> {
   }
 };
 
+/// Convert cuda_tile.select to arith.select.
+///
+/// cuda_tile.select is element-wise: result[i] = cond[i] ? val_if_true[i]
+/// : val_if_false[i]. All three operands have the same shape and the
+/// condition is i1 (scalar or vector of i1). arith.select natively supports
+/// both scalar i1 and vector<...xi1> conditions with matching shapes, so the
+/// lowering is a direct one-to-one mapping.
+struct ConvertSelect : public OpConversionPattern<cuda_tile::SelectOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::SelectOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<arith::SelectOp>(
+        op, adaptor.getCond(), adaptor.getValIfTrue(),
+        adaptor.getValIfFalse());
+    return success();
+  }
+};
+
 /// Match the body of a cuda_tile.reduce to determine the CombiningKind.
 /// The body is expected to have exactly one combining op (ignoring the yield).
 static FailureOr<vector::CombiningKind> matchReduceBody(Region &body) {
@@ -1532,6 +1552,7 @@ static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
            ConvertIf, ConvertToScfYield<cuda_tile::ContinueOp>,
            ConvertToScfYield<cuda_tile::YieldOp>, ConvertReturn, ConvertMmaF,
            ConvertAssume, ConvertReshape, ConvertReduce, ConvertScan,
+           ConvertSelect,
            ConvertGetIndexSpaceShape, ConvertLoadViewTko, ConvertStoreViewTko>(
           converter, ctx);
 }

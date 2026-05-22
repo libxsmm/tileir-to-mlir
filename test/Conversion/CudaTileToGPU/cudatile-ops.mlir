@@ -518,8 +518,11 @@ cuda_tile.module @ops_module {
   // --- reduce (1D -> scalar, addf) ---
   // CHECK-LABEL: gpu.func @test_reduce_addf_1d
   entry @test_reduce_addf_1d() {
+    // CHECK: %[[RED1_S:.*]] = arith.constant 0.000000e+00 : f32
+    // CHECK: %[[RED1_IN:.*]] = vector.broadcast %[[RED1_S]] : f32 to vector<8xf32>
     %input = constant <f32: 0.0> : tile<8xf32>
-    // CHECK: vector.reduction <add>, %{{.*}}, %{{.*}} : vector<8xf32> into f32
+    // CHECK: %[[RED1_ACC:.*]] = arith.constant 0.000000e+00 : f32
+    // CHECK: %[[RED1_R:.*]] = vector.reduction <add>, %[[RED1_IN]], %[[RED1_ACC]] : vector<8xf32> into f32
     %0 = reduce %input dim=0 identities=[0.000000e+00 : f32] : tile<8xf32> -> tile<f32>
       (%input_arg: tile<f32>, %input_accum: tile<f32>) {
         %add_result = addf %input_arg, %input_accum : tile<f32>
@@ -531,8 +534,11 @@ cuda_tile.module @ops_module {
   // --- reduce (2D -> 1D, addf along dim 0) ---
   // CHECK-LABEL: gpu.func @test_reduce_addf_2d
   entry @test_reduce_addf_2d() {
+    // CHECK: %[[RED2_S:.*]] = arith.constant 0.000000e+00 : f32
+    // CHECK: %[[RED2_IN:.*]] = vector.broadcast %[[RED2_S]] : f32 to vector<8x64xf32>
     %input = constant <f32: 0.0> : tile<8x64xf32>
-    // CHECK: vector.multi_reduction <add>, %{{.*}}, %{{.*}} [0] : vector<8x64xf32> to vector<64xf32>
+    // CHECK: %[[RED2_ACC:.*]] = arith.constant dense<0.000000e+00> : vector<64xf32>
+    // CHECK: %[[RED2_R:.*]] = vector.multi_reduction <add>, %[[RED2_IN]], %[[RED2_ACC]] [0] : vector<8x64xf32> to vector<64xf32>
     %0 = reduce %input dim=0 identities=[0.000000e+00 : f32] : tile<8x64xf32> -> tile<64xf32>
       (%input_arg: tile<f32>, %input_accum: tile<f32>) {
         %add_result = addf %input_arg, %input_accum : tile<f32>
@@ -542,16 +548,34 @@ cuda_tile.module @ops_module {
   }
 
   // --- scan (2D inclusive product along dim 1) ---
-  // From the spec example for cuda_tile.scan.
   // CHECK-LABEL: gpu.func @test_scan_mulf_2d
   entry @test_scan_mulf_2d() {
+    // CHECK: %[[SCAN_S:.*]] = arith.constant 0.000000e+00 : f32
+    // CHECK: %[[SCAN_IN:.*]] = vector.broadcast %[[SCAN_S]] : f32 to vector<8x16xf32>
     %input = constant <f32: 0.0> : tile<8x16xf32>
-    // CHECK: vector.scan <mul>, %{{.*}}, %{{.*}} {inclusive = true, reduction_dim = 1 : i64} : vector<8x16xf32>, vector<8xf32>
+    // CHECK: %[[SCAN_INIT:.*]] = arith.constant dense<1.000000e+00> : vector<8xf32>
+    // CHECK: %[[SCAN_R:.*]], %{{.*}} = vector.scan <mul>, %[[SCAN_IN]], %[[SCAN_INIT]] {inclusive = true, reduction_dim = 1 : i64} : vector<8x16xf32>, vector<8xf32>
     %result = scan %input dim=1 reverse=false identities=[1.0 : f32] : tile<8x16xf32> -> tile<8x16xf32>
       (%acc: tile<f32>, %elem: tile<f32>) {
         %prod = mulf %acc, %elem rounding<nearest_even>: tile<f32>
         yield %prod : tile<f32>
       }
+    return
+  }
+
+  // --- select (element-wise) ---
+  // cuda_tile.select has no mlirExamples; synthesized from the assembly
+  // format and spec: result[i] = cond[i] ? val_if_true[i] : val_if_false[i].
+  // CHECK-LABEL: gpu.func @test_select
+  entry @test_select() {
+    // CHECK: %[[SEL_COND:.*]] = arith.constant dense<[true, false, true, false]> : vector<4xi1>
+    %cond = constant <i1: [1, 0, 1, 0]> : tile<4xi1>
+    // CHECK: %[[SEL_T:.*]] = arith.constant dense<[1.000000e+00, 2.000000e+00, 3.000000e+00, 4.000000e+00]> : vector<4xf32>
+    %t = constant <f32: [1.0, 2.0, 3.0, 4.0]> : tile<4xf32>
+    // CHECK: %[[SEL_F:.*]] = arith.constant dense<[5.000000e+00, 6.000000e+00, 7.000000e+00, 8.000000e+00]> : vector<4xf32>
+    %f = constant <f32: [5.0, 6.0, 7.0, 8.0]> : tile<4xf32>
+    // CHECK: %[[SEL_R:.*]] = arith.select %[[SEL_COND]], %[[SEL_T]], %[[SEL_F]] : vector<4xi1>, vector<4xf32>
+    %r = select %cond, %t, %f : tile<4xi1>, tile<4xf32>
     return
   }
 
