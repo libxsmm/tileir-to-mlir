@@ -370,4 +370,117 @@ cuda_tile.module @m {
     %r = select %cond, %t, %f : tile<8xi1>, tile<8xf16>
     return
   }
+
+  // --- conversion ops (no mlirExamples in Ops.td; edge coverage lives here) ---
+
+  // CHECK-LABEL: gpu.func @test_conv_bitcast
+  entry @test_conv_bitcast() {
+    // CHECK: %[[BC_IN:.*]] = arith.constant dense<1> : vector<4xi32>
+    %x = constant <i32: 1> : tile<4xi32>
+    // CHECK: %[[BC_R:.*]] = arith.bitcast %[[BC_IN]] : vector<4xi32> to vector<4xf32>
+    %r = bitcast %x : tile<4xi32> -> tile<4xf32>
+    return
+  }
+
+  // CHECK-LABEL: gpu.func @test_conv_bitcast_scalar
+  entry @test_conv_bitcast_scalar() {
+    // CHECK: %[[BCS_IN:.*]] = arith.constant 1065353216 : i32
+    %x = constant <i32: 1065353216> : tile<i32>
+    // CHECK: %[[BCS_R:.*]] = arith.bitcast %[[BCS_IN]] : i32 to f32
+    %r = bitcast %x : tile<i32> -> tile<f32>
+    return
+  }
+
+  // CHECK-LABEL: gpu.func @test_conv_exti
+  entry @test_conv_exti() {
+    // CHECK: %[[EXT_IN:.*]] = arith.constant dense<5> : vector<4xi8>
+    %x = constant <i8: 5> : tile<4xi8>
+    // CHECK: %[[EXT_S:.*]] = arith.extsi %[[EXT_IN]] : vector<4xi8> to vector<4xi16>
+    %s = exti %x signed : tile<4xi8> -> tile<4xi16>
+    // CHECK: %[[EXT_U:.*]] = arith.extui %[[EXT_IN]] : vector<4xi8> to vector<4xi16>
+    %u = exti %x unsigned : tile<4xi8> -> tile<4xi16>
+    return
+  }
+
+  // CHECK-LABEL: gpu.func @test_conv_exti_scalar
+  entry @test_conv_exti_scalar() {
+    // CHECK: %[[EXTS_IN:.*]] = arith.constant 5 : i8
+    %x = constant <i8: 5> : tile<i8>
+    // CHECK: %[[EXTS_S:.*]] = arith.extsi %[[EXTS_IN]] : i8 to i16
+    %s = exti %x signed : tile<i8> -> tile<i16>
+    // CHECK: %[[EXTS_U:.*]] = arith.extui %[[EXTS_IN]] : i8 to i16
+    %u = exti %x unsigned : tile<i8> -> tile<i16>
+    return
+  }
+
+  // CHECK-LABEL: gpu.func @test_conv_ftof
+  entry @test_conv_ftof() {
+    // CHECK: %[[FTOF_IN:.*]] = arith.constant dense<1.250000e+00> : vector<4xf32>
+    %x = constant <f32: 1.25> : tile<4xf32>
+    // CHECK: %[[FTOF_TR:.*]] = arith.truncf %[[FTOF_IN]] : vector<4xf32> to vector<4xf16>
+    %tr = ftof %x rounding<nearest_even> : tile<4xf32> -> tile<4xf16>
+    // CHECK: %[[FTOF_EX:.*]] = arith.extf %[[FTOF_TR]] : vector<4xf16> to vector<4xf64>
+    %ex = ftof %tr rounding<nearest_even> : tile<4xf16> -> tile<4xf64>
+    return
+  }
+
+  // CHECK-LABEL: gpu.func @test_conv_ftoi
+  entry @test_conv_ftoi() {
+    // CHECK: %[[FTOI_IN:.*]] = arith.constant dense<3.500000e+00> : vector<4xf32>
+    %x = constant <f32: 3.5> : tile<4xf32>
+    // CHECK: %[[FTOI_S:.*]] = arith.fptosi %[[FTOI_IN]] : vector<4xf32> to vector<4xi32>
+    %s = ftoi %x signed rounding<nearest_int_to_zero> : tile<4xf32> -> tile<4xi32>
+    // CHECK: %[[FTOI_U:.*]] = arith.fptoui %[[FTOI_IN]] : vector<4xf32> to vector<4xi32>
+    %u = ftoi %x unsigned rounding<nearest_int_to_zero> : tile<4xf32> -> tile<4xi32>
+    return
+  }
+
+  // CHECK-LABEL: gpu.func @test_conv_ftoi_scalar
+  entry @test_conv_ftoi_scalar() {
+    // CHECK: %[[FTOIS_IN:.*]] = arith.constant 3.500000e+00 : f32
+    %x = constant <f32: 3.5> : tile<f32>
+    // CHECK: %[[FTOIS_S:.*]] = arith.fptosi %[[FTOIS_IN]] : f32 to i32
+    %s = ftoi %x signed rounding<nearest_int_to_zero> : tile<f32> -> tile<i32>
+    // CHECK: %[[FTOIS_U:.*]] = arith.fptoui %[[FTOIS_IN]] : f32 to i32
+    %u = ftoi %x unsigned rounding<nearest_int_to_zero> : tile<f32> -> tile<i32>
+    return
+  }
+
+  // CHECK-LABEL: gpu.func @test_conv_trunci
+  entry @test_conv_trunci() {
+    // CHECK: %[[TRI_IN:.*]] = arith.constant dense<42> : vector<4xi32>
+    %x = constant <i32: 42> : tile<4xi32>
+    // CHECK: %[[TRI_NW:.*]] = arith.trunci %[[TRI_IN]] overflow<nsw, nuw> : vector<4xi32> to vector<4xi16>
+    %nw = trunci %x overflow<no_wrap> : tile<4xi32> -> tile<4xi16>
+    // CHECK: %[[TRI_NSW:.*]] = arith.trunci %[[TRI_IN]] overflow<nsw> : vector<4xi32> to vector<4xi16>
+    %nsw = trunci %x overflow<no_signed_wrap> : tile<4xi32> -> tile<4xi16>
+    // CHECK: %[[TRI_NUW:.*]] = arith.trunci %[[TRI_IN]] overflow<nuw> : vector<4xi32> to vector<4xi16>
+    %nuw = trunci %x overflow<no_unsigned_wrap> : tile<4xi32> -> tile<4xi16>
+    // CHECK: %[[TRI_NONE:.*]] = arith.trunci %[[TRI_IN]] : vector<4xi32> to vector<4xi16>
+    %none = trunci %x overflow<none> : tile<4xi32> -> tile<4xi16>
+    return
+  }
+
+  // CHECK-LABEL: gpu.func @test_conv_itof
+  entry @test_conv_itof() {
+    // CHECK: %[[ITOF_IN:.*]] = arith.constant dense<7> : vector<4xi32>
+    %x = constant <i32: 7> : tile<4xi32>
+    // CHECK: %[[ITOF_S:.*]] = arith.sitofp %[[ITOF_IN]] : vector<4xi32> to vector<4xf32>
+    %s = itof %x signed rounding<nearest_even> : tile<4xi32> -> tile<4xf32>
+    // CHECK: %[[ITOF_U:.*]] = arith.uitofp %[[ITOF_IN]] : vector<4xi32> to vector<4xf32>
+    %u = itof %x unsigned rounding<nearest_even> : tile<4xi32> -> tile<4xf32>
+    return
+  }
+
+  // CHECK-LABEL: gpu.func @test_conv_itof_scalar
+  entry @test_conv_itof_scalar() {
+    // CHECK: %[[ITOFS_IN:.*]] = arith.constant 7 : i32
+    %x = constant <i32: 7> : tile<i32>
+    // CHECK: %[[ITOFS_S:.*]] = arith.sitofp %[[ITOFS_IN]] : i32 to f32
+    %s = itof %x signed rounding<nearest_even> : tile<i32> -> tile<f32>
+    // CHECK: %[[ITOFS_U:.*]] = arith.uitofp %[[ITOFS_IN]] : i32 to f32
+    %u = itof %x unsigned rounding<nearest_even> : tile<i32> -> tile<f32>
+    return
+  }
+
 }

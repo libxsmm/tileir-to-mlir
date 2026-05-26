@@ -98,6 +98,7 @@ static PartitionViewInfo getPartitionViewInfo(Value view, Value convertedView) {
   return info;
 }
 
+/// Map cuda_tile cmpf predicate+ordering to the corresponding arith predicate.
 static FailureOr<arith::CmpFPredicate>
 mapCmpFPredicate(cuda_tile::ComparisonPredicate pred,
                  cuda_tile::ComparisonOrdering ord) {
@@ -138,6 +139,8 @@ mapCmpFPredicate(cuda_tile::ComparisonPredicate pred,
   return failure();
 }
 
+/// Map cuda_tile cmpi predicate+signedness to the corresponding arith
+/// predicate.
 static FailureOr<arith::CmpIPredicate>
 mapCmpIPredicate(cuda_tile::ComparisonPredicate pred,
                  cuda_tile::Signedness signedness) {
@@ -160,6 +163,24 @@ mapCmpIPredicate(cuda_tile::ComparisonPredicate pred,
   return failure();
 }
 
+/// Map cuda_tile integer-overflow flags to arith integer-overflow flags.
+static arith::IntegerOverflowFlags
+mapIntegerOverflowFlags(cuda_tile::IntegerOverflow overflow) {
+  using IO = cuda_tile::IntegerOverflow;
+  switch (overflow) {
+  case IO::NONE:
+    return arith::IntegerOverflowFlags::none;
+  case IO::NSW:
+    return arith::IntegerOverflowFlags::nsw;
+  case IO::NUW:
+    return arith::IntegerOverflowFlags::nuw;
+  case IO::NW:
+    return arith::IntegerOverflowFlags::nsw | arith::IntegerOverflowFlags::nuw;
+  }
+  return arith::IntegerOverflowFlags::none;
+}
+
+/// Cast between index and integer types when required by lowered ops.
 static Value castValueToType(OpBuilder &builder, Location loc, Value value,
                              Type targetType) {
   if (value.getType() == targetType)
@@ -168,6 +189,21 @@ static Value castValueToType(OpBuilder &builder, Location loc, Value value,
       (isa<IntegerType>(value.getType()) && isa<IndexType>(targetType)))
     return arith::IndexCastOp::create(builder, loc, targetType, value);
   return Value();
+}
+
+/// Convert the operation result type with the current type converter or emit a
+/// match failure with `reason`.
+template <typename OpT>
+static FailureOr<Type>
+getConvertedResultTypeOrFail(OpT op, const TypeConverter *converter,
+                             ConversionPatternRewriter &rewriter,
+                             StringRef reason) {
+  Type resultTy = converter->convertType(op.getResult().getType());
+  if (!resultTy) {
+    (void)rewriter.notifyMatchFailure(op, reason);
+    return failure();
+  }
+  return resultTy;
 }
 
 struct MmaContractionSpec {
@@ -307,6 +343,7 @@ struct ConvertDimQueryOp : public OpConversionPattern<SrcOp> {
   }
 };
 
+/// Convert cuda_tile.atan2 to math.atan2.
 struct ConvertAtan2 : public OpConversionPattern<cuda_tile::Atan2Op> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -319,6 +356,224 @@ struct ConvertAtan2 : public OpConversionPattern<cuda_tile::Atan2Op> {
   }
 };
 
+/// Convert cuda_tile.bitcast to arith.bitcast.
+struct ConvertBitcast : public OpConversionPattern<cuda_tile::BitcastOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::BitcastOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto resultTy = getConvertedResultTypeOrFail(
+        op, getTypeConverter(), rewriter, "cannot convert bitcast result type");
+    if (failed(resultTy))
+      return failure();
+    rewriter.replaceOpWithNewOp<arith::BitcastOp>(op, resultTy.value(),
+                                                  adaptor.getSource());
+    return success();
+  }
+};
+
+/// Convert signedness-directed casts where the destination arith op depends
+/// only on the source op's signedness attribute.
+///
+/// Used by:
+///   - cuda_tile.exti  -> arith.extsi / arith.extui
+///
+///   1. Convert the destination tile type (`to`) via the type converter.
+///   2. Dispatch to `UnsignedDstOp` for `signedness = unsigned`, otherwise to
+///      `SignedDstOp`.
+///   3. Replace the original op with the selected arith op.
+template <typename SrcOp, typename SignedDstOp, typename UnsignedDstOp>
+struct ConvertFromToSignednessCastOp : public OpConversionPattern<SrcOp> {
+  using OpConversionPattern<SrcOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(SrcOp op,
+                  typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto resultTy =
+        getConvertedResultTypeOrFail(op, this->getTypeConverter(), rewriter,
+                                     "cannot convert cast result type");
+    if (failed(resultTy))
+      return failure();
+
+    if (op.getSignedness() == cuda_tile::Signedness::Unsigned)
+      rewriter.template replaceOpWithNewOp<UnsignedDstOp>(op, resultTy.value(),
+                                                          adaptor.getFrom());
+    else
+      rewriter.template replaceOpWithNewOp<SignedDstOp>(op, resultTy.value(),
+                                                        adaptor.getFrom());
+    return success();
+  }
+};
+
+/// Convert signedness-directed casts that also require an exact rounding mode.
+///
+/// Used by:
+///   - cuda_tile.ftoi  -> arith.fptosi / arith.fptoui
+///   - cuda_tile.itof  -> arith.sitofp / arith.uitofp
+///
+///   1. Require the source op rounding mode to match `ExpectedRounding`.
+///   2. Convert the destination tile type (`to`) via the type converter.
+///   3. Dispatch by signedness to the signed/unsigned arith destination op.
+template <typename SrcOp, typename SignedDstOp, typename UnsignedDstOp,
+          cuda_tile::RoundingMode ExpectedRounding>
+struct ConvertFromToSignednessCastWithRoundingOp
+    : public OpConversionPattern<SrcOp> {
+  using OpConversionPattern<SrcOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(SrcOp op,
+                  typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getRoundingMode() != ExpectedRounding)
+      return rewriter.notifyMatchFailure(op,
+                                         "unsupported rounding mode for cast");
+
+    auto resultTy =
+        getConvertedResultTypeOrFail(op, this->getTypeConverter(), rewriter,
+                                     "cannot convert cast result type");
+    if (failed(resultTy))
+      return failure();
+
+    if (op.getSignedness() == cuda_tile::Signedness::Unsigned)
+      rewriter.template replaceOpWithNewOp<UnsignedDstOp>(op, resultTy.value(),
+                                                          adaptor.getFrom());
+    else
+      rewriter.template replaceOpWithNewOp<SignedDstOp>(op, resultTy.value(),
+                                                        adaptor.getFrom());
+    return success();
+  }
+};
+
+/// Convert cuda_tile.ftof to arith.extf / arith.truncf.
+///
+///   - Only rounding<nearest_even> is representable.
+///   - Source and destination element widths must differ.
+///   - Narrowing uses arith.truncf; widening uses arith.extf.
+///
+/// Works for both scalar float and vector<float> types.
+struct ConvertFToF : public OpConversionPattern<cuda_tile::FToFOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::FToFOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getRoundingMode() != cuda_tile::RoundingMode::NEAREST_EVEN)
+      return rewriter.notifyMatchFailure(
+          op, "ftof only supports rounding<nearest_even>");
+
+    auto resultTy = getConvertedResultTypeOrFail(
+        op, getTypeConverter(), rewriter, "cannot convert ftof result type");
+    if (failed(resultTy))
+      return failure();
+
+    auto getFloatWidth = [](Type ty) -> unsigned {
+      if (auto fTy = dyn_cast<FloatType>(ty))
+        return fTy.getWidth();
+      if (auto vTy = dyn_cast<VectorType>(ty))
+        if (auto eTy = dyn_cast<FloatType>(vTy.getElementType()))
+          return eTy.getWidth();
+      return 0;
+    };
+
+    unsigned srcWidth = getFloatWidth(adaptor.getFrom().getType());
+    unsigned dstWidth = getFloatWidth(resultTy.value());
+    if (!srcWidth || !dstWidth)
+      return rewriter.notifyMatchFailure(op,
+                                         "ftof expects float or vector<float>");
+
+    if (srcWidth < dstWidth) {
+      rewriter.replaceOpWithNewOp<arith::ExtFOp>(op, resultTy.value(),
+                                                 adaptor.getFrom());
+      return success();
+    }
+    if (srcWidth > dstWidth) {
+      rewriter.replaceOpWithNewOp<arith::TruncFOp>(op, resultTy.value(),
+                                                   adaptor.getFrom());
+      return success();
+    }
+
+    return rewriter.notifyMatchFailure(op,
+                                       "ftof source/result widths must differ");
+  }
+};
+
+/// Convert cuda_tile.trunci to arith.trunci while preserving overflow flags.
+///
+/// Overflow mapping:
+///   - none            -> no flags
+///   - no_signed_wrap  -> nsw
+///   - no_unsigned_wrap-> nuw
+///   - no_wrap         -> nsw,nuw
+struct ConvertTruncI : public OpConversionPattern<cuda_tile::TruncIOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::TruncIOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto resultTy = getConvertedResultTypeOrFail(
+        op, getTypeConverter(), rewriter, "cannot convert trunci result type");
+    if (failed(resultTy))
+      return failure();
+
+    auto overflowAttr = arith::IntegerOverflowFlagsAttr::get(
+        rewriter.getContext(), mapIntegerOverflowFlags(op.getOverflow()));
+    rewriter.replaceOpWithNewOp<arith::TruncIOp>(
+        op, resultTy.value(), adaptor.getFrom(), overflowAttr);
+    return success();
+  }
+};
+
+/// Convert cuda_tile.ptr_to_ptr using memref.cast when representable.
+///
+/// Pointer model in this pass:
+///   tile<ptr<T>> -> memref<*xT>
+///
+///   1. Convert the result pointer tile type to a memref type.
+///   2. Recover the converted memref source when the adaptor provides a
+///      temporary unrealized_conversion_cast wrapper.
+///   3. Require memref.cast compatibility and emit memref.cast.
+///   4. Fail the pattern if ptr_to_ptr cannot be represented as memref.cast.
+struct ConvertPtrToPtrCastOrFail
+    : public OpConversionPattern<cuda_tile::PtrToPtrOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::PtrToPtrOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto resultTy =
+        getConvertedResultTypeOrFail(op, this->getTypeConverter(), rewriter,
+                                     "cannot convert cast result type");
+    if (failed(resultTy))
+      return failure();
+
+    Value source = adaptor.getSource();
+    // During conversion, ptr_to_ptr often receives a target-materialized
+    // operand (unrealized_conversion_cast) to the still-illegal source type.
+    // Peel that wrapper to recover the already-converted memref input.
+    if (auto materialize = source.getDefiningOp<UnrealizedConversionCastOp>()) {
+      if (materialize.getInputs().size() == 1 &&
+          isa<BaseMemRefType>(materialize.getInputs()[0].getType()))
+        source = materialize.getInputs()[0];
+    }
+
+    auto resultMemRefTy = dyn_cast<BaseMemRefType>(resultTy.value());
+    auto sourceMemRefTy = dyn_cast<BaseMemRefType>(source.getType());
+    if (!resultMemRefTy || !sourceMemRefTy)
+      return rewriter.notifyMatchFailure(
+          op, "ptr_to_ptr requires memref source/result after type conversion");
+
+    if (!memref::CastOp::areCastCompatible(sourceMemRefTy, resultMemRefTy))
+      return rewriter.notifyMatchFailure(
+          op, "ptr_to_ptr cannot be represented as memref.cast");
+
+    rewriter.replaceOpWithNewOp<memref::CastOp>(op, resultTy.value(), source);
+    return success();
+  }
+};
+
+/// Convert unary source-based ops by forwarding the converted source operand.
 template <typename SrcOp, typename DstOp>
 struct ConvertUnarySourceOp : public OpConversionPattern<SrcOp> {
   using OpConversionPattern<SrcOp>::OpConversionPattern;
@@ -332,6 +587,7 @@ struct ConvertUnarySourceOp : public OpConversionPattern<SrcOp> {
   }
 };
 
+/// Convert binary lhs/rhs source-based ops by forwarding both operands.
 template <typename SrcOp, typename DstOp>
 struct ConvertBinaryLhsRhsOp : public OpConversionPattern<SrcOp> {
   using OpConversionPattern<SrcOp>::OpConversionPattern;
@@ -346,6 +602,7 @@ struct ConvertBinaryLhsRhsOp : public OpConversionPattern<SrcOp> {
   }
 };
 
+/// Convert cuda_tile.maxf/minf based on propagate_nan and flush_to_zero flags.
 template <typename SrcOp, bool IsMax>
 struct ConvertMinMaxFOp : public OpConversionPattern<SrcOp> {
   using OpConversionPattern<SrcOp>::OpConversionPattern;
@@ -382,6 +639,7 @@ struct ConvertMinMaxFOp : public OpConversionPattern<SrcOp> {
   }
 };
 
+/// Convert cuda_tile.maxi/mini using signed or unsigned arith variants.
 template <typename SrcOp, bool IsMax>
 struct ConvertMinMaxIOp : public OpConversionPattern<SrcOp> {
   using OpConversionPattern<SrcOp>::OpConversionPattern;
@@ -410,6 +668,7 @@ struct ConvertMinMaxIOp : public OpConversionPattern<SrcOp> {
   }
 };
 
+/// Convert cuda_tile.cmpf to arith.cmpf.
 struct ConvertCmpF : public OpConversionPattern<cuda_tile::CmpFOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -427,6 +686,7 @@ struct ConvertCmpF : public OpConversionPattern<cuda_tile::CmpFOp> {
   }
 };
 
+/// Convert cuda_tile.exp2 to math.exp2 when flush_to_zero is not requested.
 struct ConvertExp2 : public OpConversionPattern<cuda_tile::Exp2Op> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -441,6 +701,7 @@ struct ConvertExp2 : public OpConversionPattern<cuda_tile::Exp2Op> {
   }
 };
 
+/// Convert cuda_tile.pow to math.powf.
 struct ConvertPow : public OpConversionPattern<cuda_tile::PowOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -453,6 +714,7 @@ struct ConvertPow : public OpConversionPattern<cuda_tile::PowOp> {
   }
 };
 
+/// Convert cuda_tile.rsqrt to math.rsqrt when flush_to_zero is not requested.
 struct ConvertRsqrt : public OpConversionPattern<cuda_tile::RsqrtOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -467,6 +729,7 @@ struct ConvertRsqrt : public OpConversionPattern<cuda_tile::RsqrtOp> {
   }
 };
 
+/// Convert cuda_tile.tanh to math.tanh when rounding mode is FULL.
 struct ConvertTanH : public OpConversionPattern<cuda_tile::TanHOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -481,6 +744,7 @@ struct ConvertTanH : public OpConversionPattern<cuda_tile::TanHOp> {
   }
 };
 
+/// Convert cuda_tile.cmpi to arith.cmpi.
 struct ConvertCmpI : public OpConversionPattern<cuda_tile::CmpIOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -498,6 +762,7 @@ struct ConvertCmpI : public OpConversionPattern<cuda_tile::CmpIOp> {
   }
 };
 
+/// Convert cuda_tile.mulhii by taking the high part of mului_extended.
 struct ConvertMulhiI : public OpConversionPattern<cuda_tile::MulhiIOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -511,6 +776,7 @@ struct ConvertMulhiI : public OpConversionPattern<cuda_tile::MulhiIOp> {
   }
 };
 
+/// Convert cuda_tile.negi to arith.subi(0, source).
 struct ConvertNegI : public OpConversionPattern<cuda_tile::NegIOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -639,6 +905,40 @@ struct ConvertToScfYield : public OpConversionPattern<SrcOp> {
     return success();
   }
 };
+
+using ConvertGetTileBlockId =
+    ConvertDimQueryOp<cuda_tile::GetTileBlockIdOp, gpu::BlockIdOp>;
+using ConvertGetNumTileBlocks =
+    ConvertDimQueryOp<cuda_tile::GetNumTileBlocksOp, gpu::GridDimOp>;
+
+using ConvertExtI =
+    ConvertFromToSignednessCastOp<cuda_tile::ExtIOp, arith::ExtSIOp,
+                                  arith::ExtUIOp>;
+using ConvertFToI = ConvertFromToSignednessCastWithRoundingOp<
+    cuda_tile::FToIOp, arith::FPToSIOp, arith::FPToUIOp,
+    cuda_tile::RoundingMode::NEAREST_INT_TO_ZERO>;
+using ConvertIToF = ConvertFromToSignednessCastWithRoundingOp<
+    cuda_tile::IToFOp, arith::SIToFPOp, arith::UIToFPOp,
+    cuda_tile::RoundingMode::NEAREST_EVEN>;
+
+using ConvertMulI = ConvertBinaryLhsRhsOp<cuda_tile::MulIOp, arith::MulIOp>;
+using ConvertXOrI = ConvertBinaryLhsRhsOp<cuda_tile::XOrIOp, arith::XOrIOp>;
+
+using ConvertCeil = ConvertUnarySourceOp<cuda_tile::CeilOp, math::CeilOp>;
+using ConvertCos = ConvertUnarySourceOp<cuda_tile::CosOp, math::CosOp>;
+using ConvertExp = ConvertUnarySourceOp<cuda_tile::ExpOp, math::ExpOp>;
+using ConvertFloor = ConvertUnarySourceOp<cuda_tile::FloorOp, math::FloorOp>;
+using ConvertLog2 = ConvertUnarySourceOp<cuda_tile::Log2Op, math::Log2Op>;
+using ConvertNegF = ConvertUnarySourceOp<cuda_tile::NegFOp, arith::NegFOp>;
+using ConvertSin = ConvertUnarySourceOp<cuda_tile::SinOp, math::SinOp>;
+
+using ConvertMaxF = ConvertMinMaxFOp<cuda_tile::MaxFOp, /*IsMax=*/true>;
+using ConvertMinF = ConvertMinMaxFOp<cuda_tile::MinFOp, /*IsMax=*/false>;
+using ConvertMaxI = ConvertMinMaxIOp<cuda_tile::MaxIOp, /*IsMax=*/true>;
+using ConvertMinI = ConvertMinMaxIOp<cuda_tile::MinIOp, /*IsMax=*/false>;
+
+using ConvertContinue = ConvertToScfYield<cuda_tile::ContinueOp>;
+using ConvertYield = ConvertToScfYield<cuda_tile::YieldOp>;
 
 /// Convert cuda_tile.if to scf.if.
 struct ConvertIf : public OpConversionPattern<cuda_tile::IfOp> {
@@ -1096,6 +1396,7 @@ static Value makePaddingValue(OpBuilder &b, Location loc, Type elemTy,
   return arith::ConstantFloatOp::create(b, loc, fty, val);
 }
 
+/// Validate shared load/store_tko constraints before lowering.
 template <typename TkoOp>
 static LogicalResult checkCommonTkoGuards(TkoOp op,
                                           ConversionPatternRewriter &rewriter) {
@@ -1463,6 +1764,7 @@ struct ConvertModule : public OpConversionPattern<cuda_tile::ModuleOp> {
 // Type converter and conversion pattern population
 //===----------------------------------------------------------------------===//
 
+/// Populate type-conversion rules for cuda_tile -> gpu/vector lowering.
 static void populateTileIRToGPUTypeConverter(TypeConverter &converter,
                                              MLIRContext *ctx) {
   // Fallback: keep types unchanged.
@@ -1513,41 +1815,30 @@ static void populateTileIRToGPUTypeConverter(TypeConverter &converter,
   converter.addTargetMaterialization(materializeCast);
 }
 
+/// Register all cuda_tile -> gpu/vector conversion patterns.
 static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
                                                   RewritePatternSet &patterns) {
   MLIRContext *ctx = patterns.getContext();
   patterns
       .add<ConvertModule, ConvertEntry, ConvertMakeTensorView,
-           ConvertMakePartitionView, ConvertConstant,
-           ConvertDimQueryOp<cuda_tile::GetTileBlockIdOp, gpu::BlockIdOp>,
-           ConvertDimQueryOp<cuda_tile::GetNumTileBlocksOp, gpu::GridDimOp>,
-           ConvertBinaryLhsRhsOp<cuda_tile::MulIOp, arith::MulIOp>,
-           ConvertAtan2, ConvertUnarySourceOp<cuda_tile::CeilOp, math::CeilOp>,
-           ConvertCmpF, ConvertUnarySourceOp<cuda_tile::CosOp, math::CosOp>,
-           ConvertExp2, ConvertUnarySourceOp<cuda_tile::ExpOp, math::ExpOp>,
-           ConvertUnarySourceOp<cuda_tile::FloorOp, math::FloorOp>,
-           ConvertUnarySourceOp<cuda_tile::Log2Op, math::Log2Op>,
-           ConvertMinMaxFOp<cuda_tile::MaxFOp, /*IsMax=*/true>,
-           ConvertMinMaxFOp<cuda_tile::MinFOp, /*IsMax=*/false>,
-           ConvertUnarySourceOp<cuda_tile::NegFOp, arith::NegFOp>, ConvertPow,
-           ConvertRsqrt, ConvertUnarySourceOp<cuda_tile::SinOp, math::SinOp>,
-           ConvertTanH, ConvertCmpI,
-           ConvertMinMaxIOp<cuda_tile::MaxIOp, /*IsMax=*/true>,
-           ConvertMinMaxIOp<cuda_tile::MinIOp, /*IsMax=*/false>, ConvertMmaI,
-           ConvertMulhiI, ConvertNegI,
-           ConvertBinaryLhsRhsOp<cuda_tile::XOrIOp, arith::XOrIOp>, ConvertFor,
-           ConvertIf, ConvertToScfYield<cuda_tile::ContinueOp>,
-           ConvertToScfYield<cuda_tile::YieldOp>, ConvertReturn, ConvertMmaF,
-           ConvertAssume, ConvertReshape, ConvertReduce, ConvertScan,
-           ConvertSelect,
-           ConvertGetIndexSpaceShape, ConvertLoadViewTko, ConvertStoreViewTko>(
-          converter, ctx);
+           ConvertMakePartitionView, ConvertConstant, ConvertGetTileBlockId,
+           ConvertGetNumTileBlocks, ConvertBitcast, ConvertMulI, ConvertAtan2,
+           ConvertCeil, ConvertCmpF, ConvertExtI, ConvertCos, ConvertFToF,
+           ConvertFToI, ConvertExp2, ConvertExp, ConvertFloor, ConvertIToF,
+           ConvertLog2, ConvertMaxF, ConvertMinF, ConvertNegF, ConvertPow,
+           ConvertRsqrt, ConvertSin, ConvertTanH, ConvertCmpI, ConvertMaxI,
+           ConvertMinI, ConvertMmaI, ConvertMulhiI, ConvertNegI, ConvertTruncI,
+           ConvertXOrI, ConvertFor, ConvertIf, ConvertContinue, ConvertYield,
+           ConvertReturn, ConvertMmaF, ConvertAssume, ConvertReshape,
+           ConvertReduce, ConvertScan, ConvertSelect, ConvertGetIndexSpaceShape,
+           ConvertLoadViewTko, ConvertStoreViewTko>(converter, ctx);
 }
 
 //===----------------------------------------------------------------------===//
 // Pass Definition
 //===----------------------------------------------------------------------===//
 
+/// Pass driver for lowering CudaTile IR to GPU/vector/scf/arith/memref.
 struct ConvertTileIRToGPUPass
     : public PassWrapper<ConvertTileIRToGPUPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ConvertTileIRToGPUPass)
