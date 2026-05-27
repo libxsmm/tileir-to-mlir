@@ -42,6 +42,7 @@
 // cuda_tile::GlobalOp
 // cuda_tile::IToFOp
 // cuda_tile::IfOp
+// cuda_tile::IotaOp
 // cuda_tile::LoadViewTkoOp
 // cuda_tile::LogOp
 // cuda_tile::Log2Op
@@ -89,7 +90,6 @@
 // cuda_tile::AtomicRMWTkoOp
 // cuda_tile::BreakOp
 // cuda_tile::IntToPtrOp
-// cuda_tile::IotaOp
 // cuda_tile::LoadPtrTkoOp
 // cuda_tile::LoopOp
 // cuda_tile::OffsetOp
@@ -501,6 +501,34 @@ struct ConvertConstant : public OpConversionPattern<cuda_tile::ConstantOp> {
       }
       rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, vecTy, vecAttr);
     }
+    return success();
+  }
+};
+
+/// Convert cuda_tile.iota to vector.step + arith.index_castui.
+///   1. Emit vector.step : vector<nxindex> to materialize [0..n-1].
+///   2. Convert lanes to the destination integer element type with
+///      arith.index_castui to preserve unsigned interpretation.
+struct ConvertIota : public OpConversionPattern<cuda_tile::IotaOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::IotaOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto resultTy = getConvertedResultTypeOrFail(
+        op, getTypeConverter(), rewriter, "cannot convert iota result type");
+    if (failed(resultTy))
+      return failure();
+
+    auto dstVecTy = dyn_cast<VectorType>(resultTy.value());
+    if (!dstVecTy || dstVecTy.getRank() != 1)
+      return rewriter.notifyMatchFailure(
+          op, "iota expects a 1-D vector result after type conversion");
+
+    auto indexVecTy =
+        VectorType::get(dstVecTy.getShape(), rewriter.getIndexType());
+    Value step = vector::StepOp::create(rewriter, op.getLoc(), indexVecTy);
+    rewriter.replaceOpWithNewOp<arith::IndexCastUIOp>(op, dstVecTy, step);
     return success();
   }
 };
@@ -2480,25 +2508,26 @@ static void populateTileIRToGPUTypeConverter(TypeConverter &converter,
 static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
                                                   RewritePatternSet &patterns) {
   MLIRContext *ctx = patterns.getContext();
-  patterns
-      .add<ConvertModule, ConvertEntry, ConvertMakeTensorView,
-           ConvertMakePartitionView, ConvertConstant, ConvertGetGlobal,
-           ConvertGlobal, ConvertGetTileBlockId, ConvertGetNumTileBlocks,
-           ConvertBitcast, ConvertMulI, ConvertAtan2, ConvertCeil, ConvertCmpF,
-           ConvertExtI, ConvertCos, ConvertFToF, ConvertFToI, ConvertExp2,
-           ConvertExp, ConvertFloor, ConvertIToF, ConvertLog2, ConvertMaxF,
-           ConvertMinF, ConvertNegF, ConvertPow, ConvertRsqrt, ConvertSin,
-           ConvertTanH, ConvertCmpI, ConvertMaxI, ConvertMinI, ConvertMmaI,
-           ConvertMulhiI, ConvertNegI, ConvertTruncI, ConvertXOrI, ConvertFor,
-           ConvertIf, ConvertContinue, ConvertYield, ConvertReturn, ConvertMmaF,
-           ConvertAssume, ConvertPermute, ConvertReshape, ConvertBroadcast,
-           ConvertExtract, ConvertCat, ConvertReduce, ConvertScan,
-           ConvertSelect, ConvertGetTensorShape, ConvertGetIndexSpaceShape,
-           ConvertLoadViewTko, ConvertStoreViewTko, ConvertAbsF, ConvertAbsI,
-           ConvertLog, ConvertTan, ConvertSinH, ConvertCosH, ConvertSqrt,
-           ConvertFma, ConvertAndI, ConvertOrI, ConvertRemF, ConvertAddI,
-           ConvertSubI, ConvertShLI, ConvertDivI, ConvertRemI, ConvertShRI,
-           ConvertAddF, ConvertSubF, ConvertMulF, ConvertDivF>(converter, ctx);
+  patterns.add<ConvertModule, ConvertEntry, ConvertMakeTensorView,
+               ConvertMakePartitionView, ConvertConstant, ConvertIota,
+               ConvertGetGlobal, ConvertGlobal, ConvertGetTileBlockId,
+               ConvertGetNumTileBlocks, ConvertBitcast, ConvertMulI,
+               ConvertAtan2, ConvertCeil, ConvertCmpF, ConvertExtI, ConvertCos,
+               ConvertFToF, ConvertFToI, ConvertExp2, ConvertExp, ConvertFloor,
+               ConvertIToF, ConvertLog2, ConvertMaxF, ConvertMinF, ConvertNegF,
+               ConvertPow, ConvertRsqrt, ConvertSin, ConvertTanH, ConvertCmpI,
+               ConvertMaxI, ConvertMinI, ConvertMmaI, ConvertMulhiI,
+               ConvertNegI, ConvertTruncI, ConvertXOrI, ConvertFor, ConvertIf,
+               ConvertContinue, ConvertYield, ConvertReturn, ConvertMmaF,
+               ConvertAssume, ConvertPermute, ConvertReshape, ConvertBroadcast,
+               ConvertExtract, ConvertCat, ConvertReduce, ConvertScan,
+               ConvertSelect, ConvertGetTensorShape, ConvertGetIndexSpaceShape,
+               ConvertLoadViewTko, ConvertStoreViewTko, ConvertAbsF,
+               ConvertAbsI, ConvertLog, ConvertTan, ConvertSinH, ConvertCosH,
+               ConvertSqrt, ConvertFma, ConvertAndI, ConvertOrI, ConvertRemF,
+               ConvertAddI, ConvertSubI, ConvertShLI, ConvertDivI, ConvertRemI,
+               ConvertShRI, ConvertAddF, ConvertSubF, ConvertMulF, ConvertDivF>(
+      converter, ctx);
 }
 
 //===----------------------------------------------------------------------===//

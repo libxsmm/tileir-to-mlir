@@ -35,6 +35,17 @@ cuda_tile.module @ops_module {
     return
   }
 
+  // --- iota ---
+  // Extracted from Ops.td mlirExamples usage (e.g. atomic examples using
+  // `%offsets = iota : tile<8xi32>`).
+  // CHECK-LABEL: gpu.func @test_iota_example
+  entry @test_iota_example() {
+    // CHECK: %[[STEP:.*]] = vector.step : vector<8xindex>
+    // CHECK: %[[IOTA:.*]] = arith.index_castui %[[STEP]] : vector<8xindex> to vector<8xi32>
+    %offsets = iota : tile<8xi32>
+    return
+  }
+
   // --- constant ---
   // CHECK-LABEL: gpu.func @test_constant
   entry @test_constant() {

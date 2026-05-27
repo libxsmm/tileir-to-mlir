@@ -129,6 +129,23 @@ cuda_tile.module @m {
     return
   }
 
+  // --- iota edge cases ---
+  // CHECK-LABEL: gpu.func @test_iota_i8
+  entry @test_iota_i8() {
+    // CHECK: %[[I8_STEP:.*]] = vector.step : vector<4xindex>
+    // CHECK: %[[I8_IOTA:.*]] = arith.index_castui %[[I8_STEP]] : vector<4xindex> to vector<4xi8>
+    %idx = iota : tile<4xi8>
+    return
+  }
+
+  // CHECK-LABEL: gpu.func @test_iota_i64
+  entry @test_iota_i64() {
+    // CHECK: %[[I64_STEP:.*]] = vector.step : vector<16xindex>
+    // CHECK: %[[I64_IOTA:.*]] = arith.index_castui %[[I64_STEP]] : vector<16xindex> to vector<16xi64>
+    %idx = iota : tile<16xi64>
+    return
+  }
+
   // --- load with dynamic memref, identity dim_map, ub.poison padding ---
   // CHECK-LABEL: gpu.func @test_load_identity_no_padding
   // CHECK-SAME: %[[LID_UPTR:[a-zA-Z0-9_]+]]: memref<*xf16>
