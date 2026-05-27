@@ -13,6 +13,7 @@
 // cuda_tile::AssumeOp
 // cuda_tile::Atan2Op
 // cuda_tile::BitcastOp
+// cuda_tile::BroadcastOp
 // cuda_tile::CosOp
 // cuda_tile::CosHOp
 // cuda_tile::CeilOp
@@ -27,6 +28,7 @@
 // cuda_tile::ExpOp
 // cuda_tile::Exp2Op
 // cuda_tile::ExtIOp
+// cuda_tile::ExtractOp
 // cuda_tile::FmaOp
 // cuda_tile::ForOp
 // cuda_tile::FloorOp
@@ -80,10 +82,8 @@
 // cuda_tile::AssertOp
 // cuda_tile::AtomicCASTkoOp
 // cuda_tile::AtomicRMWTkoOp
-// cuda_tile::BroadcastOp
 // cuda_tile::BreakOp
 // cuda_tile::CatOp
-// cuda_tile::ExtractOp
 // cuda_tile::GlobalOp
 // cuda_tile::IntToPtrOp
 // cuda_tile::IotaOp
@@ -1355,6 +1355,125 @@ struct ConvertReshape : public OpConversionPattern<cuda_tile::ReshapeOp> {
   }
 };
 
+/// Convert cuda_tile.broadcast to vector.broadcast.
+///
+/// Both ops expand size-1 dimensions by duplicating data along them while
+/// preserving the rank.  cuda_tile.broadcast requires same rank for source
+/// and result and only stretches dimensions of size 1.  vector.broadcast has
+/// the same "dim-1 stretching" semantics for trailing dimensions when the
+/// source and result have equal rank, so the lowering is a direct 1:1 map.
+struct ConvertBroadcast : public OpConversionPattern<cuda_tile::BroadcastOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::BroadcastOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type resultTy = getTypeConverter()->convertType(op.getType());
+    if (!resultTy)
+      return rewriter.notifyMatchFailure(op, "cannot convert result type");
+    auto dstVecTy = cast<VectorType>(resultTy);
+    rewriter.replaceOpWithNewOp<vector::BroadcastOp>(op, dstVecTy,
+                                                     adaptor.getSource());
+    return success();
+  }
+};
+
+/// Convert cuda_tile.extract to vector.shape_cast + vector.transpose +
+/// vector.extract.
+///
+/// Source semantics (from Ops.td):
+///   For `extract %t[%i_0, ..., %i_{n-1}] : tile<D_0 x ... x D_{n-1} x T>
+///                                       -> tile<R_0 x ... x R_{n-1} x T>`,
+///   each R_k evenly divides D_k.  With S_k = D_k / R_k slices per axis,
+///       result[a_0, ..., a_{n-1}] = source[i_0*R_0 + a_0, ...,
+///                                          i_{n-1}*R_{n-1} + a_{n-1}].
+///   The $indices are interpreted as unsigned i32; OOB is UB.
+///
+/// Lowering (dynamic indices preclude vector.extract_strided_slice which
+/// requires static offsets):
+///   1. shape_cast <D_0 x ... x D_{n-1}>
+///                 -> <S_0 x R_0 x S_1 x R_1 x ... x S_{n-1} x R_{n-1}>.
+///      Row-major linearization gives position [s_0,r_0,...,s_k,r_k] the same
+///      linear index as source[s_0*R_0 + r_0, ..., s_k*R_k + r_k] because
+///      D_k = S_k * R_k.
+///   2. transpose with permutation [0,2,...,2(n-1), 1,3,...,2(n-1)+1] to
+///      group slice-index dims first:
+///          <S_0 x ... x S_{n-1} x R_0 x ... x R_{n-1}>.
+///   3. vector.extract at [i_0, ..., i_{n-1}] yields the <R_0 x ... x R_{n-1}>
+///      subvector matching the source semantics.
+///
+/// Special cases:
+///   - rank-1 source: interleaved shape <S_0, R_0> already has the slice dim
+///     leading, the permutation is the identity, so the transpose is skipped.
+///   - source type == result type (scalar tile or all S_k == 1): forward the
+///     source directly. This also covers the scalar tile<T> case where the
+///     converted type is not a VectorType.
+struct ConvertExtract : public OpConversionPattern<cuda_tile::ExtractOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::ExtractOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type resultTy = getTypeConverter()->convertType(op.getType());
+    if (!resultTy)
+      return rewriter.notifyMatchFailure(op, "cannot convert result type");
+
+    Value source = adaptor.getSource();
+    Location loc = op.getLoc();
+
+    // Trivial case: source and result types coincide (all S_k == 1, or a
+    // scalar tile<T> that converts to a non-vector type).
+    if (source.getType() == resultTy) {
+      rewriter.replaceOp(op, source);
+      return success();
+    }
+
+    auto srcVecTy = cast<VectorType>(source.getType());
+    auto dstVecTy = cast<VectorType>(resultTy);
+    int64_t rank = srcVecTy.getRank();
+
+    // Step 1: Build interleaved reshape <S_0, R_0, S_1, R_1, ...>.
+    SmallVector<int64_t> interleavedShape;
+    interleavedShape.reserve(2 * rank);
+    for (auto [d, r] :
+         llvm::zip_equal(srcVecTy.getShape(), dstVecTy.getShape())) {
+      interleavedShape.push_back(d / r); // S_k
+      interleavedShape.push_back(r);     // R_k
+    }
+    auto interleavedTy =
+        VectorType::get(interleavedShape, srcVecTy.getElementType());
+    Value reshaped =
+        vector::ShapeCastOp::create(rewriter, loc, interleavedTy, source);
+
+    // Step 2: Transpose slice dims to the front.  For rank 1 the permutation
+    // is [0,1] (identity), so we skip the transpose.
+    Value extractSource = reshaped;
+    if (rank > 1) {
+      SmallVector<int64_t> perm;
+      perm.reserve(2 * rank);
+      for (int64_t k = 0; k < rank; ++k)
+        perm.push_back(2 * k); // slice dims first
+      for (int64_t k = 0; k < rank; ++k)
+        perm.push_back(2 * k + 1); // result dims trailing
+      extractSource =
+          vector::TransposeOp::create(rewriter, loc, reshaped, perm);
+    }
+
+    // Step 3: Cast the unsigned i32 slice indices to `index` (the spec
+    // declares $indices as unsigned, so use index_castui) and emit
+    // vector.extract.
+    Type indexTy = rewriter.getIndexType();
+    SmallVector<OpFoldResult> positions = llvm::map_to_vector(
+        adaptor.getIndices(), [&](Value idx) -> OpFoldResult {
+          return arith::IndexCastUIOp::create(rewriter, loc, indexTy, idx)
+              .getResult();
+        });
+    rewriter.replaceOpWithNewOp<vector::ExtractOp>(op, extractSource,
+                                                   positions);
+    return success();
+  }
+};
+
 /// Convert cuda_tile.select to arith.select.
 ///
 /// cuda_tile.select is element-wise: result[i] = cond[i] ? val_if_true[i]
@@ -2065,24 +2184,24 @@ static void populateTileIRToGPUTypeConverter(TypeConverter &converter,
 static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
                                                   RewritePatternSet &patterns) {
   MLIRContext *ctx = patterns.getContext();
-  patterns.add<ConvertModule, ConvertEntry, ConvertMakeTensorView,
-               ConvertMakePartitionView, ConvertConstant, ConvertGetTileBlockId,
-               ConvertGetNumTileBlocks, ConvertBitcast, ConvertMulI,
-               ConvertAtan2, ConvertCeil, ConvertCmpF, ConvertExtI, ConvertCos,
-               ConvertFToF, ConvertFToI, ConvertExp2, ConvertExp, ConvertFloor,
-               ConvertIToF, ConvertLog2, ConvertMaxF, ConvertMinF, ConvertNegF,
-               ConvertPow, ConvertRsqrt, ConvertSin, ConvertTanH, ConvertCmpI,
-               ConvertMaxI, ConvertMinI, ConvertMmaI, ConvertMulhiI,
-               ConvertNegI, ConvertTruncI, ConvertXOrI, ConvertFor, ConvertIf,
-               ConvertContinue, ConvertYield, ConvertReturn, ConvertMmaF,
-               ConvertAssume, ConvertPermute, ConvertReshape, ConvertReduce,
-               ConvertScan, ConvertSelect, ConvertGetIndexSpaceShape,
-               ConvertLoadViewTko, ConvertStoreViewTko, ConvertAbsF,
-               ConvertAbsI, ConvertLog, ConvertTan, ConvertSinH, ConvertCosH,
-               ConvertSqrt, ConvertFma, ConvertAndI, ConvertOrI, ConvertRemF,
-               ConvertAddI, ConvertSubI, ConvertShLI, ConvertDivI, ConvertRemI,
-               ConvertShRI, ConvertAddF, ConvertSubF, ConvertMulF, ConvertDivF>(
-      converter, ctx);
+  patterns
+      .add<ConvertModule, ConvertEntry, ConvertMakeTensorView,
+           ConvertMakePartitionView, ConvertConstant, ConvertGetTileBlockId,
+           ConvertGetNumTileBlocks, ConvertBitcast, ConvertMulI, ConvertAtan2,
+           ConvertCeil, ConvertCmpF, ConvertExtI, ConvertCos, ConvertFToF,
+           ConvertFToI, ConvertExp2, ConvertExp, ConvertFloor, ConvertIToF,
+           ConvertLog2, ConvertMaxF, ConvertMinF, ConvertNegF, ConvertPow,
+           ConvertRsqrt, ConvertSin, ConvertTanH, ConvertCmpI, ConvertMaxI,
+           ConvertMinI, ConvertMmaI, ConvertMulhiI, ConvertNegI, ConvertTruncI,
+           ConvertXOrI, ConvertFor, ConvertIf, ConvertContinue, ConvertYield,
+           ConvertReturn, ConvertMmaF, ConvertAssume, ConvertPermute,
+           ConvertReshape, ConvertBroadcast, ConvertExtract, ConvertReduce,
+           ConvertScan, ConvertSelect, ConvertGetIndexSpaceShape,
+           ConvertLoadViewTko, ConvertStoreViewTko, ConvertAbsF, ConvertAbsI,
+           ConvertLog, ConvertTan, ConvertSinH, ConvertCosH, ConvertSqrt,
+           ConvertFma, ConvertAndI, ConvertOrI, ConvertRemF, ConvertAddI,
+           ConvertSubI, ConvertShLI, ConvertDivI, ConvertRemI, ConvertShRI,
+           ConvertAddF, ConvertSubF, ConvertMulF, ConvertDivF>(converter, ctx);
 }
 
 //===----------------------------------------------------------------------===//

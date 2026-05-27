@@ -577,4 +577,24 @@ cuda_tile.module @ops_module {
     return
   }
 
+  // --- extract (from mlirExamples) ---
+  // Extract subtile at slice indices [1, 2] from tile<32x8xf32> -> tile<4x2xf32>.
+  // Offset = [1*4, 2*2] = [4, 4].
+  // CHECK-LABEL: gpu.func @test_extract
+  entry @test_extract() {
+    // CHECK-DAG: %[[EXT_I:.*]] = arith.constant 1 : i32
+    %c1 = constant <i32: 1> : tile<i32>
+    // CHECK-DAG: %[[EXT_J:.*]] = arith.constant 2 : i32
+    %c2 = constant <i32: 2> : tile<i32>
+    // CHECK-DAG: %[[EXT_SRC:.*]] = arith.constant dense<0.000000e+00> : vector<32x8xf32>
+    %t = constant <f32: 0.0> : tile<32x8xf32>
+    // CHECK: %[[EXT_RESHAPE:.*]] = vector.shape_cast %[[EXT_SRC]] : vector<32x8xf32> to vector<8x4x4x2xf32>
+    // CHECK: %[[EXT_TRANS:.*]] = vector.transpose %[[EXT_RESHAPE]], [0, 2, 1, 3] : vector<8x4x4x2xf32> to vector<8x4x4x2xf32>
+    // CHECK: %[[EXT_IDX0:.*]] = arith.index_castui %[[EXT_I]] : i32 to index
+    // CHECK: %[[EXT_IDX1:.*]] = arith.index_castui %[[EXT_J]] : i32 to index
+    // CHECK: %[[EXT_R:.*]] = vector.extract %[[EXT_TRANS]][%[[EXT_IDX0]], %[[EXT_IDX1]]] : vector<4x2xf32> from vector<8x4x4x2xf32>
+    %0 = extract %t[%c1, %c2] : tile<32x8xf32> -> tile<4x2xf32>
+    return
+  }
+
 }

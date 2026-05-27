@@ -877,4 +877,107 @@ cuda_tile.module @m {
     return
   }
 
+  // --- broadcast: 1-D expand from size 1 ---
+  // CHECK-LABEL: gpu.func @test_broadcast_1d
+  entry @test_broadcast_1d() {
+    // CHECK: %[[B1D_IN:.*]] = arith.constant dense<3.000000e+00> : vector<1xf32>
+    %a = constant <f32: 3.0> : tile<1xf32>
+    // CHECK: %[[B1D_R:.*]] = vector.broadcast %[[B1D_IN]] : vector<1xf32> to vector<8xf32>
+    %r = broadcast %a : tile<1xf32> -> tile<8xf32>
+    return
+  }
+
+  // --- broadcast: 2-D expand both dimensions ---
+  // CHECK-LABEL: gpu.func @test_broadcast_2d
+  entry @test_broadcast_2d() {
+    // CHECK: %[[B2D_IN:.*]] = arith.constant dense<2.000000e+00> : vector<1x1xf16>
+    %a = constant <f16: 2.0> : tile<1x1xf16>
+    // CHECK: %[[B2D_R:.*]] = vector.broadcast %[[B2D_IN]] : vector<1x1xf16> to vector<4x8xf16>
+    %r = broadcast %a : tile<1x1xf16> -> tile<4x8xf16>
+    return
+  }
+
+  // --- broadcast: 2-D expand only second dimension ---
+  // CHECK-LABEL: gpu.func @test_broadcast_partial
+  entry @test_broadcast_partial() {
+    // CHECK: %[[BP_IN:.*]] = arith.constant dense<1.000000e+00> : vector<4x1xf32>
+    %a = constant <f32: 1.0> : tile<4x1xf32>
+    // CHECK: %[[BP_R:.*]] = vector.broadcast %[[BP_IN]] : vector<4x1xf32> to vector<4x8xf32>
+    %r = broadcast %a : tile<4x1xf32> -> tile<4x8xf32>
+    return
+  }
+
+  // --- broadcast: 3-D expand selected dimensions ---
+  // CHECK-LABEL: gpu.func @test_broadcast_3d
+  entry @test_broadcast_3d() {
+    // CHECK: %[[B3D_IN:.*]] = arith.constant dense<5.000000e-01> : vector<1x4x1xf32>
+    %a = constant <f32: 0.5> : tile<1x4x1xf32>
+    // CHECK: %[[B3D_R:.*]] = vector.broadcast %[[B3D_IN]] : vector<1x4x1xf32> to vector<8x4x16xf32>
+    %r = broadcast %a : tile<1x4x1xf32> -> tile<8x4x16xf32>
+    return
+  }
+
+  // --- extract: 1-D extraction (no transpose needed) ---
+  // CHECK-LABEL: gpu.func @test_extract_1d
+  entry @test_extract_1d() {
+    // CHECK-DAG: %[[E1D_IDX:.*]] = arith.constant 2 : i32
+    %idx = constant <i32: 2> : tile<i32>
+    // CHECK-DAG: %[[E1D_SRC:.*]] = arith.constant dense<1.000000e+00> : vector<16xf32>
+    %src = constant <f32: 1.0> : tile<16xf32>
+    // CHECK: %[[E1D_RESHAPE:.*]] = vector.shape_cast %[[E1D_SRC]] : vector<16xf32> to vector<4x4xf32>
+    // CHECK: %[[E1D_CAST:.*]] = arith.index_castui %[[E1D_IDX]] : i32 to index
+    // CHECK: %[[E1D_R:.*]] = vector.extract %[[E1D_RESHAPE]][%[[E1D_CAST]]] : vector<4xf32> from vector<4x4xf32>
+    %r = extract %src[%idx] : tile<16xf32> -> tile<4xf32>
+    return
+  }
+
+  // --- extract: trivial identity (source == result shape) ---
+  // CHECK-LABEL: gpu.func @test_extract_identity
+  entry @test_extract_identity() {
+    // CHECK-DAG: %[[EID_IDX:.*]] = arith.constant 0 : i32
+    %idx0 = constant <i32: 0> : tile<i32>
+    // CHECK-DAG: %[[EID_SRC:.*]] = arith.constant dense<2.000000e+00> : vector<4x8xf32>
+    %src = constant <f32: 2.0> : tile<4x8xf32>
+    // Source and result shapes match → identity (no reshape/transpose/extract).
+    // CHECK-NOT: vector.shape_cast
+    // CHECK-NOT: vector.transpose
+    // CHECK-NOT: vector.extract
+    %r = extract %src[%idx0, %idx0] : tile<4x8xf32> -> tile<4x8xf32>
+    return
+  }
+
+  // --- extract: 2-D extraction with integer type ---
+  // CHECK-LABEL: gpu.func @test_extract_2d_int
+  entry @test_extract_2d_int() {
+    // CHECK-DAG: %[[E2I_I:.*]] = arith.constant 1 : i32
+    %i = constant <i32: 1> : tile<i32>
+    // CHECK-DAG: %[[E2I_J:.*]] = arith.constant 0 : i32
+    %j = constant <i32: 0> : tile<i32>
+    // CHECK-DAG: %[[E2I_SRC:.*]] = arith.constant dense<42> : vector<8x4xi16>
+    %src = constant <i16: 42> : tile<8x4xi16>
+    // 8/2=4 slices in dim0, 4/2=2 slices in dim1.
+    // CHECK: %[[E2I_RESHAPE:.*]] = vector.shape_cast %[[E2I_SRC]] : vector<8x4xi16> to vector<4x2x2x2xi16>
+    // CHECK: %[[E2I_TRANS:.*]] = vector.transpose %[[E2I_RESHAPE]], [0, 2, 1, 3] : vector<4x2x2x2xi16> to vector<4x2x2x2xi16>
+    // CHECK: %[[E2I_IDX0:.*]] = arith.index_castui %[[E2I_I]] : i32 to index
+    // CHECK: %[[E2I_IDX1:.*]] = arith.index_castui %[[E2I_J]] : i32 to index
+    // CHECK: %[[E2I_R:.*]] = vector.extract %[[E2I_TRANS]][%[[E2I_IDX0]], %[[E2I_IDX1]]] : vector<2x2xi16> from vector<4x2x2x2xi16>
+    %r = extract %src[%i, %j] : tile<8x4xi16> -> tile<2x2xi16>
+    return
+  }
+
+  // --- extract: 1-D with halving (extract half) ---
+  // CHECK-LABEL: gpu.func @test_extract_half
+  entry @test_extract_half() {
+    // CHECK-DAG: %[[EH_IDX:.*]] = arith.constant 1 : i32
+    %idx = constant <i32: 1> : tile<i32>
+    // CHECK-DAG: %[[EH_SRC:.*]] = arith.constant dense<0.000000e+00> : vector<8xf32>
+    %src = constant <f32: 0.0> : tile<8xf32>
+    // 8/4=2 slices.
+    // CHECK: %[[EH_RESHAPE:.*]] = vector.shape_cast %[[EH_SRC]] : vector<8xf32> to vector<2x4xf32>
+    // CHECK: %[[EH_CAST:.*]] = arith.index_castui %[[EH_IDX]] : i32 to index
+    // CHECK: %[[EH_R:.*]] = vector.extract %[[EH_RESHAPE]][%[[EH_CAST]]] : vector<4xf32> from vector<2x4xf32>
+    %r = extract %src[%idx] : tile<8xf32> -> tile<4xf32>
+    return
+  }
+
 }
