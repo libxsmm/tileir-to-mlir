@@ -46,6 +46,7 @@
 // cuda_tile::LoadViewTkoOp
 // cuda_tile::LogOp
 // cuda_tile::Log2Op
+// cuda_tile::MakePartitionViewOp
 // cuda_tile::MakeTensorViewOp
 // cuda_tile::MaxFOp
 // cuda_tile::MaxIOp
@@ -62,6 +63,7 @@
 // cuda_tile::OrIOp
 // cuda_tile::PermuteOp
 // cuda_tile::PowOp
+// cuda_tile::PtrToPtrOp
 // cuda_tile::ReduceOp
 // cuda_tile::RemFOp
 // cuda_tile::RemIOp
@@ -90,12 +92,14 @@
 // cuda_tile::AtomicRMWTkoOp
 // cuda_tile::BreakOp
 // cuda_tile::IntToPtrOp
+// cuda_tile::JoinTokensOp
 // cuda_tile::LoadPtrTkoOp
 // cuda_tile::LoopOp
+// cuda_tile::MakeTokenOp
 // cuda_tile::OffsetOp
 // cuda_tile::PrintTkoOp
 // cuda_tile::PtrToIntOp
-// cuda_tile::PtrToPtrOp
+// cuda_tile::StorePtrTkoOp
 
 #include "mlir/Conversion/CudaTileToGPU/CudaTileToGPU.h"
 
@@ -786,6 +790,11 @@ struct ConvertPtrToPtrCastOrFail
     if (!resultMemRefTy || !sourceMemRefTy)
       return rewriter.notifyMatchFailure(
           op, "ptr_to_ptr requires memref source/result after type conversion");
+
+    if (sourceMemRefTy == resultMemRefTy) {
+      rewriter.replaceOp(op, source);
+      return success();
+    }
 
     if (!memref::CastOp::areCastCompatible(sourceMemRefTy, resultMemRefTy))
       return rewriter.notifyMatchFailure(
@@ -2508,26 +2517,25 @@ static void populateTileIRToGPUTypeConverter(TypeConverter &converter,
 static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
                                                   RewritePatternSet &patterns) {
   MLIRContext *ctx = patterns.getContext();
-  patterns.add<ConvertModule, ConvertEntry, ConvertMakeTensorView,
-               ConvertMakePartitionView, ConvertConstant, ConvertIota,
-               ConvertGetGlobal, ConvertGlobal, ConvertGetTileBlockId,
-               ConvertGetNumTileBlocks, ConvertBitcast, ConvertMulI,
-               ConvertAtan2, ConvertCeil, ConvertCmpF, ConvertExtI, ConvertCos,
-               ConvertFToF, ConvertFToI, ConvertExp2, ConvertExp, ConvertFloor,
-               ConvertIToF, ConvertLog2, ConvertMaxF, ConvertMinF, ConvertNegF,
-               ConvertPow, ConvertRsqrt, ConvertSin, ConvertTanH, ConvertCmpI,
-               ConvertMaxI, ConvertMinI, ConvertMmaI, ConvertMulhiI,
-               ConvertNegI, ConvertTruncI, ConvertXOrI, ConvertFor, ConvertIf,
-               ConvertContinue, ConvertYield, ConvertReturn, ConvertMmaF,
-               ConvertAssume, ConvertPermute, ConvertReshape, ConvertBroadcast,
-               ConvertExtract, ConvertCat, ConvertReduce, ConvertScan,
-               ConvertSelect, ConvertGetTensorShape, ConvertGetIndexSpaceShape,
-               ConvertLoadViewTko, ConvertStoreViewTko, ConvertAbsF,
-               ConvertAbsI, ConvertLog, ConvertTan, ConvertSinH, ConvertCosH,
-               ConvertSqrt, ConvertFma, ConvertAndI, ConvertOrI, ConvertRemF,
-               ConvertAddI, ConvertSubI, ConvertShLI, ConvertDivI, ConvertRemI,
-               ConvertShRI, ConvertAddF, ConvertSubF, ConvertMulF, ConvertDivF>(
-      converter, ctx);
+  patterns.add<
+      ConvertModule, ConvertEntry, ConvertMakeTensorView,
+      ConvertMakePartitionView, ConvertConstant, ConvertIota, ConvertGetGlobal,
+      ConvertGlobal, ConvertGetTileBlockId, ConvertGetNumTileBlocks,
+      ConvertBitcast, ConvertPtrToPtrCastOrFail, ConvertMulI, ConvertAtan2,
+      ConvertCeil, ConvertCmpF, ConvertExtI, ConvertCos, ConvertFToF,
+      ConvertFToI, ConvertExp2, ConvertExp, ConvertFloor, ConvertIToF,
+      ConvertLog2, ConvertMaxF, ConvertMinF, ConvertNegF, ConvertPow,
+      ConvertRsqrt, ConvertSin, ConvertTanH, ConvertCmpI, ConvertMaxI,
+      ConvertMinI, ConvertMmaI, ConvertMulhiI, ConvertNegI, ConvertTruncI,
+      ConvertXOrI, ConvertFor, ConvertIf, ConvertContinue, ConvertYield,
+      ConvertReturn, ConvertMmaF, ConvertAssume, ConvertPermute, ConvertReshape,
+      ConvertBroadcast, ConvertExtract, ConvertCat, ConvertReduce, ConvertScan,
+      ConvertSelect, ConvertGetTensorShape, ConvertGetIndexSpaceShape,
+      ConvertLoadViewTko, ConvertStoreViewTko, ConvertAbsF, ConvertAbsI,
+      ConvertLog, ConvertTan, ConvertSinH, ConvertCosH, ConvertSqrt, ConvertFma,
+      ConvertAndI, ConvertOrI, ConvertRemF, ConvertAddI, ConvertSubI,
+      ConvertShLI, ConvertDivI, ConvertRemI, ConvertShRI, ConvertAddF,
+      ConvertSubF, ConvertMulF, ConvertDivF>(converter, ctx);
 }
 
 //===----------------------------------------------------------------------===//

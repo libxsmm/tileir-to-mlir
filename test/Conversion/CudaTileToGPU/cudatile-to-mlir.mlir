@@ -27,6 +27,41 @@ cuda_tile.module @m {
     return
   }
 
+  // --- ptr_to_ptr ---
+  // CHECK-LABEL: gpu.func @test_ptr_to_ptr_example
+  // CHECK-SAME: %[[PTP_IN:[a-zA-Z0-9_]+]]: memref<*xf32>
+  entry @test_ptr_to_ptr_example(%source: !cuda_tile.tile<!cuda_tile.ptr<f32>>) {
+    // CHECK-NOT: memref.cast
+    %cast = ptr_to_ptr %source : tile<ptr<f32>> -> tile<ptr<f32>>
+    return
+  }
+
+  // --- ptr_to_ptr edge cases ---
+  // Covers chaining with get_global and use as a make_tensor_view base.
+  // CHECK-LABEL: gpu.func @test_ptr_to_ptr_get_global_chain
+  entry @test_ptr_to_ptr_get_global_chain() {
+    // CHECK: %[[PTPG_G:.*]] = memref.get_global @g_f32_aligned : memref<4xf32>
+    // CHECK: %[[PTPG_P:.*]] = memref.cast %[[PTPG_G]] : memref<4xf32> to memref<*xf32>
+    %p = get_global @g_f32_aligned : tile<ptr<f32>>
+    %q = ptr_to_ptr %p : tile<ptr<f32>> -> tile<ptr<f32>>
+    // CHECK-NOT: memref.cast {{.*}} : memref<\*xf32> to memref<\*xf32>
+    // CHECK: %[[PTPG_V:.*]] = memref.reinterpret_cast %[[PTPG_P]] to offset: [0], sizes: [4], strides: [1] : memref<*xf32> to memref<4xf32>
+    %tv = make_tensor_view %q, shape = [4], strides = [1] : tensor_view<4xf32, strides=[1]>
+    return
+  }
+
+  // CHECK-LABEL: gpu.func @test_ptr_to_ptr_dynamic_base
+  // CHECK-SAME: %[[PTPD_BASE:[a-zA-Z0-9_]+]]: memref<*xf16>, %[[PTPD_M:[a-zA-Z0-9_]+]]: i32, %[[PTPD_S:[a-zA-Z0-9_]+]]: i32
+  entry @test_ptr_to_ptr_dynamic_base(%p: !cuda_tile.tile<!cuda_tile.ptr<f16>>, %m: !cuda_tile.tile<i32>, %s: !cuda_tile.tile<i32>) {
+    // CHECK-NOT: memref.cast
+    %q = ptr_to_ptr %p : tile<ptr<f16>> -> tile<ptr<f16>>
+    // CHECK: %[[PTPD_MI:.*]] = arith.index_cast %[[PTPD_M]] : i32 to index
+    // CHECK: %[[PTPD_SI:.*]] = arith.index_cast %[[PTPD_S]] : i32 to index
+    // CHECK: %[[PTPD_V:.*]] = memref.reinterpret_cast %[[PTPD_BASE]] to offset: [0], sizes: [%[[PTPD_MI]], 8], strides: [%[[PTPD_SI]], 1] : memref<*xf16> to memref<?x8xf16, strided<[?, 1]>>
+    %tv = make_tensor_view %q, shape = [%m, 8], strides = [%s, 1] : tile<i32> -> tensor_view<?x8xf16, strides=[?,1]>
+    return
+  }
+
   // --- 2D array constant (not covered by cuda_tile_ir_ops) ---
   // CHECK-LABEL: gpu.func @test_constant_2d_array
   entry @test_constant_2d_array() {
