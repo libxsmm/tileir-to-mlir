@@ -980,4 +980,64 @@ cuda_tile.module @m {
     return
   }
 
+  // --- cat: 1D concatenation ---
+  // CHECK-LABEL: gpu.func @test_cat_1d
+  entry @test_cat_1d() {
+    // CHECK-DAG: %[[C1D_L:.*]] = arith.constant dense<1.000000e+00> : vector<4xf32>
+    %l = constant <f32: 1.0> : tile<4xf32>
+    // CHECK-DAG: %[[C1D_R:.*]] = arith.constant dense<2.000000e+00> : vector<4xf32>
+    %r = constant <f32: 2.0> : tile<4xf32>
+    // dim=0, lhs.shape[0]=4, result = <8xf32>
+    // CHECK: %[[C1D_P:.*]] = ub.poison : vector<8xf32>
+    // CHECK: %[[C1D_INS0:.*]] = vector.insert_strided_slice %[[C1D_L]], %[[C1D_P]] {offsets = [0], strides = [1]} : vector<4xf32> into vector<8xf32>
+    // CHECK: %[[C1D_INS1:.*]] = vector.insert_strided_slice %[[C1D_R]], %[[C1D_INS0]] {offsets = [4], strides = [1]} : vector<4xf32> into vector<8xf32>
+    %0 = cat %l, %r dim = 0 : tile<4xf32>, tile<4xf32> -> tile<8xf32>
+    return
+  }
+
+  // --- cat: asymmetric 2D along dim 0 ---
+  // CHECK-LABEL: gpu.func @test_cat_2d_dim0
+  entry @test_cat_2d_dim0() {
+    // CHECK-DAG: %[[C2D0_L:.*]] = arith.constant dense<0> : vector<2x8xi16>
+    %l = constant <i16: 0> : tile<2x8xi16>
+    // CHECK-DAG: %[[C2D0_R:.*]] = arith.constant dense<1> : vector<2x8xi16>
+    %r = constant <i16: 1> : tile<2x8xi16>
+    // result = <4x8xi16>
+    // CHECK: %[[C2D0_P:.*]] = ub.poison : vector<4x8xi16>
+    // CHECK: %[[C2D0_INS0:.*]] = vector.insert_strided_slice %[[C2D0_L]], %[[C2D0_P]] {offsets = [0, 0], strides = [1, 1]} : vector<2x8xi16> into vector<4x8xi16>
+    // CHECK: %[[C2D0_INS1:.*]] = vector.insert_strided_slice %[[C2D0_R]], %[[C2D0_INS0]] {offsets = [2, 0], strides = [1, 1]} : vector<2x8xi16> into vector<4x8xi16>
+    %0 = cat %l, %r dim = 0 : tile<2x8xi16>, tile<2x8xi16> -> tile<4x8xi16>
+    return
+  }
+
+  // --- cat: 3D concatenation along middle dim ---
+  // CHECK-LABEL: gpu.func @test_cat_3d_dim1
+  entry @test_cat_3d_dim1() {
+    // CHECK-DAG: %[[C3D_L:.*]] = arith.constant dense<0.000000e+00> : vector<2x4x8xf16>
+    %l = constant <f16: 0.0> : tile<2x4x8xf16>
+    // CHECK-DAG: %[[C3D_R:.*]] = arith.constant dense<0.000000e+00> : vector<2x4x8xf16>
+    %r = constant <f16: 0.0> : tile<2x4x8xf16>
+    // result = <2x8x8xf16>
+    // CHECK: %[[C3D_P:.*]] = ub.poison : vector<2x8x8xf16>
+    // CHECK: %[[C3D_INS0:.*]] = vector.insert_strided_slice %[[C3D_L]], %[[C3D_P]] {offsets = [0, 0, 0], strides = [1, 1, 1]} : vector<2x4x8xf16> into vector<2x8x8xf16>
+    // CHECK: %[[C3D_INS1:.*]] = vector.insert_strided_slice %[[C3D_R]], %[[C3D_INS0]] {offsets = [0, 4, 0], strides = [1, 1, 1]} : vector<2x4x8xf16> into vector<2x8x8xf16>
+    %0 = cat %l, %r dim = 1 : tile<2x4x8xf16>, tile<2x4x8xf16> -> tile<2x8x8xf16>
+    return
+  }
+
+  // --- cat: integer type, last dim ---
+  // CHECK-LABEL: gpu.func @test_cat_i32_last_dim
+  entry @test_cat_i32_last_dim() {
+    // CHECK-DAG: %[[CI_L:.*]] = arith.constant dense<0> : vector<4x2xi32>
+    %l = constant <i32: 0> : tile<4x2xi32>
+    // CHECK-DAG: %[[CI_R:.*]] = arith.constant dense<0> : vector<4x2xi32>
+    %r = constant <i32: 0> : tile<4x2xi32>
+    // result = <4x4xi32>
+    // CHECK: %[[CI_P:.*]] = ub.poison : vector<4x4xi32>
+    // CHECK: %[[CI_INS0:.*]] = vector.insert_strided_slice %[[CI_L]], %[[CI_P]] {offsets = [0, 0], strides = [1, 1]} : vector<4x2xi32> into vector<4x4xi32>
+    // CHECK: %[[CI_INS1:.*]] = vector.insert_strided_slice %[[CI_R]], %[[CI_INS0]] {offsets = [0, 2], strides = [1, 1]} : vector<4x2xi32> into vector<4x4xi32>
+    %0 = cat %l, %r dim = 1 : tile<4x2xi32>, tile<4x2xi32> -> tile<4x4xi32>
+    return
+  }
+
 }

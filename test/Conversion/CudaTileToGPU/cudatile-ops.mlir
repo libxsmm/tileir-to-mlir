@@ -597,4 +597,27 @@ cuda_tile.module @ops_module {
     return
   }
 
+  // --- cat (from mlirExamples) ---
+  // Concatenate two tiles along dim 1 and dim 0.
+  // CHECK-LABEL: gpu.func @test_cat
+  entry @test_cat() {
+    // CHECK-DAG: %[[CAT_LHS:.*]] = arith.constant dense<0.000000e+00> : vector<2x4xf32>
+    %arg0 = constant <f32: 0.0> : tile<2x4xf32>
+    // CHECK-DAG: %[[CAT_RHS:.*]] = arith.constant dense<1.000000e+00> : vector<2x4xf32>
+    %arg1 = constant <f32: 1.0> : tile<2x4xf32>
+
+    // cat along dim=1: tile<2x4> ++ tile<2x4> -> tile<2x8>
+    // CHECK: %[[CAT1_P:.*]] = ub.poison : vector<2x8xf32>
+    // CHECK: %[[CAT1_L:.*]] = vector.insert_strided_slice %[[CAT_LHS]], %[[CAT1_P]] {offsets = [0, 0], strides = [1, 1]} : vector<2x4xf32> into vector<2x8xf32>
+    // CHECK: %[[CAT1_R:.*]] = vector.insert_strided_slice %[[CAT_RHS]], %[[CAT1_L]] {offsets = [0, 4], strides = [1, 1]} : vector<2x4xf32> into vector<2x8xf32>
+    %0 = cat %arg0, %arg1 dim = 1 : tile<2x4xf32>, tile<2x4xf32> -> tile<2x8xf32>
+
+    // cat along dim=0: tile<2x4> ++ tile<2x4> -> tile<4x4>
+    // CHECK: %[[CAT0_P:.*]] = ub.poison : vector<4x4xf32>
+    // CHECK: %[[CAT0_L:.*]] = vector.insert_strided_slice %[[CAT_LHS]], %[[CAT0_P]] {offsets = [0, 0], strides = [1, 1]} : vector<2x4xf32> into vector<4x4xf32>
+    // CHECK: %[[CAT0_R:.*]] = vector.insert_strided_slice %[[CAT_RHS]], %[[CAT0_L]] {offsets = [2, 0], strides = [1, 1]} : vector<2x4xf32> into vector<4x4xf32>
+    %1 = cat %arg0, %arg1 dim = 0 : tile<2x4xf32>, tile<2x4xf32> -> tile<4x4xf32>
+    return
+  }
+
 }

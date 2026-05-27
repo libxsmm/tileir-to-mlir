@@ -14,6 +14,7 @@
 // cuda_tile::Atan2Op
 // cuda_tile::BitcastOp
 // cuda_tile::BroadcastOp
+// cuda_tile::CatOp
 // cuda_tile::CosOp
 // cuda_tile::CosHOp
 // cuda_tile::CeilOp
@@ -83,7 +84,8 @@
 // cuda_tile::AtomicCASTkoOp
 // cuda_tile::AtomicRMWTkoOp
 // cuda_tile::BreakOp
-// cuda_tile::CatOp
+// cuda_tile::GetIndexSpaceShapeOp
+// cuda_tile::GetTensorShapeOp
 // cuda_tile::GlobalOp
 // cuda_tile::IntToPtrOp
 // cuda_tile::IotaOp
@@ -1474,6 +1476,66 @@ struct ConvertExtract : public OpConversionPattern<cuda_tile::ExtractOp> {
   }
 };
 
+/// Convert cuda_tile.cat to vector.insert_strided_slice.
+///
+/// Source semantics (from Ops.td):
+///   `cat %lhs, %rhs dim = d : tile<...>, tile<...> -> tile<...>`
+///   Concatenates lhs and rhs along dimension `d`.  All non-concat dimensions
+///   must match.  result.shape[d] = lhs.shape[d] + rhs.shape[d].
+///
+///   cat(x, y, d)[..., i_d, ...] =
+///     x[..., i_d, ...]              if i_d < lhs.shape[d]
+///     y[..., i_d - lhs.shape[d], ...] otherwise
+///
+///   1. Create a poison/undef vector of the result type (ub.poison) — its
+///      elements will be fully overwritten by the two inserts.
+///   2. vector.insert_strided_slice lhs into the result at all-zero offsets.
+///   3. vector.insert_strided_slice rhs into the result at offset
+///      [0,...,lhs.shape[d],...,0] (only the concat-dim offset is non-zero).
+///
+///   All sizes and offsets are statically known from the tile types, which is
+///   exactly what vector.insert_strided_slice requires (I64ArrayAttr offsets,
+///   unit strides).
+struct ConvertCat : public OpConversionPattern<cuda_tile::CatOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::CatOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type resultTy = getTypeConverter()->convertType(op.getType());
+    if (!resultTy)
+      return rewriter.notifyMatchFailure(op, "cannot convert result type");
+
+    auto dstVecTy = cast<VectorType>(resultTy);
+    int64_t rank = dstVecTy.getRank();
+    int64_t concatDim = op.getDim();
+    Location loc = op.getLoc();
+
+    Value lhs = adaptor.getLhs();
+    Value rhs = adaptor.getRhs();
+    auto lhsVecTy = cast<VectorType>(lhs.getType());
+
+    // Start with an undefined result vector (all elements will be written).
+    Value dest = ub::PoisonOp::create(rewriter, loc, dstVecTy);
+
+    // Offsets for lhs: all zeros.
+    SmallVector<int64_t> lhsOffsets(rank, 0);
+    // Strides: all ones (required by vector.insert_strided_slice).
+    SmallVector<int64_t> strides(rank, 1);
+
+    Value withLhs = vector::InsertStridedSliceOp::create(
+        rewriter, loc, lhs, dest, lhsOffsets, strides);
+
+    // Offsets for rhs: zero everywhere except concatDim = lhs.shape[concatDim].
+    SmallVector<int64_t> rhsOffsets(rank, 0);
+    rhsOffsets[concatDim] = lhsVecTy.getDimSize(concatDim);
+
+    rewriter.replaceOpWithNewOp<vector::InsertStridedSliceOp>(
+        op, rhs, withLhs, rhsOffsets, strides);
+    return success();
+  }
+};
+
 /// Convert cuda_tile.select to arith.select.
 ///
 /// cuda_tile.select is element-wise: result[i] = cond[i] ? val_if_true[i]
@@ -2195,8 +2257,8 @@ static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
            ConvertMinI, ConvertMmaI, ConvertMulhiI, ConvertNegI, ConvertTruncI,
            ConvertXOrI, ConvertFor, ConvertIf, ConvertContinue, ConvertYield,
            ConvertReturn, ConvertMmaF, ConvertAssume, ConvertPermute,
-           ConvertReshape, ConvertBroadcast, ConvertExtract, ConvertReduce,
-           ConvertScan, ConvertSelect, ConvertGetIndexSpaceShape,
+           ConvertReshape, ConvertBroadcast, ConvertExtract, ConvertCat,
+           ConvertReduce, ConvertScan, ConvertSelect, ConvertGetIndexSpaceShape,
            ConvertLoadViewTko, ConvertStoreViewTko, ConvertAbsF, ConvertAbsI,
            ConvertLog, ConvertTan, ConvertSinH, ConvertCosH, ConvertSqrt,
            ConvertFma, ConvertAndI, ConvertOrI, ConvertRemF, ConvertAddI,
