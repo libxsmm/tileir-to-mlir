@@ -4,6 +4,96 @@
 //
 //===----------------------------------------------------------------------===//
 
+// cuda_tile ops with registered conversion patterns in this pass:
+// cuda_tile::AssumeOp
+// cuda_tile::Atan2Op
+// cuda_tile::BitcastOp
+// cuda_tile::CosOp
+// cuda_tile::CeilOp
+// cuda_tile::CmpFOp
+// cuda_tile::CmpIOp
+// cuda_tile::ConstantOp
+// cuda_tile::ContinueOp
+// cuda_tile::MmaFOp
+// cuda_tile::MmaIOp
+// cuda_tile::ExpOp
+// cuda_tile::Exp2Op
+// cuda_tile::ExtIOp
+// cuda_tile::ForOp
+// cuda_tile::FloorOp
+// cuda_tile::FToFOp
+// cuda_tile::FToIOp
+// cuda_tile::EntryOp
+// cuda_tile::GetTileBlockIdOp
+// cuda_tile::GetNumTileBlocksOp
+// cuda_tile::IfOp
+// cuda_tile::TruncIOp
+// cuda_tile::IToFOp
+// cuda_tile::LoadViewTkoOp
+// cuda_tile::Log2Op
+// cuda_tile::MakeTensorViewOp
+// cuda_tile::MaxFOp
+// cuda_tile::MaxIOp
+// cuda_tile::MinFOp
+// cuda_tile::MinIOp
+// cuda_tile::ModuleOp
+// cuda_tile::MulIOp
+// cuda_tile::MulhiIOp
+// cuda_tile::NegIOp
+// cuda_tile::NegFOp
+// cuda_tile::PowOp
+// cuda_tile::ReduceOp
+// cuda_tile::ReshapeOp
+// cuda_tile::ReturnOp
+// cuda_tile::ScanOp
+// cuda_tile::SelectOp
+// cuda_tile::SinOp
+// cuda_tile::StoreViewTkoOp
+// cuda_tile::TanHOp
+// cuda_tile::XOrIOp
+// cuda_tile::YieldOp
+// cuda_tile::RsqrtOp
+//
+// cuda_tile ops without a registered conversion pattern in this pass:
+// cuda_tile::AbsFOp
+// cuda_tile::AbsIOp
+// cuda_tile::AddIOp
+// cuda_tile::AddFOp
+// cuda_tile::AndIOp
+// cuda_tile::AssertOp
+// cuda_tile::AtomicCASTkoOp
+// cuda_tile::AtomicRMWTkoOp
+// cuda_tile::BroadcastOp
+// cuda_tile::CatOp
+// cuda_tile::CosHOp
+// cuda_tile::BreakOp
+// cuda_tile::DivFOp
+// cuda_tile::DivIOp
+// cuda_tile::ExtractOp
+// cuda_tile::FmaOp
+// cuda_tile::GlobalOp
+// cuda_tile::IntToPtrOp
+// cuda_tile::IotaOp
+// cuda_tile::LoadPtrTkoOp
+// cuda_tile::LogOp
+// cuda_tile::LoopOp
+// cuda_tile::MulFOp
+// cuda_tile::OffsetOp
+// cuda_tile::PermuteOp
+// cuda_tile::PrintTkoOp
+// cuda_tile::PtrToIntOp
+// cuda_tile::PtrToPtrOp
+// cuda_tile::RemIOp
+// cuda_tile::ShLIOp
+// cuda_tile::ShRIOp
+// cuda_tile::SinHOp
+// cuda_tile::SubFOp
+// cuda_tile::SubIOp
+// cuda_tile::TanOp
+// cuda_tile::OrIOp
+// cuda_tile::RemFOp
+// cuda_tile::SqrtOp
+
 #include "mlir/Conversion/CudaTileToGPU/CudaTileToGPU.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
