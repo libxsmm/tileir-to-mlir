@@ -5,20 +5,29 @@
 //===----------------------------------------------------------------------===//
 
 // cuda_tile ops with registered conversion patterns in this pass:
+// cuda_tile::AbsFOp
+// cuda_tile::AbsIOp
+// cuda_tile::AddFOp
+// cuda_tile::AddIOp
+// cuda_tile::AndIOp
 // cuda_tile::AssumeOp
 // cuda_tile::Atan2Op
 // cuda_tile::BitcastOp
 // cuda_tile::CosOp
+// cuda_tile::CosHOp
 // cuda_tile::CeilOp
 // cuda_tile::CmpFOp
 // cuda_tile::CmpIOp
 // cuda_tile::ConstantOp
 // cuda_tile::ContinueOp
+// cuda_tile::DivFOp
+// cuda_tile::DivIOp
 // cuda_tile::MmaFOp
 // cuda_tile::MmaIOp
 // cuda_tile::ExpOp
 // cuda_tile::Exp2Op
 // cuda_tile::ExtIOp
+// cuda_tile::FmaOp
 // cuda_tile::ForOp
 // cuda_tile::FloorOp
 // cuda_tile::FToFOp
@@ -30,6 +39,7 @@
 // cuda_tile::TruncIOp
 // cuda_tile::IToFOp
 // cuda_tile::LoadViewTkoOp
+// cuda_tile::LogOp
 // cuda_tile::Log2Op
 // cuda_tile::MakeTensorViewOp
 // cuda_tile::MaxFOp
@@ -37,62 +47,52 @@
 // cuda_tile::MinFOp
 // cuda_tile::MinIOp
 // cuda_tile::ModuleOp
+// cuda_tile::MulFOp
 // cuda_tile::MulIOp
 // cuda_tile::MulhiIOp
 // cuda_tile::NegIOp
 // cuda_tile::NegFOp
+// cuda_tile::OrIOp
 // cuda_tile::PowOp
 // cuda_tile::ReduceOp
+// cuda_tile::RemFOp
+// cuda_tile::RemIOp
 // cuda_tile::ReshapeOp
 // cuda_tile::ReturnOp
+// cuda_tile::RsqrtOp
 // cuda_tile::ScanOp
 // cuda_tile::SelectOp
+// cuda_tile::ShLIOp
+// cuda_tile::ShRIOp
 // cuda_tile::SinOp
+// cuda_tile::SinHOp
+// cuda_tile::SqrtOp
 // cuda_tile::StoreViewTkoOp
+// cuda_tile::SubFOp
+// cuda_tile::SubIOp
+// cuda_tile::TanOp
 // cuda_tile::TanHOp
 // cuda_tile::XOrIOp
 // cuda_tile::YieldOp
-// cuda_tile::RsqrtOp
 //
 // cuda_tile ops without a registered conversion pattern in this pass:
-// cuda_tile::AbsFOp
-// cuda_tile::AbsIOp
-// cuda_tile::AddIOp
-// cuda_tile::AddFOp
-// cuda_tile::AndIOp
 // cuda_tile::AssertOp
 // cuda_tile::AtomicCASTkoOp
 // cuda_tile::AtomicRMWTkoOp
 // cuda_tile::BroadcastOp
-// cuda_tile::CatOp
-// cuda_tile::CosHOp
 // cuda_tile::BreakOp
-// cuda_tile::DivFOp
-// cuda_tile::DivIOp
+// cuda_tile::CatOp
 // cuda_tile::ExtractOp
-// cuda_tile::FmaOp
 // cuda_tile::GlobalOp
 // cuda_tile::IntToPtrOp
 // cuda_tile::IotaOp
 // cuda_tile::LoadPtrTkoOp
-// cuda_tile::LogOp
 // cuda_tile::LoopOp
-// cuda_tile::MulFOp
 // cuda_tile::OffsetOp
 // cuda_tile::PermuteOp
 // cuda_tile::PrintTkoOp
 // cuda_tile::PtrToIntOp
 // cuda_tile::PtrToPtrOp
-// cuda_tile::RemIOp
-// cuda_tile::ShLIOp
-// cuda_tile::ShRIOp
-// cuda_tile::SinHOp
-// cuda_tile::SubFOp
-// cuda_tile::SubIOp
-// cuda_tile::TanOp
-// cuda_tile::OrIOp
-// cuda_tile::RemFOp
-// cuda_tile::SqrtOp
 
 #include "mlir/Conversion/CudaTileToGPU/CudaTileToGPU.h"
 
@@ -692,6 +692,111 @@ struct ConvertBinaryLhsRhsOp : public OpConversionPattern<SrcOp> {
   }
 };
 
+/// Convert integer binary ops that carry overflow flags (addi, subi, shli).
+template <typename SrcOp, typename DstOp>
+struct ConvertBinaryLhsRhsWithOverflowOp : public OpConversionPattern<SrcOp> {
+  using OpConversionPattern<SrcOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(SrcOp op,
+                  typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto overflowAttr = arith::IntegerOverflowFlagsAttr::get(
+        rewriter.getContext(), mapIntegerOverflowFlags(op.getOverflow()));
+    rewriter.template replaceOpWithNewOp<DstOp>(op, adaptor.getLhs(),
+                                                adaptor.getRhs(), overflowAttr);
+    return success();
+  }
+};
+
+/// Convert integer binary ops that dispatch on signedness (remi, shri).
+template <typename SrcOp, typename SignedDstOp, typename UnsignedDstOp>
+struct ConvertBinaryLhsRhsWithSignednessOp : public OpConversionPattern<SrcOp> {
+  using OpConversionPattern<SrcOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(SrcOp op,
+                  typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getSignedness() == cuda_tile::Signedness::Unsigned)
+      rewriter.template replaceOpWithNewOp<UnsignedDstOp>(op, adaptor.getLhs(),
+                                                          adaptor.getRhs());
+    else
+      rewriter.template replaceOpWithNewOp<SignedDstOp>(op, adaptor.getLhs(),
+                                                        adaptor.getRhs());
+    return success();
+  }
+};
+
+/// Convert float binary ops that reject flush_to_zero (addf, subf, mulf, divf).
+template <typename SrcOp, typename DstOp>
+struct ConvertBinaryFloatOp : public OpConversionPattern<SrcOp> {
+  using OpConversionPattern<SrcOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(SrcOp op,
+                  typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getFlushToZero())
+      return rewriter.notifyMatchFailure(
+          op, "flush_to_zero is not representable in arith float ops");
+    rewriter.template replaceOpWithNewOp<DstOp>(op, adaptor.getLhs(),
+                                                adaptor.getRhs());
+    return success();
+  }
+};
+
+/// Convert cuda_tile.sqrt to math.sqrt; rejects flush_to_zero.
+struct ConvertSqrt : public OpConversionPattern<cuda_tile::SqrtOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::SqrtOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getFlushToZero())
+      return rewriter.notifyMatchFailure(
+          op, "sqrt flush_to_zero is not representable in math.sqrt");
+    rewriter.replaceOpWithNewOp<math::SqrtOp>(op, adaptor.getSource());
+    return success();
+  }
+};
+
+/// Convert cuda_tile.fma to math.fma; rejects flush_to_zero.
+struct ConvertFma : public OpConversionPattern<cuda_tile::FmaOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::FmaOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getFlushToZero())
+      return rewriter.notifyMatchFailure(
+          op, "fma flush_to_zero is not representable in math.fma");
+    rewriter.replaceOpWithNewOp<math::FmaOp>(
+        op, adaptor.getLhs(), adaptor.getRhs(), adaptor.getAcc());
+    return success();
+  }
+};
+
+/// Convert cuda_tile.divi to arith.divsi/divui; rejects non-ZERO rounding.
+struct ConvertDivI : public OpConversionPattern<cuda_tile::DivIOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::DivIOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getRounding() != cuda_tile::RoundingMode::ZERO)
+      return rewriter.notifyMatchFailure(
+          op, "only rounding<zero> (truncating) division is supported");
+    if (op.getSignedness() == cuda_tile::Signedness::Unsigned)
+      rewriter.replaceOpWithNewOp<arith::DivUIOp>(op, adaptor.getLhs(),
+                                                  adaptor.getRhs());
+    else
+      rewriter.replaceOpWithNewOp<arith::DivSIOp>(op, adaptor.getLhs(),
+                                                  adaptor.getRhs());
+    return success();
+  }
+};
+
 /// Convert cuda_tile.maxf/minf based on propagate_nan and flush_to_zero flags.
 template <typename SrcOp, bool IsMax>
 struct ConvertMinMaxFOp : public OpConversionPattern<SrcOp> {
@@ -1013,6 +1118,28 @@ using ConvertIToF = ConvertFromToSignednessCastWithRoundingOp<
 
 using ConvertMulI = ConvertBinaryLhsRhsOp<cuda_tile::MulIOp, arith::MulIOp>;
 using ConvertXOrI = ConvertBinaryLhsRhsOp<cuda_tile::XOrIOp, arith::XOrIOp>;
+using ConvertAndI = ConvertBinaryLhsRhsOp<cuda_tile::AndIOp, arith::AndIOp>;
+using ConvertOrI = ConvertBinaryLhsRhsOp<cuda_tile::OrIOp, arith::OrIOp>;
+using ConvertRemF = ConvertBinaryLhsRhsOp<cuda_tile::RemFOp, arith::RemFOp>;
+
+using ConvertAddI =
+    ConvertBinaryLhsRhsWithOverflowOp<cuda_tile::AddIOp, arith::AddIOp>;
+using ConvertSubI =
+    ConvertBinaryLhsRhsWithOverflowOp<cuda_tile::SubIOp, arith::SubIOp>;
+using ConvertShLI =
+    ConvertBinaryLhsRhsWithOverflowOp<cuda_tile::ShLIOp, arith::ShLIOp>;
+
+using ConvertRemI =
+    ConvertBinaryLhsRhsWithSignednessOp<cuda_tile::RemIOp, arith::RemSIOp,
+                                        arith::RemUIOp>;
+using ConvertShRI =
+    ConvertBinaryLhsRhsWithSignednessOp<cuda_tile::ShRIOp, arith::ShRSIOp,
+                                        arith::ShRUIOp>;
+
+using ConvertAddF = ConvertBinaryFloatOp<cuda_tile::AddFOp, arith::AddFOp>;
+using ConvertSubF = ConvertBinaryFloatOp<cuda_tile::SubFOp, arith::SubFOp>;
+using ConvertMulF = ConvertBinaryFloatOp<cuda_tile::MulFOp, arith::MulFOp>;
+using ConvertDivF = ConvertBinaryFloatOp<cuda_tile::DivFOp, arith::DivFOp>;
 
 using ConvertCeil = ConvertUnarySourceOp<cuda_tile::CeilOp, math::CeilOp>;
 using ConvertCos = ConvertUnarySourceOp<cuda_tile::CosOp, math::CosOp>;
@@ -1021,6 +1148,12 @@ using ConvertFloor = ConvertUnarySourceOp<cuda_tile::FloorOp, math::FloorOp>;
 using ConvertLog2 = ConvertUnarySourceOp<cuda_tile::Log2Op, math::Log2Op>;
 using ConvertNegF = ConvertUnarySourceOp<cuda_tile::NegFOp, arith::NegFOp>;
 using ConvertSin = ConvertUnarySourceOp<cuda_tile::SinOp, math::SinOp>;
+using ConvertAbsF = ConvertUnarySourceOp<cuda_tile::AbsFOp, math::AbsFOp>;
+using ConvertAbsI = ConvertUnarySourceOp<cuda_tile::AbsIOp, math::AbsIOp>;
+using ConvertLog = ConvertUnarySourceOp<cuda_tile::LogOp, math::LogOp>;
+using ConvertTan = ConvertUnarySourceOp<cuda_tile::TanOp, math::TanOp>;
+using ConvertSinH = ConvertUnarySourceOp<cuda_tile::SinHOp, math::SinhOp>;
+using ConvertCosH = ConvertUnarySourceOp<cuda_tile::CosHOp, math::CoshOp>;
 
 using ConvertMaxF = ConvertMinMaxFOp<cuda_tile::MaxFOp, /*IsMax=*/true>;
 using ConvertMinF = ConvertMinMaxFOp<cuda_tile::MinFOp, /*IsMax=*/false>;
@@ -1921,7 +2054,11 @@ static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
            ConvertXOrI, ConvertFor, ConvertIf, ConvertContinue, ConvertYield,
            ConvertReturn, ConvertMmaF, ConvertAssume, ConvertReshape,
            ConvertReduce, ConvertScan, ConvertSelect, ConvertGetIndexSpaceShape,
-           ConvertLoadViewTko, ConvertStoreViewTko>(converter, ctx);
+           ConvertLoadViewTko, ConvertStoreViewTko, ConvertAbsF, ConvertAbsI,
+           ConvertLog, ConvertTan, ConvertSinH, ConvertCosH, ConvertSqrt,
+           ConvertFma, ConvertAndI, ConvertOrI, ConvertRemF, ConvertAddI,
+           ConvertSubI, ConvertShLI, ConvertDivI, ConvertRemI, ConvertShRI,
+           ConvertAddF, ConvertSubF, ConvertMulF, ConvertDivF>(converter, ctx);
 }
 
 //===----------------------------------------------------------------------===//

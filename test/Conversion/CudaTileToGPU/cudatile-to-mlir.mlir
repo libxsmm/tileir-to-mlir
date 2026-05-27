@@ -483,4 +483,352 @@ cuda_tile.module @m {
     return
   }
 
+  // --- absf ---
+  // CHECK-LABEL: gpu.func @test_absf
+  entry @test_absf() {
+    // CHECK: %[[ABSF_IN:.*]] = arith.constant dense<[1.000000e+00, -1.000000e+00, 0.000000e+00, 2.000000e+00]> : vector<4xf32>
+    %in = constant <f32: [1.0, -1.0, 0.0, 2.0]> : tile<4xf32>
+    // CHECK: %[[ABSF_R:.*]] = math.absf %[[ABSF_IN]] : vector<4xf32>
+    %res = absf %in : tile<4xf32>
+    return
+  }
+
+  // --- absi ---
+  // CHECK-LABEL: gpu.func @test_absi
+  entry @test_absi() {
+    // CHECK: %[[ABSI_IN:.*]] = arith.constant dense<[0, -1, 2, -3]> : vector<4xi32>
+    %in = constant <i32: [0, -1, 2, -3]> : tile<4xi32>
+    // CHECK: %[[ABSI_R:.*]] = math.absi %[[ABSI_IN]] : vector<4xi32>
+    %res = absi %in : tile<4xi32>
+    return
+  }
+
+  // --- log ---
+  // CHECK-LABEL: gpu.func @test_log
+  entry @test_log() {
+    // CHECK: %[[LOG_IN:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
+    %in = constant <f32: [1.0, 2.0, 3.0, 4.0]> : tile<4xf32>
+    // CHECK: %[[LOG_R:.*]] = math.log %[[LOG_IN]] : vector<4xf32>
+    %res = log %in : tile<4xf32>
+    return
+  }
+
+  // --- tan ---
+  // CHECK-LABEL: gpu.func @test_tan
+  entry @test_tan() {
+    // CHECK: %[[TAN_IN:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
+    %in = constant <f32: [0.0, 1.0, 2.0, 3.0]> : tile<4xf32>
+    // CHECK: %[[TAN_R:.*]] = math.tan %[[TAN_IN]] : vector<4xf32>
+    %res = tan %in : tile<4xf32>
+    return
+  }
+
+  // --- sinh ---
+  // CHECK-LABEL: gpu.func @test_sinh
+  entry @test_sinh() {
+    // CHECK: %[[SINH_IN:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
+    %in = constant <f32: [0.0, 1.0, 2.0, 3.0]> : tile<4xf32>
+    // CHECK: %[[SINH_R:.*]] = math.sinh %[[SINH_IN]] : vector<4xf32>
+    %res = sinh %in : tile<4xf32>
+    return
+  }
+
+  // --- cosh ---
+  // CHECK-LABEL: gpu.func @test_cosh
+  entry @test_cosh() {
+    // CHECK: %[[COSH_IN:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
+    %in = constant <f32: [0.0, 1.0, 2.0, 3.0]> : tile<4xf32>
+    // CHECK: %[[COSH_R:.*]] = math.cosh %[[COSH_IN]] : vector<4xf32>
+    %res = cosh %in : tile<4xf32>
+    return
+  }
+
+  // --- sqrt ---
+  // CHECK-LABEL: gpu.func @test_sqrt
+  entry @test_sqrt() {
+    // CHECK: %[[SQRT_IN:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
+    %in = constant <f32: [1.0, 4.0, 9.0, 16.0]> : tile<4xf32>
+    // CHECK: %[[SQRT_R:.*]] = math.sqrt %[[SQRT_IN]] : vector<4xf32>
+    %res = sqrt %in : tile<4xf32>
+    return
+  }
+
+  // --- andi ---
+  // CHECK-LABEL: gpu.func @test_andi
+  entry @test_andi() {
+    // CHECK: %[[ANDI_LHS:.*]] = arith.constant dense<[0, 1, 2, 3]> : vector<4xi32>
+    %lhs = constant <i32: [0, 1, 2, 3]> : tile<4xi32>
+    // CHECK: %[[ANDI_RHS:.*]] = arith.constant dense<[4, 5, 6, 7]> : vector<4xi32>
+    %rhs = constant <i32: [4, 5, 6, 7]> : tile<4xi32>
+    // CHECK: %[[ANDI_R:.*]] = arith.andi %[[ANDI_LHS]], %[[ANDI_RHS]] : vector<4xi32>
+    %result = andi %lhs, %rhs : tile<4xi32>
+    return
+  }
+
+  // --- ori ---
+  // CHECK-LABEL: gpu.func @test_ori
+  entry @test_ori() {
+    // CHECK: %[[ORI_LHS:.*]] = arith.constant dense<[0, 1, 2, 3]> : vector<4xi32>
+    %lhs = constant <i32: [0, 1, 2, 3]> : tile<4xi32>
+    // CHECK: %[[ORI_RHS:.*]] = arith.constant dense<[4, 5, 6, 7]> : vector<4xi32>
+    %rhs = constant <i32: [4, 5, 6, 7]> : tile<4xi32>
+    // CHECK: %[[ORI_R:.*]] = arith.ori %[[ORI_LHS]], %[[ORI_RHS]] : vector<4xi32>
+    %result = ori %lhs, %rhs : tile<4xi32>
+    return
+  }
+
+  // --- remf ---
+  // CHECK-LABEL: gpu.func @test_remf
+  entry @test_remf() {
+    // CHECK: %[[REMF_LHS:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
+    %lhs = constant <f32: [5.0, 7.0, 3.0, 9.0]> : tile<4xf32>
+    // CHECK: %[[REMF_RHS:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
+    %rhs = constant <f32: [2.0, 3.0, 2.0, 4.0]> : tile<4xf32>
+    // CHECK: %[[REMF_R:.*]] = arith.remf %[[REMF_LHS]], %[[REMF_RHS]] : vector<4xf32>
+    %result = remf %lhs, %rhs : tile<4xf32>
+    return
+  }
+
+  // --- addi ---
+  // CHECK-LABEL: gpu.func @test_addi
+  entry @test_addi() {
+    // CHECK: %[[ADDI_LHS:.*]] = arith.constant dense<[0, 1, 2, 3]> : vector<4xi32>
+    %lhs = constant <i32: [0, 1, 2, 3]> : tile<4xi32>
+    // CHECK: %[[ADDI_RHS:.*]] = arith.constant dense<[4, 5, 6, 7]> : vector<4xi32>
+    %rhs = constant <i32: [4, 5, 6, 7]> : tile<4xi32>
+    // CHECK: %[[ADDI_R:.*]] = arith.addi %[[ADDI_LHS]], %[[ADDI_RHS]] : vector<4xi32>
+    %result = addi %lhs, %rhs : tile<4xi32>
+    return
+  }
+
+  // --- subi ---
+  // CHECK-LABEL: gpu.func @test_subi
+  entry @test_subi() {
+    // CHECK: %[[SUBI_LHS:.*]] = arith.constant dense<[4, 5, 6, 7]> : vector<4xi32>
+    %lhs = constant <i32: [4, 5, 6, 7]> : tile<4xi32>
+    // CHECK: %[[SUBI_RHS:.*]] = arith.constant dense<[0, 1, 2, 3]> : vector<4xi32>
+    %rhs = constant <i32: [0, 1, 2, 3]> : tile<4xi32>
+    // CHECK: %[[SUBI_R:.*]] = arith.subi %[[SUBI_LHS]], %[[SUBI_RHS]] : vector<4xi32>
+    %result = subi %lhs, %rhs : tile<4xi32>
+    return
+  }
+
+  // --- shli ---
+  // CHECK-LABEL: gpu.func @test_shli
+  entry @test_shli() {
+    // CHECK: %[[SHLI_LHS:.*]] = arith.constant dense<[1, 2, 3, 4]> : vector<4xi32>
+    %lhs = constant <i32: [1, 2, 3, 4]> : tile<4xi32>
+    // CHECK: %[[SHLI_RHS:.*]] = arith.constant dense<1> : vector<4xi32>
+    %rhs = constant <i32: 1> : tile<4xi32>
+    // CHECK: %[[SHLI_R:.*]] = arith.shli %[[SHLI_LHS]], %[[SHLI_RHS]] : vector<4xi32>
+    %result = shli %lhs, %rhs : tile<4xi32>
+    return
+  }
+
+  // --- divi ---
+  // CHECK-LABEL: gpu.func @test_divi
+  entry @test_divi() {
+    // CHECK: %[[DIVI_LHS:.*]] = arith.constant dense<[8, 9, 10, 11]> : vector<4xi32>
+    %lhs = constant <i32: [8, 9, 10, 11]> : tile<4xi32>
+    // CHECK: %[[DIVI_RHS:.*]] = arith.constant dense<[2, 3, 4, 5]> : vector<4xi32>
+    %rhs = constant <i32: [2, 3, 4, 5]> : tile<4xi32>
+    // CHECK: %[[DIVI_S:.*]] = arith.divsi %[[DIVI_LHS]], %[[DIVI_RHS]] : vector<4xi32>
+    %s = divi %lhs, %rhs signed : tile<4xi32>
+    // CHECK: %[[DIVI_U:.*]] = arith.divui %[[DIVI_LHS]], %[[DIVI_RHS]] : vector<4xi32>
+    %u = divi %lhs, %rhs unsigned : tile<4xi32>
+    return
+  }
+
+  // --- remi ---
+  // CHECK-LABEL: gpu.func @test_remi
+  entry @test_remi() {
+    // CHECK: %[[REMI_LHS:.*]] = arith.constant dense<[7, 8, 9, 10]> : vector<4xi32>
+    %lhs = constant <i32: [7, 8, 9, 10]> : tile<4xi32>
+    // CHECK: %[[REMI_RHS:.*]] = arith.constant dense<[3, 3, 4, 4]> : vector<4xi32>
+    %rhs = constant <i32: [3, 3, 4, 4]> : tile<4xi32>
+    // CHECK: %[[REMI_S:.*]] = arith.remsi %[[REMI_LHS]], %[[REMI_RHS]] : vector<4xi32>
+    %s = remi %lhs, %rhs signed : tile<4xi32>
+    // CHECK: %[[REMI_U:.*]] = arith.remui %[[REMI_LHS]], %[[REMI_RHS]] : vector<4xi32>
+    %u = remi %lhs, %rhs unsigned : tile<4xi32>
+    return
+  }
+
+  // --- shri ---
+  // CHECK-LABEL: gpu.func @test_shri
+  entry @test_shri() {
+    // CHECK: %[[SHRI_LHS:.*]] = arith.constant dense<[8, 16, 32, 64]> : vector<4xi32>
+    %lhs = constant <i32: [8, 16, 32, 64]> : tile<4xi32>
+    // CHECK: %[[SHRI_RHS:.*]] = arith.constant dense<[1, 2, 3, 4]> : vector<4xi32>
+    %rhs = constant <i32: [1, 2, 3, 4]> : tile<4xi32>
+    // CHECK: %[[SHRI_S:.*]] = arith.shrsi %[[SHRI_LHS]], %[[SHRI_RHS]] : vector<4xi32>
+    %s = shri %lhs, %rhs signed : tile<4xi32>
+    // CHECK: %[[SHRI_U:.*]] = arith.shrui %[[SHRI_LHS]], %[[SHRI_RHS]] : vector<4xi32>
+    %u = shri %lhs, %rhs unsigned : tile<4xi32>
+    return
+  }
+
+  // --- addf ---
+  // CHECK-LABEL: gpu.func @test_addf
+  entry @test_addf() {
+    // CHECK: %[[ADDF_LHS:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
+    %lhs = constant <f32: [1.0, 2.0, 3.0, 4.0]> : tile<4xf32>
+    // CHECK: %[[ADDF_RHS:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
+    %rhs = constant <f32: [5.0, 6.0, 7.0, 8.0]> : tile<4xf32>
+    // CHECK: %[[ADDF_R:.*]] = arith.addf %[[ADDF_LHS]], %[[ADDF_RHS]] : vector<4xf32>
+    %result = addf %lhs, %rhs : tile<4xf32>
+    return
+  }
+
+  // --- subf ---
+  // CHECK-LABEL: gpu.func @test_subf
+  entry @test_subf() {
+    // CHECK: %[[SUBF_LHS:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
+    %lhs = constant <f32: [5.0, 6.0, 7.0, 8.0]> : tile<4xf32>
+    // CHECK: %[[SUBF_RHS:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
+    %rhs = constant <f32: [1.0, 2.0, 3.0, 4.0]> : tile<4xf32>
+    // CHECK: %[[SUBF_R:.*]] = arith.subf %[[SUBF_LHS]], %[[SUBF_RHS]] : vector<4xf32>
+    %result = subf %lhs, %rhs : tile<4xf32>
+    return
+  }
+
+  // --- mulf ---
+  // CHECK-LABEL: gpu.func @test_mulf
+  entry @test_mulf() {
+    // CHECK: %[[MULF_LHS:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
+    %lhs = constant <f32: [1.0, 2.0, 3.0, 4.0]> : tile<4xf32>
+    // CHECK: %[[MULF_RHS:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
+    %rhs = constant <f32: [2.0, 3.0, 4.0, 5.0]> : tile<4xf32>
+    // CHECK: %[[MULF_R:.*]] = arith.mulf %[[MULF_LHS]], %[[MULF_RHS]] : vector<4xf32>
+    %result = mulf %lhs, %rhs : tile<4xf32>
+    return
+  }
+
+  // --- divf ---
+  // CHECK-LABEL: gpu.func @test_divf
+  entry @test_divf() {
+    // CHECK: %[[DIVF_LHS:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
+    %lhs = constant <f32: [4.0, 9.0, 16.0, 25.0]> : tile<4xf32>
+    // CHECK: %[[DIVF_RHS:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
+    %rhs = constant <f32: [2.0, 3.0, 4.0, 5.0]> : tile<4xf32>
+    // CHECK: %[[DIVF_R:.*]] = arith.divf %[[DIVF_LHS]], %[[DIVF_RHS]] : vector<4xf32>
+    %result = divf %lhs, %rhs : tile<4xf32>
+    return
+  }
+
+  // --- fma ---
+  // CHECK-LABEL: gpu.func @test_fma
+  entry @test_fma() {
+    // CHECK: %[[FMA_LHS:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
+    %lhs = constant <f32: [1.0, 2.0, 3.0, 4.0]> : tile<4xf32>
+    // CHECK: %[[FMA_RHS:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
+    %rhs = constant <f32: [2.0, 3.0, 4.0, 5.0]> : tile<4xf32>
+    // CHECK: %[[FMA_ACC:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
+    %acc = constant <f32: [0.5, 0.5, 0.5, 0.5]> : tile<4xf32>
+    // CHECK: %[[FMA_R:.*]] = math.fma %[[FMA_LHS]], %[[FMA_RHS]], %[[FMA_ACC]] : vector<4xf32>
+    %result = fma %lhs, %rhs, %acc : tile<4xf32>
+    return
+  }
+
+  // --- addi with overflow flags ---
+  // CHECK-LABEL: gpu.func @test_addi_overflow
+  entry @test_addi_overflow() {
+    // CHECK: %[[AOV_LHS:.*]] = arith.constant dense<[1, 2, 3, 4]> : vector<4xi32>
+    %lhs = constant <i32: [1, 2, 3, 4]> : tile<4xi32>
+    // CHECK: %[[AOV_RHS:.*]] = arith.constant dense<[5, 6, 7, 8]> : vector<4xi32>
+    %rhs = constant <i32: [5, 6, 7, 8]> : tile<4xi32>
+    // CHECK: %[[AOV_NSW:.*]] = arith.addi %[[AOV_LHS]], %[[AOV_RHS]] overflow<nsw> : vector<4xi32>
+    %nsw = addi %lhs, %rhs overflow<no_signed_wrap> : tile<4xi32>
+    // CHECK: %[[AOV_NUW:.*]] = arith.addi %[[AOV_LHS]], %[[AOV_RHS]] overflow<nuw> : vector<4xi32>
+    %nuw = addi %lhs, %rhs overflow<no_unsigned_wrap> : tile<4xi32>
+    // CHECK: %[[AOV_NW:.*]] = arith.addi %[[AOV_LHS]], %[[AOV_RHS]] overflow<nsw, nuw> : vector<4xi32>
+    %nw = addi %lhs, %rhs overflow<no_wrap> : tile<4xi32>
+    return
+  }
+
+  // --- subi with overflow flags ---
+  // CHECK-LABEL: gpu.func @test_subi_overflow
+  entry @test_subi_overflow() {
+    // CHECK: %[[SOV_LHS:.*]] = arith.constant dense<[5, 6, 7, 8]> : vector<4xi32>
+    %lhs = constant <i32: [5, 6, 7, 8]> : tile<4xi32>
+    // CHECK: %[[SOV_RHS:.*]] = arith.constant dense<[1, 2, 3, 4]> : vector<4xi32>
+    %rhs = constant <i32: [1, 2, 3, 4]> : tile<4xi32>
+    // CHECK: %[[SOV_NSW:.*]] = arith.subi %[[SOV_LHS]], %[[SOV_RHS]] overflow<nsw> : vector<4xi32>
+    %nsw = subi %lhs, %rhs overflow<no_signed_wrap> : tile<4xi32>
+    return
+  }
+
+  // --- shli with overflow flags ---
+  // CHECK-LABEL: gpu.func @test_shli_overflow
+  entry @test_shli_overflow() {
+    // CHECK: %[[SHLOV_LHS:.*]] = arith.constant dense<[1, 2, 3, 4]> : vector<4xi32>
+    %lhs = constant <i32: [1, 2, 3, 4]> : tile<4xi32>
+    // CHECK: %[[SHLOV_RHS:.*]] = arith.constant dense<1> : vector<4xi32>
+    %rhs = constant <i32: 1> : tile<4xi32>
+    // CHECK: %[[SHLOV_NUW:.*]] = arith.shli %[[SHLOV_LHS]], %[[SHLOV_RHS]] overflow<nuw> : vector<4xi32>
+    %nuw = shli %lhs, %rhs overflow<no_unsigned_wrap> : tile<4xi32>
+    return
+  }
+
+  // --- scalar math ops ---
+  // CHECK-LABEL: gpu.func @test_scalar_math_ops
+  entry @test_scalar_math_ops() {
+    // CHECK: %[[SM_F:.*]] = arith.constant 4.000000e+00 : f32
+    %f = constant <f32: 4.0> : tile<f32>
+    // CHECK: %[[SM_I:.*]] = arith.constant -3 : i32
+    %i = constant <i32: -3> : tile<i32>
+    // CHECK: %[[SM_SQRT:.*]] = math.sqrt %[[SM_F]] : f32
+    %sq = sqrt %f : tile<f32>
+    // CHECK: %[[SM_ABSF:.*]] = math.absf %[[SM_F]] : f32
+    %af = absf %f : tile<f32>
+    // CHECK: %[[SM_ABSI:.*]] = math.absi %[[SM_I]] : i32
+    %ai = absi %i : tile<i32>
+    // CHECK: %[[SM_LOG:.*]] = math.log %[[SM_F]] : f32
+    %lg = log %f : tile<f32>
+    return
+  }
+
+  // --- scalar binary ops ---
+  // CHECK-LABEL: gpu.func @test_scalar_binary_ops
+  entry @test_scalar_binary_ops() {
+    // CHECK: %[[SB_A:.*]] = arith.constant 10 : i32
+    %a = constant <i32: 10> : tile<i32>
+    // CHECK: %[[SB_B:.*]] = arith.constant 3 : i32
+    %b = constant <i32: 3> : tile<i32>
+    // CHECK: %[[SB_ADDI:.*]] = arith.addi %[[SB_A]], %[[SB_B]] : i32
+    %add = addi %a, %b : tile<i32>
+    // CHECK: %[[SB_SUBI:.*]] = arith.subi %[[SB_A]], %[[SB_B]] : i32
+    %sub = subi %a, %b : tile<i32>
+    // CHECK: %[[SB_DIVS:.*]] = arith.divsi %[[SB_A]], %[[SB_B]] : i32
+    %ds = divi %a, %b signed : tile<i32>
+    // CHECK: %[[SB_DIVU:.*]] = arith.divui %[[SB_A]], %[[SB_B]] : i32
+    %du = divi %a, %b unsigned : tile<i32>
+    // CHECK: %[[SB_REMS:.*]] = arith.remsi %[[SB_A]], %[[SB_B]] : i32
+    %rs = remi %a, %b signed : tile<i32>
+    // CHECK: %[[SB_REMU:.*]] = arith.remui %[[SB_A]], %[[SB_B]] : i32
+    %ru = remi %a, %b unsigned : tile<i32>
+    return
+  }
+
+  // --- scalar float ops ---
+  // CHECK-LABEL: gpu.func @test_scalar_float_ops
+  entry @test_scalar_float_ops() {
+    // CHECK: %[[SF_A:.*]] = arith.constant 6.000000e+00 : f32
+    %a = constant <f32: 6.0> : tile<f32>
+    // CHECK: %[[SF_B:.*]] = arith.constant 2.000000e+00 : f32
+    %b = constant <f32: 2.0> : tile<f32>
+    // CHECK: %[[SF_C:.*]] = arith.constant 1.000000e+00 : f32
+    %c = constant <f32: 1.0> : tile<f32>
+    // CHECK: %[[SF_ADDF:.*]] = arith.addf %[[SF_A]], %[[SF_B]] : f32
+    %add = addf %a, %b : tile<f32>
+    // CHECK: %[[SF_SUBF:.*]] = arith.subf %[[SF_A]], %[[SF_B]] : f32
+    %sub = subf %a, %b : tile<f32>
+    // CHECK: %[[SF_MULF:.*]] = arith.mulf %[[SF_A]], %[[SF_B]] : f32
+    %mul = mulf %a, %b : tile<f32>
+    // CHECK: %[[SF_DIVF:.*]] = arith.divf %[[SF_A]], %[[SF_B]] : f32
+    %div = divf %a, %b : tile<f32>
+    // CHECK: %[[SF_FMA:.*]] = math.fma %[[SF_A]], %[[SF_B]], %[[SF_C]] : f32
+    %fm = fma %a, %b, %c : tile<f32>
+    return
+  }
+
 }
