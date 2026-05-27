@@ -53,6 +53,7 @@
 // cuda_tile::NegIOp
 // cuda_tile::NegFOp
 // cuda_tile::OrIOp
+// cuda_tile::PermuteOp
 // cuda_tile::PowOp
 // cuda_tile::ReduceOp
 // cuda_tile::RemFOp
@@ -89,7 +90,6 @@
 // cuda_tile::LoadPtrTkoOp
 // cuda_tile::LoopOp
 // cuda_tile::OffsetOp
-// cuda_tile::PermuteOp
 // cuda_tile::PrintTkoOp
 // cuda_tile::PtrToIntOp
 // cuda_tile::PtrToPtrOp
@@ -1116,7 +1116,8 @@ using ConvertIToF = ConvertFromToSignednessCastWithRoundingOp<
     cuda_tile::IToFOp, arith::SIToFPOp, arith::UIToFPOp,
     cuda_tile::RoundingMode::NEAREST_EVEN>;
 
-using ConvertMulI = ConvertBinaryLhsRhsOp<cuda_tile::MulIOp, arith::MulIOp>;
+using ConvertMulI =
+    ConvertBinaryLhsRhsWithOverflowOp<cuda_tile::MulIOp, arith::MulIOp>;
 using ConvertXOrI = ConvertBinaryLhsRhsOp<cuda_tile::XOrIOp, arith::XOrIOp>;
 using ConvertAndI = ConvertBinaryLhsRhsOp<cuda_tile::AndIOp, arith::AndIOp>;
 using ConvertOrI = ConvertBinaryLhsRhsOp<cuda_tile::OrIOp, arith::OrIOp>;
@@ -1296,6 +1297,26 @@ struct ConvertAssume : public OpConversionPattern<cuda_tile::AssumeOp> {
   matchAndRewrite(cuda_tile::AssumeOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     rewriter.replaceOp(op, adaptor.getValue());
+    return success();
+  }
+};
+
+/// Convert cuda_tile.permute to vector.transpose.
+///
+/// Both ops reorder the dimensions of an N-D tensor/vector according to a
+/// permutation array.  The only mechanical difference is the attribute type:
+///   cuda_tile.permute uses DenseI32ArrayAttr,
+///   vector.transpose  uses DenseI64ArrayAttr.
+struct ConvertPermute : public OpConversionPattern<cuda_tile::PermuteOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::PermuteOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    SmallVector<int64_t> perm(op.getPermutation().begin(),
+                              op.getPermutation().end());
+    rewriter.replaceOpWithNewOp<vector::TransposeOp>(op, adaptor.getSource(),
+                                                     perm);
     return success();
   }
 };
@@ -1682,8 +1703,10 @@ buildTransferViewAccessPlan(ConversionPatternRewriter &rewriter, Operation *op,
       return rewriter.notifyMatchFailure(
           op, "view index could not be converted to index");
     Value tileSizeVal = arith::ConstantIndexOp::create(rewriter, loc, tileSize);
+    auto nswFlag = arith::IntegerOverflowFlagsAttr::get(
+        rewriter.getContext(), arith::IntegerOverflowFlags::nsw);
     Value elemOffset =
-        arith::MulIOp::create(rewriter, loc, tileIndex, tileSizeVal);
+        arith::MulIOp::create(rewriter, loc, tileIndex, tileSizeVal, nswFlag);
     memrefIndices[tensorDim] = elemOffset;
   }
 
@@ -2042,23 +2065,24 @@ static void populateTileIRToGPUTypeConverter(TypeConverter &converter,
 static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
                                                   RewritePatternSet &patterns) {
   MLIRContext *ctx = patterns.getContext();
-  patterns
-      .add<ConvertModule, ConvertEntry, ConvertMakeTensorView,
-           ConvertMakePartitionView, ConvertConstant, ConvertGetTileBlockId,
-           ConvertGetNumTileBlocks, ConvertBitcast, ConvertMulI, ConvertAtan2,
-           ConvertCeil, ConvertCmpF, ConvertExtI, ConvertCos, ConvertFToF,
-           ConvertFToI, ConvertExp2, ConvertExp, ConvertFloor, ConvertIToF,
-           ConvertLog2, ConvertMaxF, ConvertMinF, ConvertNegF, ConvertPow,
-           ConvertRsqrt, ConvertSin, ConvertTanH, ConvertCmpI, ConvertMaxI,
-           ConvertMinI, ConvertMmaI, ConvertMulhiI, ConvertNegI, ConvertTruncI,
-           ConvertXOrI, ConvertFor, ConvertIf, ConvertContinue, ConvertYield,
-           ConvertReturn, ConvertMmaF, ConvertAssume, ConvertReshape,
-           ConvertReduce, ConvertScan, ConvertSelect, ConvertGetIndexSpaceShape,
-           ConvertLoadViewTko, ConvertStoreViewTko, ConvertAbsF, ConvertAbsI,
-           ConvertLog, ConvertTan, ConvertSinH, ConvertCosH, ConvertSqrt,
-           ConvertFma, ConvertAndI, ConvertOrI, ConvertRemF, ConvertAddI,
-           ConvertSubI, ConvertShLI, ConvertDivI, ConvertRemI, ConvertShRI,
-           ConvertAddF, ConvertSubF, ConvertMulF, ConvertDivF>(converter, ctx);
+  patterns.add<ConvertModule, ConvertEntry, ConvertMakeTensorView,
+               ConvertMakePartitionView, ConvertConstant, ConvertGetTileBlockId,
+               ConvertGetNumTileBlocks, ConvertBitcast, ConvertMulI,
+               ConvertAtan2, ConvertCeil, ConvertCmpF, ConvertExtI, ConvertCos,
+               ConvertFToF, ConvertFToI, ConvertExp2, ConvertExp, ConvertFloor,
+               ConvertIToF, ConvertLog2, ConvertMaxF, ConvertMinF, ConvertNegF,
+               ConvertPow, ConvertRsqrt, ConvertSin, ConvertTanH, ConvertCmpI,
+               ConvertMaxI, ConvertMinI, ConvertMmaI, ConvertMulhiI,
+               ConvertNegI, ConvertTruncI, ConvertXOrI, ConvertFor, ConvertIf,
+               ConvertContinue, ConvertYield, ConvertReturn, ConvertMmaF,
+               ConvertAssume, ConvertPermute, ConvertReshape, ConvertReduce,
+               ConvertScan, ConvertSelect, ConvertGetIndexSpaceShape,
+               ConvertLoadViewTko, ConvertStoreViewTko, ConvertAbsF,
+               ConvertAbsI, ConvertLog, ConvertTan, ConvertSinH, ConvertCosH,
+               ConvertSqrt, ConvertFma, ConvertAndI, ConvertOrI, ConvertRemF,
+               ConvertAddI, ConvertSubI, ConvertShLI, ConvertDivI, ConvertRemI,
+               ConvertShRI, ConvertAddF, ConvertSubF, ConvertMulF, ConvertDivF>(
+      converter, ctx);
 }
 
 //===----------------------------------------------------------------------===//

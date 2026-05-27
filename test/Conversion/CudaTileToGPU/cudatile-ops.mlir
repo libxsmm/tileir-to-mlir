@@ -567,4 +567,14 @@ cuda_tile.module @ops_module {
     return
   }
 
+  // --- permute ---
+  // CHECK-LABEL: gpu.func @test_permute
+  entry @test_permute() {
+    // CHECK: %[[PERM_IN:.*]] = arith.constant dense<0.000000e+00> : vector<2x4x8xf16>
+    %arg0 = constant <f16: 0.0> : tile<2x4x8xf16>
+    // CHECK: %[[PERM_R:.*]] = vector.transpose %[[PERM_IN]], [2, 0, 1] : vector<2x4x8xf16> to vector<8x2x4xf16>
+    %0 = permute %arg0 [2, 0, 1] : tile<2x4x8xf16> -> tile<8x2x4xf16>
+    return
+  }
+
 }

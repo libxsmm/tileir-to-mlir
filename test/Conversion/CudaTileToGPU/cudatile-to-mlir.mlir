@@ -831,4 +831,50 @@ cuda_tile.module @m {
     return
   }
 
+  // --- muli with overflow flags ---
+  // CHECK-LABEL: gpu.func @test_muli_overflow
+  entry @test_muli_overflow() {
+    // CHECK: %[[MOV_LHS:.*]] = arith.constant dense<[2, 3, 4, 5]> : vector<4xi32>
+    %lhs = constant <i32: [2, 3, 4, 5]> : tile<4xi32>
+    // CHECK: %[[MOV_RHS:.*]] = arith.constant dense<[6, 7, 8, 9]> : vector<4xi32>
+    %rhs = constant <i32: [6, 7, 8, 9]> : tile<4xi32>
+    // CHECK: %[[MOV_NSW:.*]] = arith.muli %[[MOV_LHS]], %[[MOV_RHS]] overflow<nsw> : vector<4xi32>
+    %nsw = muli %lhs, %rhs overflow<no_signed_wrap> : tile<4xi32>
+    // CHECK: %[[MOV_NUW:.*]] = arith.muli %[[MOV_LHS]], %[[MOV_RHS]] overflow<nuw> : vector<4xi32>
+    %nuw = muli %lhs, %rhs overflow<no_unsigned_wrap> : tile<4xi32>
+    // CHECK: %[[MOV_NW:.*]] = arith.muli %[[MOV_LHS]], %[[MOV_RHS]] overflow<nsw, nuw> : vector<4xi32>
+    %nw = muli %lhs, %rhs overflow<no_wrap> : tile<4xi32>
+    return
+  }
+
+  // --- permute: 2D transpose ---
+  // CHECK-LABEL: gpu.func @test_permute_2d
+  entry @test_permute_2d() {
+    // CHECK: %[[P2D_IN:.*]] = arith.constant dense<1> : vector<2x4xi32>
+    %a = constant <i32: 1> : tile<2x4xi32>
+    // CHECK: %[[P2D_R:.*]] = vector.transpose %[[P2D_IN]], [1, 0] : vector<2x4xi32> to vector<4x2xi32>
+    %t = permute %a [1, 0] : tile<2x4xi32> -> tile<4x2xi32>
+    return
+  }
+
+  // --- permute: identity permutation (no-op reordering) ---
+  // CHECK-LABEL: gpu.func @test_permute_identity
+  entry @test_permute_identity() {
+    // CHECK: %[[PID_IN:.*]] = arith.constant dense<0.000000e+00> : vector<2x4x8xf32>
+    %a = constant <f32: 0.0> : tile<2x4x8xf32>
+    // CHECK: %[[PID_R:.*]] = vector.transpose %[[PID_IN]], [0, 1, 2] : vector<2x4x8xf32> to vector<2x4x8xf32>
+    %t = permute %a [0, 1, 2] : tile<2x4x8xf32> -> tile<2x4x8xf32>
+    return
+  }
+
+  // --- permute: 4D permutation ---
+  // CHECK-LABEL: gpu.func @test_permute_4d
+  entry @test_permute_4d() {
+    // CHECK: %[[P4D_IN:.*]] = arith.constant dense<1.000000e+00> : vector<2x4x8x16xf16>
+    %a = constant <f16: 1.0> : tile<2x4x8x16xf16>
+    // CHECK: %[[P4D_R:.*]] = vector.transpose %[[P4D_IN]], [3, 2, 1, 0] : vector<2x4x8x16xf16> to vector<16x8x4x2xf16>
+    %t = permute %a [3, 2, 1, 0] : tile<2x4x8x16xf16> -> tile<16x8x4x2xf16>
+    return
+  }
+
 }
