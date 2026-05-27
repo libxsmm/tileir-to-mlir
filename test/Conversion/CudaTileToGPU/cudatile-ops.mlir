@@ -8,6 +8,20 @@
 // CHECK-LABEL: gpu.module @ops_module {
 cuda_tile.module @ops_module {
 
+  // --- global / get_global ---
+  // Derived from cuda_tile.global and cuda_tile.get_global mlirExamples in
+  // Ops.td.
+  // CHECK: memref.global @val : memref<4xf32> = dense<[1.000000e-01, 2.000000e-01, 3.000000e-01, 4.000000e-01]> {alignment = 128 : i64}
+  global @val alignment = 128 <f32: [0.1, 0.2, 0.3, 0.4]> : tile<4xf32>
+
+  // CHECK-LABEL: gpu.func @test_get_global
+  entry @test_get_global() {
+    // CHECK: %[[G:.*]] = memref.get_global @val : memref<4xf32>
+    // CHECK: %[[P:.*]] = memref.cast %[[G]] : memref<4xf32> to memref<*xf32>
+    %ptr = get_global @val : tile<ptr<f32>>
+    return
+  }
+
   // --- constant ---
   // CHECK-LABEL: gpu.func @test_constant
   entry @test_constant() {

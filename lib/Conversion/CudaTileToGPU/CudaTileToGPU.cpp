@@ -15,32 +15,32 @@
 // cuda_tile::BitcastOp
 // cuda_tile::BroadcastOp
 // cuda_tile::CatOp
-// cuda_tile::CosOp
-// cuda_tile::CosHOp
 // cuda_tile::CeilOp
 // cuda_tile::CmpFOp
 // cuda_tile::CmpIOp
 // cuda_tile::ConstantOp
 // cuda_tile::ContinueOp
+// cuda_tile::CosOp
+// cuda_tile::CosHOp
 // cuda_tile::DivFOp
 // cuda_tile::DivIOp
-// cuda_tile::MmaFOp
-// cuda_tile::MmaIOp
+// cuda_tile::EntryOp
 // cuda_tile::ExpOp
 // cuda_tile::Exp2Op
 // cuda_tile::ExtIOp
 // cuda_tile::ExtractOp
+// cuda_tile::FloorOp
 // cuda_tile::FmaOp
 // cuda_tile::ForOp
-// cuda_tile::FloorOp
 // cuda_tile::FToFOp
 // cuda_tile::FToIOp
-// cuda_tile::EntryOp
-// cuda_tile::GetTileBlockIdOp
+// cuda_tile::GetGlobalOp
+// cuda_tile::GetIndexSpaceShapeOp
 // cuda_tile::GetNumTileBlocksOp
-// cuda_tile::IfOp
-// cuda_tile::TruncIOp
+// cuda_tile::GetTileBlockIdOp
+// cuda_tile::GlobalOp
 // cuda_tile::IToFOp
+// cuda_tile::IfOp
 // cuda_tile::LoadViewTkoOp
 // cuda_tile::LogOp
 // cuda_tile::Log2Op
@@ -49,12 +49,14 @@
 // cuda_tile::MaxIOp
 // cuda_tile::MinFOp
 // cuda_tile::MinIOp
+// cuda_tile::MmaFOp
+// cuda_tile::MmaIOp
 // cuda_tile::ModuleOp
 // cuda_tile::MulFOp
-// cuda_tile::MulIOp
 // cuda_tile::MulhiIOp
-// cuda_tile::NegIOp
+// cuda_tile::MulIOp
 // cuda_tile::NegFOp
+// cuda_tile::NegIOp
 // cuda_tile::OrIOp
 // cuda_tile::PermuteOp
 // cuda_tile::PowOp
@@ -76,6 +78,7 @@
 // cuda_tile::SubIOp
 // cuda_tile::TanOp
 // cuda_tile::TanHOp
+// cuda_tile::TruncIOp
 // cuda_tile::XOrIOp
 // cuda_tile::YieldOp
 //
@@ -84,9 +87,7 @@
 // cuda_tile::AtomicCASTkoOp
 // cuda_tile::AtomicRMWTkoOp
 // cuda_tile::BreakOp
-// cuda_tile::GetIndexSpaceShapeOp
 // cuda_tile::GetTensorShapeOp
-// cuda_tile::GlobalOp
 // cuda_tile::IntToPtrOp
 // cuda_tile::IotaOp
 // cuda_tile::LoadPtrTkoOp
@@ -109,6 +110,7 @@
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 
@@ -296,6 +298,107 @@ getConvertedResultTypeOrFail(OpT op, const TypeConverter *converter,
     return failure();
   }
   return resultTy;
+}
+
+/// Build the ranked memref type corresponding to a cuda_tile.global
+/// definition.
+///
+/// cuda_tile.global stores a DenseElementsAttr payload and semantically
+/// materializes a static allocation initialized at module load time. We lower
+/// that allocation to memref.global with a ranked static memref type matching
+/// the payload shape/element type.
+static FailureOr<MemRefType>
+getGlobalMemRefTypeOrFail(cuda_tile::GlobalOp globalOp,
+                          ConversionPatternRewriter &rewriter,
+                          Operation *diagnosticOp) {
+  auto initTy = dyn_cast<ShapedType>(globalOp.getValue().getType());
+  if (!initTy || !initTy.hasStaticShape())
+    return rewriter.notifyMatchFailure(
+        diagnosticOp,
+        "global initializer must be a statically shaped elements attribute");
+
+  // cuda_tile.global semantics are linear and 1-D in the source dialect.
+  if (initTy.getRank() != 1)
+    return rewriter.notifyMatchFailure(
+        diagnosticOp,
+        "global initializer must be 1-D to match cuda_tile.global semantics");
+
+  return MemRefType::get(initTy.getShape(), initTy.getElementType());
+}
+
+/// Build a tensor-typed ElementsAttr for memref.global from a cuda_tile.global
+/// initializer.
+///
+/// memref.global requires an ElementsAttr whose type is a ranked tensor.
+/// cuda_tile.global may carry an elements attribute with a non-tensor shaped
+/// type (for example, a vector type). Normalize to the equivalent ranked
+/// tensor payload while preserving values.
+static FailureOr<ElementsAttr>
+getGlobalInitializerAttrOrFail(cuda_tile::GlobalOp globalOp,
+                               ConversionPatternRewriter &rewriter,
+                               Operation *diagnosticOp) {
+  auto initAttr = dyn_cast<ElementsAttr>(globalOp.getValue());
+  if (!initAttr)
+    return rewriter.notifyMatchFailure(
+        diagnosticOp, "global initializer must be an elements attribute");
+
+  auto initTy = dyn_cast<ShapedType>(initAttr.getType());
+  if (!initTy || !initTy.hasStaticShape())
+    return rewriter.notifyMatchFailure(
+        diagnosticOp,
+        "global initializer must be a statically shaped elements attribute");
+
+  auto tensorTy =
+      RankedTensorType::get(initTy.getShape(), initTy.getElementType());
+  if (initAttr.getType() == tensorTy)
+    return initAttr;
+
+  auto denseAttr = dyn_cast<DenseElementsAttr>(initAttr);
+  if (!denseAttr)
+    return rewriter.notifyMatchFailure(
+        diagnosticOp, "global initializer must be a dense elements attribute "
+                      "when retyping is required");
+
+  if (denseAttr.isSplat())
+    return ElementsAttr(
+        DenseElementsAttr::get(tensorTy, denseAttr.getSplatValue<Attribute>()));
+
+  SmallVector<Attribute> values(denseAttr.getValues<Attribute>().begin(),
+                                denseAttr.getValues<Attribute>().end());
+  return ElementsAttr(DenseElementsAttr::get(tensorTy, values));
+}
+
+/// Resolve a get_global symbol to the ranked memref type of the referenced
+/// allocation.
+///
+/// During dialect conversion, the referenced symbol may still be
+/// `cuda_tile.global` or may already have been rewritten to `memref.global`
+/// depending on pattern application order. Accept both cases to keep
+/// get_global lowering order-independent.
+static FailureOr<MemRefType>
+getReferencedGlobalMemRefTypeOrFail(cuda_tile::GetGlobalOp getGlobalOp,
+                                    ConversionPatternRewriter &rewriter) {
+  Operation *symbolOp = SymbolTable::lookupNearestSymbolFrom(
+      getGlobalOp, getGlobalOp.getNameAttr());
+  if (!symbolOp)
+    return rewriter.notifyMatchFailure(getGlobalOp,
+                                       "referenced global symbol not found");
+
+  if (auto cudaGlobal = dyn_cast<cuda_tile::GlobalOp>(symbolOp))
+    return getGlobalMemRefTypeOrFail(cudaGlobal, rewriter, getGlobalOp);
+
+  if (auto memrefGlobal = dyn_cast<memref::GlobalOp>(symbolOp)) {
+    auto memrefTy = dyn_cast<MemRefType>(memrefGlobal.getType());
+    if (!memrefTy)
+      return rewriter.notifyMatchFailure(
+          getGlobalOp,
+          "referenced memref.global does not have a ranked memref type");
+    return memrefTy;
+  }
+
+  return rewriter.notifyMatchFailure(
+      getGlobalOp,
+      "referenced symbol is neither cuda_tile.global nor memref.global");
 }
 
 struct MmaContractionSpec {
@@ -1303,6 +1406,78 @@ struct ConvertAssume : public OpConversionPattern<cuda_tile::AssumeOp> {
   }
 };
 
+/// Convert cuda_tile.global to memref.global.
+///   1. Derive a ranked static memref type from the initializer shape/element.
+///   2. Emit memref.global with the same symbol name and initial value.
+///   3. Preserve alignment when non-zero; omit it otherwise.
+///
+/// Note: cuda_tile.global is mutable, so we do not set memref.global
+/// `constant`.
+struct ConvertGlobal : public OpConversionPattern<cuda_tile::GlobalOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::GlobalOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto memrefTy = getGlobalMemRefTypeOrFail(op, rewriter, op);
+    if (failed(memrefTy))
+      return failure();
+
+    auto initAttr = getGlobalInitializerAttrOrFail(op, rewriter, op);
+    if (failed(initAttr))
+      return failure();
+
+    IntegerAttr alignmentAttr;
+    if (op.getAlignment() != 0)
+      alignmentAttr = rewriter.getI64IntegerAttr(op.getAlignment());
+
+    rewriter.replaceOpWithNewOp<memref::GlobalOp>(
+        op, op.getSymName(), /*sym_visibility=*/StringAttr(), *memrefTy,
+        *initAttr, /*constant=*/false, alignmentAttr);
+    return success();
+  }
+};
+
+/// Convert cuda_tile.get_global to memref.get_global (+ memref.cast).
+///   1. Resolve the referenced cuda_tile.global symbol.
+///   2. Emit memref.get_global with the ranked memref type derived from that
+///      global initializer.
+///   3. Cast to the converted result type (typically memref<*xT>) so this
+///      pass's pointer model remains uniform (tile<ptr<T>> -> memref<*xT>).
+struct ConvertGetGlobal : public OpConversionPattern<cuda_tile::GetGlobalOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::GetGlobalOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto rankedMemRefTy = getReferencedGlobalMemRefTypeOrFail(op, rewriter);
+    if (failed(rankedMemRefTy))
+      return failure();
+
+    auto resultTy = getConvertedResultTypeOrFail(
+        op, getTypeConverter(), rewriter, "cannot convert get_global result");
+    if (failed(resultTy))
+      return failure();
+
+    Value getGlobal = memref::GetGlobalOp::create(
+        rewriter, op.getLoc(), *rankedMemRefTy, op.getNameAttr());
+
+    if (getGlobal.getType() != resultTy.value()) {
+      auto dstTy = dyn_cast<BaseMemRefType>(resultTy.value());
+      auto srcTy = dyn_cast<BaseMemRefType>(getGlobal.getType());
+      if (!dstTy || !srcTy || !memref::CastOp::areCastCompatible(srcTy, dstTy))
+        return rewriter.notifyMatchFailure(
+            op, "cannot cast memref.get_global result to converted pointer "
+                "type");
+      getGlobal = memref::CastOp::create(rewriter, op.getLoc(),
+                                         resultTy.value(), getGlobal);
+    }
+
+    rewriter.replaceOp(op, getGlobal);
+    return success();
+  }
+};
+
 /// Convert cuda_tile.permute to vector.transpose.
 ///
 /// Both ops reorder the dimensions of an N-D tensor/vector according to a
@@ -2248,22 +2423,23 @@ static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
   MLIRContext *ctx = patterns.getContext();
   patterns
       .add<ConvertModule, ConvertEntry, ConvertMakeTensorView,
-           ConvertMakePartitionView, ConvertConstant, ConvertGetTileBlockId,
-           ConvertGetNumTileBlocks, ConvertBitcast, ConvertMulI, ConvertAtan2,
-           ConvertCeil, ConvertCmpF, ConvertExtI, ConvertCos, ConvertFToF,
-           ConvertFToI, ConvertExp2, ConvertExp, ConvertFloor, ConvertIToF,
-           ConvertLog2, ConvertMaxF, ConvertMinF, ConvertNegF, ConvertPow,
-           ConvertRsqrt, ConvertSin, ConvertTanH, ConvertCmpI, ConvertMaxI,
-           ConvertMinI, ConvertMmaI, ConvertMulhiI, ConvertNegI, ConvertTruncI,
-           ConvertXOrI, ConvertFor, ConvertIf, ConvertContinue, ConvertYield,
-           ConvertReturn, ConvertMmaF, ConvertAssume, ConvertPermute,
-           ConvertReshape, ConvertBroadcast, ConvertExtract, ConvertCat,
-           ConvertReduce, ConvertScan, ConvertSelect, ConvertGetIndexSpaceShape,
-           ConvertLoadViewTko, ConvertStoreViewTko, ConvertAbsF, ConvertAbsI,
-           ConvertLog, ConvertTan, ConvertSinH, ConvertCosH, ConvertSqrt,
-           ConvertFma, ConvertAndI, ConvertOrI, ConvertRemF, ConvertAddI,
-           ConvertSubI, ConvertShLI, ConvertDivI, ConvertRemI, ConvertShRI,
-           ConvertAddF, ConvertSubF, ConvertMulF, ConvertDivF>(converter, ctx);
+           ConvertMakePartitionView, ConvertConstant, ConvertGetGlobal,
+           ConvertGlobal, ConvertGetTileBlockId, ConvertGetNumTileBlocks,
+           ConvertBitcast, ConvertMulI, ConvertAtan2, ConvertCeil, ConvertCmpF,
+           ConvertExtI, ConvertCos, ConvertFToF, ConvertFToI, ConvertExp2,
+           ConvertExp, ConvertFloor, ConvertIToF, ConvertLog2, ConvertMaxF,
+           ConvertMinF, ConvertNegF, ConvertPow, ConvertRsqrt, ConvertSin,
+           ConvertTanH, ConvertCmpI, ConvertMaxI, ConvertMinI, ConvertMmaI,
+           ConvertMulhiI, ConvertNegI, ConvertTruncI, ConvertXOrI, ConvertFor,
+           ConvertIf, ConvertContinue, ConvertYield, ConvertReturn, ConvertMmaF,
+           ConvertAssume, ConvertPermute, ConvertReshape, ConvertBroadcast,
+           ConvertExtract, ConvertCat, ConvertReduce, ConvertScan,
+           ConvertSelect, ConvertGetIndexSpaceShape, ConvertLoadViewTko,
+           ConvertStoreViewTko, ConvertAbsF, ConvertAbsI, ConvertLog,
+           ConvertTan, ConvertSinH, ConvertCosH, ConvertSqrt, ConvertFma,
+           ConvertAndI, ConvertOrI, ConvertRemF, ConvertAddI, ConvertSubI,
+           ConvertShLI, ConvertDivI, ConvertRemI, ConvertShRI, ConvertAddF,
+           ConvertSubF, ConvertMulF, ConvertDivF>(converter, ctx);
 }
 
 //===----------------------------------------------------------------------===//

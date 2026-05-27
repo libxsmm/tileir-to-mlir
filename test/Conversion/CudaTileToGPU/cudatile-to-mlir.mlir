@@ -8,6 +8,25 @@
 // CHECK-LABEL: gpu.module @m {
 cuda_tile.module @m {
 
+  // --- global/get_global edge cases ---
+  // CHECK: memref.global @g_f32_aligned : memref<4xf32> = dense<[1.000000e+00, 2.000000e+00, 3.000000e+00, 4.000000e+00]> {alignment = 256 : i64}
+  global @g_f32_aligned alignment = 256 <f32: [1.0, 2.0, 3.0, 4.0]> : tile<4xf32>
+
+  // CHECK: memref.global @g_i32_single : memref<1xi32> = dense<7>
+  global @g_i32_single <i32: [7]> : tile<1xi32>
+
+  // CHECK-LABEL: gpu.func @test_get_global_edges
+  entry @test_get_global_edges() {
+    // CHECK: %[[GF:.*]] = memref.get_global @g_f32_aligned : memref<4xf32>
+    // CHECK: %[[PF:.*]] = memref.cast %[[GF]] : memref<4xf32> to memref<*xf32>
+    %pf = get_global @g_f32_aligned : tile<ptr<f32>>
+
+    // CHECK: %[[GI:.*]] = memref.get_global @g_i32_single : memref<1xi32>
+    // CHECK: %[[PI:.*]] = memref.cast %[[GI]] : memref<1xi32> to memref<*xi32>
+    %pi = get_global @g_i32_single : tile<ptr<i32>>
+    return
+  }
+
   // --- 2D array constant (not covered by cuda_tile_ir_ops) ---
   // CHECK-LABEL: gpu.func @test_constant_2d_array
   entry @test_constant_2d_array() {
