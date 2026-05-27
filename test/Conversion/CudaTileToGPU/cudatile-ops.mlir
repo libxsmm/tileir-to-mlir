@@ -22,6 +22,19 @@ cuda_tile.module @ops_module {
     return
   }
 
+  // --- get_tensor_shape ---
+  // Derived from cuda_tile.get_tensor_shape mlirExamples in Ops.td.
+  // CHECK-LABEL: gpu.func @test_get_tensor_shape_example
+  // CHECK-SAME: %[[TS_BASE:[a-zA-Z0-9_]+]]: memref<*xf32>
+  entry @test_get_tensor_shape_example(%base: !cuda_tile.tile<!cuda_tile.ptr<f32>>) {
+    // CHECK: %[[TS_VIEW:.*]] = memref.reinterpret_cast %[[TS_BASE]] to offset: [0], sizes: [32, 32], strides: [32, 1] : memref<*xf32> to memref<32x32xf32>
+    %tensor_view = make_tensor_view %base, shape = [32, 32], strides = [32, 1] : tensor_view<32x32xf32, strides=[32,1]>
+    // CHECK: arith.index_castui {{.*}} : index to i64
+    // CHECK: arith.index_castui {{.*}} : index to i64
+    %dim0, %dim1 = get_tensor_shape %tensor_view : tensor_view<32x32xf32, strides=[32,1]> -> tile<i64>
+    return
+  }
+
   // --- constant ---
   // CHECK-LABEL: gpu.func @test_constant
   entry @test_constant() {

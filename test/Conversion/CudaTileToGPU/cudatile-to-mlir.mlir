@@ -101,6 +101,34 @@ cuda_tile.module @m {
     %dims:2 = get_index_space_shape %pv : partition_view<tile=(16x8), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]> -> tile<i32>
   }
 
+  // --- get_tensor_shape with dynamic tensor_view dims ---
+  // CHECK-LABEL: gpu.func @test_get_tensor_shape_dynamic
+  // CHECK-SAME: %[[GTSD_UPTR:[a-zA-Z0-9_]+]]: memref<*xf16>
+  entry @test_get_tensor_shape_dynamic(%p: !cuda_tile.tile<!cuda_tile.ptr<f16>>, %m: !cuda_tile.tile<i32>, %n: !cuda_tile.tile<i32>, %s: !cuda_tile.tile<i32>) {
+    %tv = make_tensor_view %p, shape = [%m, %n], strides = [%s, 1] : tile<i32> -> tensor_view<?x?xf16, strides=[?,1]>
+    // CHECK: %[[GTSD_VIEW:.*]] = memref.reinterpret_cast %[[GTSD_UPTR]]{{.*}} : memref<*xf16> to memref<?x?xf16, strided<[?, 1]>>
+    // CHECK: %[[GTSD_D0:.*]] = memref.dim %[[GTSD_VIEW]], {{.*}}0
+    // CHECK: %[[GTSD_R0:.*]] = arith.index_castui %[[GTSD_D0]] : index to i32
+    // CHECK: %[[GTSD_D1:.*]] = memref.dim %[[GTSD_VIEW]], {{.*}}1
+    // CHECK: %[[GTSD_R1:.*]] = arith.index_castui %[[GTSD_D1]] : index to i32
+    %d0, %d1 = get_tensor_shape %tv : tensor_view<?x?xf16, strides=[?,1]> -> tile<i32>
+    return
+  }
+
+  // --- get_tensor_shape with mixed static/dynamic dims ---
+  // CHECK-LABEL: gpu.func @test_get_tensor_shape_mixed
+  // CHECK-SAME: %[[GTSM_UPTR:[a-zA-Z0-9_]+]]: memref<*xf16>
+  entry @test_get_tensor_shape_mixed(%p: !cuda_tile.tile<!cuda_tile.ptr<f16>>, %n: !cuda_tile.tile<i32>, %s: !cuda_tile.tile<i32>) {
+    %tv = make_tensor_view %p, shape = [64, %n], strides = [%s, 1] : tile<i32> -> tensor_view<64x?xf16, strides=[?,1]>
+    // CHECK: %[[GTSM_VIEW:.*]] = memref.reinterpret_cast %[[GTSM_UPTR]]{{.*}} : memref<*xf16> to memref<64x?xf16, strided<[?, 1]>>
+    // CHECK: %[[GTSM_C64:.*]] = arith.constant 64 : index
+    // CHECK: %[[GTSM_R0:.*]] = arith.index_castui %[[GTSM_C64]] : index to i64
+    // CHECK: %[[GTSM_D1:.*]] = memref.dim %[[GTSM_VIEW]], {{.*}}1
+    // CHECK: %[[GTSM_R1:.*]] = arith.index_castui %[[GTSM_D1]] : index to i64
+    %d0, %d1 = get_tensor_shape %tv : tensor_view<64x?xf16, strides=[?,1]> -> tile<i64>
+    return
+  }
+
   // --- load with dynamic memref, identity dim_map, ub.poison padding ---
   // CHECK-LABEL: gpu.func @test_load_identity_no_padding
   // CHECK-SAME: %[[LID_UPTR:[a-zA-Z0-9_]+]]: memref<*xf16>

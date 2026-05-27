@@ -35,6 +35,7 @@
 // cuda_tile::FToFOp
 // cuda_tile::FToIOp
 // cuda_tile::GetGlobalOp
+// cuda_tile::GetTensorShapeOp
 // cuda_tile::GetIndexSpaceShapeOp
 // cuda_tile::GetNumTileBlocksOp
 // cuda_tile::GetTileBlockIdOp
@@ -87,7 +88,6 @@
 // cuda_tile::AtomicCASTkoOp
 // cuda_tile::AtomicRMWTkoOp
 // cuda_tile::BreakOp
-// cuda_tile::GetTensorShapeOp
 // cuda_tile::IntToPtrOp
 // cuda_tile::IotaOp
 // cuda_tile::LoadPtrTkoOp
@@ -1895,6 +1895,65 @@ struct ConvertScan : public OpConversionPattern<cuda_tile::ScanOp> {
   }
 };
 
+/// Convert cuda_tile.get_tensor_shape.
+///
+/// For a converted tensor_view memref, each result is the extent of the
+/// corresponding memref dimension. Static extents are folded to constants;
+/// dynamic extents are queried via memref.dim.
+///
+/// Source semantics specify that these values are interpreted as unsigned
+/// integers. When the target result type is integer, use index_castui.
+struct ConvertGetTensorShape
+    : public OpConversionPattern<cuda_tile::GetTensorShapeOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::GetTensorShapeOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto memrefTy = dyn_cast<MemRefType>(adaptor.getSrc().getType());
+    if (!memrefTy)
+      return rewriter.notifyMatchFailure(
+          op, "tensor_view source did not convert to a ranked memref");
+
+    Location loc = op.getLoc();
+    auto castIndexResultTo = [&](Value indexVal, Type dstTy) -> Value {
+      if (dstTy == rewriter.getIndexType())
+        return indexVal;
+      if (isa<IntegerType>(dstTy))
+        return arith::IndexCastUIOp::create(rewriter, loc, dstTy, indexVal);
+      return Value();
+    };
+
+    SmallVector<Value> results;
+    auto shape = memrefTy.getShape();
+    for (auto [i, dimSize] : llvm::enumerate(shape)) {
+      Type resultTy =
+          getTypeConverter()->convertType(op->getResult(i).getType());
+      if (!resultTy)
+        return rewriter.notifyMatchFailure(
+            op, "cannot convert get_tensor_shape result type");
+
+      Value dimAsIndex;
+      if (dimSize != ShapedType::kDynamic) {
+        dimAsIndex = arith::ConstantIndexOp::create(rewriter, loc, dimSize);
+      } else {
+        dimAsIndex = memref::DimOp::create(
+            rewriter, loc, adaptor.getSrc(),
+            arith::ConstantIndexOp::create(rewriter, loc, i));
+      }
+
+      Value casted = castIndexResultTo(dimAsIndex, resultTy);
+      if (!casted)
+        return rewriter.notifyMatchFailure(
+            op, "cannot cast tensor_shape result to converted type");
+      results.push_back(casted);
+    }
+
+    rewriter.replaceOp(op, results);
+    return success();
+  }
+};
+
 /// Convert cuda_tile.get_index_space_shape.
 /// For
 /// partition_view<tile=(T0xT1x...), tensor_view<?x?x...>, dim_map=[d0,d1,...]>
@@ -2434,12 +2493,12 @@ static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
            ConvertIf, ConvertContinue, ConvertYield, ConvertReturn, ConvertMmaF,
            ConvertAssume, ConvertPermute, ConvertReshape, ConvertBroadcast,
            ConvertExtract, ConvertCat, ConvertReduce, ConvertScan,
-           ConvertSelect, ConvertGetIndexSpaceShape, ConvertLoadViewTko,
-           ConvertStoreViewTko, ConvertAbsF, ConvertAbsI, ConvertLog,
-           ConvertTan, ConvertSinH, ConvertCosH, ConvertSqrt, ConvertFma,
-           ConvertAndI, ConvertOrI, ConvertRemF, ConvertAddI, ConvertSubI,
-           ConvertShLI, ConvertDivI, ConvertRemI, ConvertShRI, ConvertAddF,
-           ConvertSubF, ConvertMulF, ConvertDivF>(converter, ctx);
+           ConvertSelect, ConvertGetTensorShape, ConvertGetIndexSpaceShape,
+           ConvertLoadViewTko, ConvertStoreViewTko, ConvertAbsF, ConvertAbsI,
+           ConvertLog, ConvertTan, ConvertSinH, ConvertCosH, ConvertSqrt,
+           ConvertFma, ConvertAndI, ConvertOrI, ConvertRemF, ConvertAddI,
+           ConvertSubI, ConvertShLI, ConvertDivI, ConvertRemI, ConvertShRI,
+           ConvertAddF, ConvertSubF, ConvertMulF, ConvertDivF>(converter, ctx);
 }
 
 //===----------------------------------------------------------------------===//
