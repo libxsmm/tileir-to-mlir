@@ -30,5 +30,3 @@ if(TARGET test)
 else()
   add_custom_target(test DEPENDS check-cudatile-to-gpu)
 endif()
-
-add_subdirectory(Conversion)
