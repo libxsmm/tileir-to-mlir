@@ -14,8 +14,6 @@ The LLVM/MLIR version must match the one used by your `cuda-tile`.
 See `cuda-tile`'s `README.md` and its `cmake/IncludeLLVM.cmake` to find the
 LLVM version it expects.
 
-This project requires `CUDA_TILE_DIR` at configure time.
-
 ## Configure
 
 From the repository root:
@@ -39,12 +37,6 @@ Build everything:
 
 ```bash
 cmake --build build
-```
-
-Build only the conversion tool:
-
-```bash
-cmake --build build --target cudatile-to-gpu
 ```
 
 ## Run Tests
@@ -78,5 +70,5 @@ build/tools/cudatile-to-gpu --convert-cuda-tile-to-gpu test/Conversion/CudaTileT
 Example: convert the appendix example and run canonical cleanup passes:
 
 ```bash
-build/tools/cudatile-to-gpu --convert-cuda-tile-to-gpu test/Conversion/CudaTileToGPU/cudatile-appendix.mlir | mlir-opt --loop-invariant-code-motion -cse -canonicalize -cse
+build/tools/cudatile-to-gpu --convert-cuda-tile-to-gpu test/Conversion/CudaTileToGPU/cudatile-appendix.mlir | mlir-opt --loop-invariant-code-motion -canonicalize -cse
 ```

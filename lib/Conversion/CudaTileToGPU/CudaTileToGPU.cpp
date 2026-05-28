@@ -129,6 +129,7 @@ using namespace mlir;
 namespace {
 
 /// Derive the ranked MemRefType that corresponds to a tensor_view type.
+///
 /// If the tensor_view describes a default contiguous row-major layout with
 /// fully static shape/strides, a plain (layout-free) memref is returned;
 /// otherwise a strided-layout memref is returned (which also covers any
@@ -235,71 +236,6 @@ validatePartitionViewInfo(Operation *op, const PartitionViewInfo &info,
   return success();
 }
 
-/// Map cuda_tile cmpf predicate+ordering to the corresponding arith predicate.
-static FailureOr<arith::CmpFPredicate>
-mapCmpFPredicate(cuda_tile::ComparisonPredicate pred,
-                 cuda_tile::ComparisonOrdering ord) {
-  using CP = cuda_tile::ComparisonPredicate;
-  using CO = cuda_tile::ComparisonOrdering;
-  if (ord == CO::ORDERED) {
-    switch (pred) {
-    case CP::EQUAL:
-      return arith::CmpFPredicate::OEQ;
-    case CP::NOT_EQUAL:
-      return arith::CmpFPredicate::ONE;
-    case CP::LESS_THAN:
-      return arith::CmpFPredicate::OLT;
-    case CP::LESS_THAN_OR_EQUAL:
-      return arith::CmpFPredicate::OLE;
-    case CP::GREATER_THAN:
-      return arith::CmpFPredicate::OGT;
-    case CP::GREATER_THAN_OR_EQUAL:
-      return arith::CmpFPredicate::OGE;
-    }
-  }
-  if (ord == CO::UNORDERED) {
-    switch (pred) {
-    case CP::EQUAL:
-      return arith::CmpFPredicate::UEQ;
-    case CP::NOT_EQUAL:
-      return arith::CmpFPredicate::UNE;
-    case CP::LESS_THAN:
-      return arith::CmpFPredicate::ULT;
-    case CP::LESS_THAN_OR_EQUAL:
-      return arith::CmpFPredicate::ULE;
-    case CP::GREATER_THAN:
-      return arith::CmpFPredicate::UGT;
-    case CP::GREATER_THAN_OR_EQUAL:
-      return arith::CmpFPredicate::UGE;
-    }
-  }
-  return failure();
-}
-
-/// Map cuda_tile cmpi predicate+signedness to the corresponding arith
-/// predicate.
-static FailureOr<arith::CmpIPredicate>
-mapCmpIPredicate(cuda_tile::ComparisonPredicate pred,
-                 cuda_tile::Signedness signedness) {
-  using CP = cuda_tile::ComparisonPredicate;
-  bool isUnsigned = signedness == cuda_tile::Signedness::Unsigned;
-  switch (pred) {
-  case CP::EQUAL:
-    return arith::CmpIPredicate::eq;
-  case CP::NOT_EQUAL:
-    return arith::CmpIPredicate::ne;
-  case CP::LESS_THAN:
-    return isUnsigned ? arith::CmpIPredicate::ult : arith::CmpIPredicate::slt;
-  case CP::LESS_THAN_OR_EQUAL:
-    return isUnsigned ? arith::CmpIPredicate::ule : arith::CmpIPredicate::sle;
-  case CP::GREATER_THAN:
-    return isUnsigned ? arith::CmpIPredicate::ugt : arith::CmpIPredicate::sgt;
-  case CP::GREATER_THAN_OR_EQUAL:
-    return isUnsigned ? arith::CmpIPredicate::uge : arith::CmpIPredicate::sge;
-  }
-  return failure();
-}
-
 /// Map cuda_tile integer-overflow flags to arith integer-overflow flags.
 static arith::IntegerOverflowFlags
 mapIntegerOverflowFlags(cuda_tile::IntegerOverflow overflow) {
@@ -388,81 +324,6 @@ getGlobalMemRefTypeOrFail(cuda_tile::GlobalOp globalOp,
         "global initializer must be 1-D to match cuda_tile.global semantics");
 
   return MemRefType::get(initTy.getShape(), initTy.getElementType());
-}
-
-/// Build a tensor-typed ElementsAttr for memref.global from a cuda_tile.global
-/// initializer.
-///
-/// memref.global requires an ElementsAttr whose type is a ranked tensor.
-/// cuda_tile.global may carry an elements attribute with a non-tensor shaped
-/// type (for example, a vector type). Normalize to the equivalent ranked
-/// tensor payload while preserving values.
-static FailureOr<ElementsAttr>
-getGlobalInitializerAttrOrFail(cuda_tile::GlobalOp globalOp,
-                               ConversionPatternRewriter &rewriter,
-                               Operation *diagnosticOp) {
-  auto initAttr = dyn_cast<ElementsAttr>(globalOp.getValue());
-  if (!initAttr)
-    return rewriter.notifyMatchFailure(
-        diagnosticOp, "global initializer must be an elements attribute");
-
-  auto initTy = dyn_cast<ShapedType>(initAttr.getType());
-  if (!initTy || !initTy.hasStaticShape())
-    return rewriter.notifyMatchFailure(
-        diagnosticOp,
-        "global initializer must be a statically shaped elements attribute");
-
-  auto tensorTy =
-      RankedTensorType::get(initTy.getShape(), initTy.getElementType());
-  if (initAttr.getType() == tensorTy)
-    return initAttr;
-
-  auto denseAttr = dyn_cast<DenseElementsAttr>(initAttr);
-  if (!denseAttr)
-    return rewriter.notifyMatchFailure(
-        diagnosticOp, "global initializer must be a dense elements attribute "
-                      "when retyping is required");
-
-  if (denseAttr.isSplat())
-    return ElementsAttr(
-        DenseElementsAttr::get(tensorTy, denseAttr.getSplatValue<Attribute>()));
-
-  SmallVector<Attribute> values(denseAttr.getValues<Attribute>().begin(),
-                                denseAttr.getValues<Attribute>().end());
-  return ElementsAttr(DenseElementsAttr::get(tensorTy, values));
-}
-
-/// Resolve a get_global symbol to the ranked memref type of the referenced
-/// allocation.
-///
-/// During dialect conversion, the referenced symbol may still be
-/// `cuda_tile.global` or may already have been rewritten to `memref.global`
-/// depending on pattern application order. Accept both cases to keep
-/// get_global lowering order-independent.
-static FailureOr<MemRefType>
-getReferencedGlobalMemRefTypeOrFail(cuda_tile::GetGlobalOp getGlobalOp,
-                                    ConversionPatternRewriter &rewriter) {
-  Operation *symbolOp = SymbolTable::lookupNearestSymbolFrom(
-      getGlobalOp, getGlobalOp.getNameAttr());
-  if (!symbolOp)
-    return rewriter.notifyMatchFailure(getGlobalOp,
-                                       "referenced global symbol not found");
-
-  if (auto cudaGlobal = dyn_cast<cuda_tile::GlobalOp>(symbolOp))
-    return getGlobalMemRefTypeOrFail(cudaGlobal, rewriter, getGlobalOp);
-
-  if (auto memrefGlobal = dyn_cast<memref::GlobalOp>(symbolOp)) {
-    auto memrefTy = dyn_cast<MemRefType>(memrefGlobal.getType());
-    if (!memrefTy)
-      return rewriter.notifyMatchFailure(
-          getGlobalOp,
-          "referenced memref.global does not have a ranked memref type");
-    return memrefTy;
-  }
-
-  return rewriter.notifyMatchFailure(
-      getGlobalOp,
-      "referenced symbol is neither cuda_tile.global nor memref.global");
 }
 
 struct MmaContractionSpec {
@@ -568,40 +429,6 @@ struct ConvertBinaryLhsRhsOp : public OpConversionPattern<SrcOp> {
                   ConversionPatternRewriter &rewriter) const override {
     rewriter.template replaceOpWithNewOp<DstOp>(op, adaptor.getLhs(),
                                                 adaptor.getRhs());
-    return success();
-  }
-};
-
-/// Convert signedness-directed casts where the destination arith op depends
-/// only on the source op's signedness attribute.
-///
-/// Used by:
-///   - cuda_tile.exti  -> arith.extsi / arith.extui
-///
-///   1. Convert the destination tile type (`to`) via the type converter.
-///   2. Dispatch to `UnsignedDstOp` for `signedness = unsigned`, otherwise to
-///      `SignedDstOp`.
-///   3. Replace the original op with the selected arith op.
-template <typename SrcOp, typename SignedDstOp, typename UnsignedDstOp>
-struct ConvertFromToSignednessCastOp : public OpConversionPattern<SrcOp> {
-  using OpConversionPattern<SrcOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(SrcOp op,
-                  typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto resultTy =
-        getConvertedResultTypeOrFail(op, this->getTypeConverter(), rewriter,
-                                     "cannot convert cast result type");
-    if (failed(resultTy))
-      return failure();
-
-    if (op.getSignedness() == cuda_tile::Signedness::Unsigned)
-      rewriter.template replaceOpWithNewOp<UnsignedDstOp>(op, resultTy.value(),
-                                                          adaptor.getFrom());
-    else
-      rewriter.template replaceOpWithNewOp<SignedDstOp>(op, resultTy.value(),
-                                                        adaptor.getFrom());
     return success();
   }
 };
@@ -759,70 +586,6 @@ struct ConvertMinMaxIOp : public OpConversionPattern<SrcOp> {
   }
 };
 
-/// Match the body of a cuda_tile.reduce to determine the CombiningKind.
-/// The body is expected to have exactly one combining op (ignoring the yield).
-static FailureOr<vector::CombiningKind> matchReduceBody(Region &body) {
-  Block &block = body.front();
-  if (block.getNumArguments() != 2)
-    return failure();
-
-  auto yieldOp = dyn_cast<cuda_tile::YieldOp>(block.getTerminator());
-  if (!yieldOp || yieldOp.getNumOperands() != 1)
-    return failure();
-
-  // The body should contain exactly one op besides the terminator (yield).
-  Operation *combiningOp = nullptr;
-  for (Operation &op : block.without_terminator()) {
-    if (combiningOp)
-      return failure(); // more than one op
-    combiningOp = &op;
-  }
-  if (!combiningOp)
-    return failure();
-
-  if (combiningOp->getNumOperands() != 2 || combiningOp->getNumResults() != 1)
-    return failure();
-  if (yieldOp.getOperand(0) != combiningOp->getResult(0))
-    return failure();
-
-  auto lhsArg = dyn_cast<BlockArgument>(combiningOp->getOperand(0));
-  auto rhsArg = dyn_cast<BlockArgument>(combiningOp->getOperand(1));
-  if (!lhsArg || !rhsArg || lhsArg.getOwner() != &block ||
-      rhsArg.getOwner() != &block)
-    return failure();
-  if (lhsArg.getArgNumber() == rhsArg.getArgNumber())
-    return failure();
-
-  return llvm::TypeSwitch<Operation *, FailureOr<vector::CombiningKind>>(
-             combiningOp)
-      .Case<cuda_tile::AddFOp, cuda_tile::AddIOp>(
-          [](auto) { return vector::CombiningKind::ADD; })
-      .Case<cuda_tile::MulFOp, cuda_tile::MulIOp>(
-          [](auto) { return vector::CombiningKind::MUL; })
-      .Case<cuda_tile::MaxFOp>([](cuda_tile::MaxFOp op) {
-        return op.getPropagateNan() ? vector::CombiningKind::MAXIMUMF
-                                    : vector::CombiningKind::MAXNUMF;
-      })
-      .Case<cuda_tile::MinFOp>([](cuda_tile::MinFOp op) {
-        return op.getPropagateNan() ? vector::CombiningKind::MINIMUMF
-                                    : vector::CombiningKind::MINNUMF;
-      })
-      .Case<cuda_tile::MaxIOp>([](cuda_tile::MaxIOp op) {
-        return op.getSignedness() == cuda_tile::Signedness::Unsigned
-                   ? vector::CombiningKind::MAXUI
-                   : vector::CombiningKind::MAXSI;
-      })
-      .Case<cuda_tile::MinIOp>([](cuda_tile::MinIOp op) {
-        return op.getSignedness() == cuda_tile::Signedness::Unsigned
-                   ? vector::CombiningKind::MINUI
-                   : vector::CombiningKind::MINSI;
-      })
-      .Case<cuda_tile::AndIOp>([](auto) { return vector::CombiningKind::AND; })
-      .Case<cuda_tile::OrIOp>([](auto) { return vector::CombiningKind::OR; })
-      .Case<cuda_tile::XOrIOp>([](auto) { return vector::CombiningKind::XOR; })
-      .Default([](Operation *) { return failure(); });
-}
-
 /// Common pre-flight checks for cuda_tile.reduce/scan lowerings.
 ///
 /// Extracts the combining kind from the body, validates that the op has a
@@ -833,16 +596,80 @@ template <typename OpT>
 static FailureOr<
     std::tuple<vector::CombiningKind, Value, VectorType, TypedAttr>>
 matchSingleOperandCombiningOp(OpT op, ValueRange convertedOperands,
-                              ConversionPatternRewriter &rewriter,
-                              StringRef opName) {
+                              ConversionPatternRewriter &rewriter) {
   if (op.getOperands().size() != 1)
-    return rewriter.notifyMatchFailure(op, Twine("multi-operand ") + opName +
-                                               " not supported");
+    return rewriter.notifyMatchFailure(
+        op, "multi-operand reductions are not supported");
 
-  auto kind = matchReduceBody(op.getBody());
+  Block &block = op.getBody().front();
+  if (block.getNumArguments() != 2)
+    return rewriter.notifyMatchFailure(
+        op, "cannot determine combining kind from body");
+
+  auto yieldOp = dyn_cast<cuda_tile::YieldOp>(block.getTerminator());
+  if (!yieldOp || yieldOp.getNumOperands() != 1)
+    return rewriter.notifyMatchFailure(
+        op, "cannot determine combining kind from body");
+
+  Operation *combiningOp = nullptr;
+  for (Operation &bodyOp : block.without_terminator()) {
+    if (combiningOp)
+      return rewriter.notifyMatchFailure(
+          op, "cannot determine combining kind from body");
+    combiningOp = &bodyOp;
+  }
+  if (!combiningOp)
+    return rewriter.notifyMatchFailure(
+        op, "cannot determine combining kind from body");
+
+  if (combiningOp->getNumOperands() != 2 || combiningOp->getNumResults() != 1 ||
+      yieldOp.getOperand(0) != combiningOp->getResult(0))
+    return rewriter.notifyMatchFailure(
+        op, "cannot determine combining kind from body");
+
+  auto lhsArg = dyn_cast<BlockArgument>(combiningOp->getOperand(0));
+  auto rhsArg = dyn_cast<BlockArgument>(combiningOp->getOperand(1));
+  if (!lhsArg || !rhsArg || lhsArg.getOwner() != &block ||
+      rhsArg.getOwner() != &block ||
+      lhsArg.getArgNumber() == rhsArg.getArgNumber())
+    return rewriter.notifyMatchFailure(
+        op, "cannot determine combining kind from body");
+
+  auto kind =
+      llvm::TypeSwitch<Operation *, FailureOr<vector::CombiningKind>>(
+          combiningOp)
+          .template Case<cuda_tile::AddFOp, cuda_tile::AddIOp>(
+              [](auto) { return vector::CombiningKind::ADD; })
+          .template Case<cuda_tile::MulFOp, cuda_tile::MulIOp>(
+              [](auto) { return vector::CombiningKind::MUL; })
+          .template Case<cuda_tile::MaxFOp>([](cuda_tile::MaxFOp bodyOp) {
+            return bodyOp.getPropagateNan() ? vector::CombiningKind::MAXIMUMF
+                                            : vector::CombiningKind::MAXNUMF;
+          })
+          .template Case<cuda_tile::MinFOp>([](cuda_tile::MinFOp bodyOp) {
+            return bodyOp.getPropagateNan() ? vector::CombiningKind::MINIMUMF
+                                            : vector::CombiningKind::MINNUMF;
+          })
+          .template Case<cuda_tile::MaxIOp>([](cuda_tile::MaxIOp bodyOp) {
+            return bodyOp.getSignedness() == cuda_tile::Signedness::Unsigned
+                       ? vector::CombiningKind::MAXUI
+                       : vector::CombiningKind::MAXSI;
+          })
+          .template Case<cuda_tile::MinIOp>([](cuda_tile::MinIOp bodyOp) {
+            return bodyOp.getSignedness() == cuda_tile::Signedness::Unsigned
+                       ? vector::CombiningKind::MINUI
+                       : vector::CombiningKind::MINSI;
+          })
+          .template Case<cuda_tile::AndIOp>(
+              [](auto) { return vector::CombiningKind::AND; })
+          .template Case<cuda_tile::OrIOp>(
+              [](auto) { return vector::CombiningKind::OR; })
+          .template Case<cuda_tile::XOrIOp>(
+              [](auto) { return vector::CombiningKind::XOR; })
+          .Default([](Operation *) { return failure(); });
   if (failed(kind))
     return rewriter.notifyMatchFailure(
-        op, Twine("cannot determine combining kind from ") + opName + " body");
+        op, "cannot determine combining kind from body");
 
   Value source = convertedOperands.front();
   auto srcVecTy = dyn_cast<VectorType>(source.getType());
@@ -854,12 +681,12 @@ matchSingleOperandCombiningOp(OpT op, ValueRange convertedOperands,
                                        "source vector must have positive rank");
 
   if (op.getDim() >= static_cast<uint32_t>(srcVecTy.getRank()))
-    return rewriter.notifyMatchFailure(
-        op, Twine(opName) + " reduction dimension is out of bounds");
+    return rewriter.notifyMatchFailure(op,
+                                       "reduction dimension is out of bounds");
 
   if (op.getIdentities().size() != 1)
-    return rewriter.notifyMatchFailure(
-        op, Twine(opName) + " requires exactly one identity value");
+    return rewriter.notifyMatchFailure(op,
+                                       "requires exactly one identity value");
 
   auto identityAttr = dyn_cast<TypedAttr>(op.getIdentities()[0]);
   if (!identityAttr)
@@ -867,8 +694,7 @@ matchSingleOperandCombiningOp(OpT op, ValueRange convertedOperands,
 
   if (identityAttr.getType() != srcVecTy.getElementType())
     return rewriter.notifyMatchFailure(
-        op, Twine(opName) +
-                " identity type does not match the source element type");
+        op, "identity type does not match the source element type");
 
   return std::make_tuple(*kind, source, srcVecTy, identityAttr);
 }
@@ -891,44 +717,6 @@ struct ConvertBinaryLhsRhsWithSignednessOp : public OpConversionPattern<SrcOp> {
     return success();
   }
 };
-
-/// Materialize the constant value implied by a partition_view padding_value
-/// attribute. Falls back to ub.poison when no padding_value was specified;
-/// in that case the spec leaves OOB elements unspecified. The special enum
-/// cases (neg_zero / nan / pos_inf / neg_inf) are only valid for floating
-/// point element types per the dialect verifier.
-static Value makePaddingValue(OpBuilder &b, Location loc, Type elemTy,
-                              cuda_tile::PaddingValueAttr pvAttr) {
-  if (!pvAttr)
-    return ub::PoisonOp::create(b, loc, elemTy);
-
-  auto fty = dyn_cast<FloatType>(elemTy);
-  if (!fty) {
-    // Integer element types only accept `zero`; emit a 0 constant.
-    return arith::ConstantIntOp::create(b, loc, elemTy, 0);
-  }
-
-  const llvm::fltSemantics &sem = fty.getFloatSemantics();
-  APFloat val = APFloat::getZero(sem, /*Negative=*/false);
-  switch (pvAttr.getValue()) {
-  case cuda_tile::PaddingValue::zero:
-    val = APFloat::getZero(sem, /*Negative=*/false);
-    break;
-  case cuda_tile::PaddingValue::neg_zero:
-    val = APFloat::getZero(sem, /*Negative=*/true);
-    break;
-  case cuda_tile::PaddingValue::nan:
-    val = APFloat::getNaN(sem);
-    break;
-  case cuda_tile::PaddingValue::pos_inf:
-    val = APFloat::getInf(sem, /*Negative=*/false);
-    break;
-  case cuda_tile::PaddingValue::neg_inf:
-    val = APFloat::getInf(sem, /*Negative=*/true);
-    break;
-  }
-  return arith::ConstantFloatOp::create(b, loc, fty, val);
-}
 
 /// Validate shared load/store_tko constraints before lowering.
 template <typename TkoOp>
@@ -962,7 +750,8 @@ struct TransferViewAccessPlan {
 /// permutation map, and in-bounds flags required by vector.transfer_read/write.
 /// 1. Cast each tile-level index to `index` and scale by the tile extent.
 /// 2. Place the scaled index into the memref-dimension slot given by dim_map.
-/// 3. Build a permutation_map that maps memref dims back to tile dims.
+/// 3. Build a permutation_map whose i-th result references memref dimension
+///    dim_map[i], so vector dim i reads/writes that tensor dimension.
 /// 4. Set inBounds[i] = true only when the tensor extent is static and evenly
 ///    divisible by the tile extent along that dimension.
 static FailureOr<TransferViewAccessPlan>
@@ -1105,15 +894,6 @@ struct ConvertBroadcast : public OpConversionPattern<cuda_tile::BroadcastOp> {
 
 /// Convert cuda_tile.cat to vector.insert_strided_slice.
 ///
-/// Source semantics (from Ops.td):
-///   `cat %lhs, %rhs dim = d : tile<...>, tile<...> -> tile<...>`
-///   Concatenates lhs and rhs along dimension `d`.  All non-concat dimensions
-///   must match.  result.shape[d] = lhs.shape[d] + rhs.shape[d].
-///
-///   cat(x, y, d)[..., i_d, ...] =
-///     x[..., i_d, ...]              if i_d < lhs.shape[d]
-///     y[..., i_d - lhs.shape[d], ...] otherwise
-///
 ///   1. Create a poison/undef vector of the result type (ub.poison) — its
 ///      elements will be fully overwritten by the two inserts.
 ///   2. vector.insert_strided_slice lhs into the result at all-zero offsets.
@@ -1172,8 +952,52 @@ struct ConvertCmpF : public OpConversionPattern<cuda_tile::CmpFOp> {
   LogicalResult
   matchAndRewrite(cuda_tile::CmpFOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto pred = mapCmpFPredicate(op.getComparisonPredicate(),
-                                 op.getComparisonOrdering());
+    FailureOr<arith::CmpFPredicate> pred = failure();
+    using CP = cuda_tile::ComparisonPredicate;
+    using CO = cuda_tile::ComparisonOrdering;
+    if (op.getComparisonOrdering() == CO::ORDERED) {
+      switch (op.getComparisonPredicate()) {
+      case CP::EQUAL:
+        pred = arith::CmpFPredicate::OEQ;
+        break;
+      case CP::NOT_EQUAL:
+        pred = arith::CmpFPredicate::ONE;
+        break;
+      case CP::LESS_THAN:
+        pred = arith::CmpFPredicate::OLT;
+        break;
+      case CP::LESS_THAN_OR_EQUAL:
+        pred = arith::CmpFPredicate::OLE;
+        break;
+      case CP::GREATER_THAN:
+        pred = arith::CmpFPredicate::OGT;
+        break;
+      case CP::GREATER_THAN_OR_EQUAL:
+        pred = arith::CmpFPredicate::OGE;
+        break;
+      }
+    } else if (op.getComparisonOrdering() == CO::UNORDERED) {
+      switch (op.getComparisonPredicate()) {
+      case CP::EQUAL:
+        pred = arith::CmpFPredicate::UEQ;
+        break;
+      case CP::NOT_EQUAL:
+        pred = arith::CmpFPredicate::UNE;
+        break;
+      case CP::LESS_THAN:
+        pred = arith::CmpFPredicate::ULT;
+        break;
+      case CP::LESS_THAN_OR_EQUAL:
+        pred = arith::CmpFPredicate::ULE;
+        break;
+      case CP::GREATER_THAN:
+        pred = arith::CmpFPredicate::UGT;
+        break;
+      case CP::GREATER_THAN_OR_EQUAL:
+        pred = arith::CmpFPredicate::UGE;
+        break;
+      }
+    }
     if (failed(pred))
       return rewriter.notifyMatchFailure(op,
                                          "unsupported cmpf predicate/ordering");
@@ -1190,8 +1014,29 @@ struct ConvertCmpI : public OpConversionPattern<cuda_tile::CmpIOp> {
   LogicalResult
   matchAndRewrite(cuda_tile::CmpIOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto pred =
-        mapCmpIPredicate(op.getComparisonPredicate(), op.getSignedness());
+    FailureOr<arith::CmpIPredicate> pred = failure();
+    using CP = cuda_tile::ComparisonPredicate;
+    bool isUnsigned = op.getSignedness() == cuda_tile::Signedness::Unsigned;
+    switch (op.getComparisonPredicate()) {
+    case CP::EQUAL:
+      pred = arith::CmpIPredicate::eq;
+      break;
+    case CP::NOT_EQUAL:
+      pred = arith::CmpIPredicate::ne;
+      break;
+    case CP::LESS_THAN:
+      pred = isUnsigned ? arith::CmpIPredicate::ult : arith::CmpIPredicate::slt;
+      break;
+    case CP::LESS_THAN_OR_EQUAL:
+      pred = isUnsigned ? arith::CmpIPredicate::ule : arith::CmpIPredicate::sle;
+      break;
+    case CP::GREATER_THAN:
+      pred = isUnsigned ? arith::CmpIPredicate::ugt : arith::CmpIPredicate::sgt;
+      break;
+    case CP::GREATER_THAN_OR_EQUAL:
+      pred = isUnsigned ? arith::CmpIPredicate::uge : arith::CmpIPredicate::sge;
+      break;
+    }
     if (failed(pred))
       return rewriter.notifyMatchFailure(
           op, "unsupported cmpi predicate/signedness");
@@ -1202,6 +1047,7 @@ struct ConvertCmpI : public OpConversionPattern<cuda_tile::CmpIOp> {
 };
 
 /// Convert cuda_tile.constant to arith/vector constants.
+///
 ///   - Scalar tiles (rank 0): Convert to scalar arith ops
 ///   - Ranked tiles: Convert to an arith.constant with a DenseElementsAttr of
 ///     the target vector type (splat values use the splat form, e.g.
@@ -1358,9 +1204,32 @@ struct ConvertExp2 : public OpConversionPattern<cuda_tile::Exp2Op> {
   }
 };
 
-using ConvertExtI =
-    ConvertFromToSignednessCastOp<cuda_tile::ExtIOp, arith::ExtSIOp,
-                                  arith::ExtUIOp>;
+/// Convert cuda_tile.exti to arith.extsi / arith.extui.
+///
+///   1. Convert the destination tile type (`to`) via the type converter.
+///   2. Dispatch to arith.extui for `signedness = unsigned`, otherwise to
+///      arith.extsi.
+struct ConvertExtI : public OpConversionPattern<cuda_tile::ExtIOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::ExtIOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto resultTy =
+        getConvertedResultTypeOrFail(op, this->getTypeConverter(), rewriter,
+                                     "cannot convert cast result type");
+    if (failed(resultTy))
+      return failure();
+
+    if (op.getSignedness() == cuda_tile::Signedness::Unsigned)
+      rewriter.replaceOpWithNewOp<arith::ExtUIOp>(op, resultTy.value(),
+                                                  adaptor.getFrom());
+    else
+      rewriter.replaceOpWithNewOp<arith::ExtSIOp>(op, resultTy.value(),
+                                                  adaptor.getFrom());
+    return success();
+  }
+};
 
 /// Convert cuda_tile.extract to vector.shape_cast + vector.transpose +
 /// vector.extract.
@@ -1477,8 +1346,12 @@ struct ConvertFma : public OpConversionPattern<cuda_tile::FmaOp> {
 };
 
 /// Convert cuda_tile.for to scf.for.
+///
 ///   - Create scf.ForOp with converted bounds and initial values.
-///     Use bounds in index space, not tile space; 
+///   - Bounds are cast to `index`. When the upper bound comes from
+///     get_index_space_shape, rescale lb/ub/step by the tile size so the loop
+///     runs in element space, then reconstruct the original tile-space IV
+///     inside the loop body with divui.
 ///   - Convert region types in old body using type converter.
 ///   - Merge old body into new body, replacing block args (induction var +
 ///     iter args).
@@ -1631,7 +1504,9 @@ using ConvertFToI = ConvertFromToSignednessCastWithRoundingOp<
     cuda_tile::RoundingMode::NEAREST_INT_TO_ZERO>;
 
 /// Convert cuda_tile.get_global to memref.get_global (+ memref.cast).
-///   1. Resolve the referenced cuda_tile.global symbol.
+///
+///   1. Resolve the referenced global symbol, accepting either cuda_tile.global
+///      or an already-converted memref.global.
 ///   2. Emit memref.get_global with the ranked memref type derived from that
 ///      global initializer.
 ///   3. Cast to the converted result type (typically memref<*xT>) so this
@@ -1642,7 +1517,26 @@ struct ConvertGetGlobal : public OpConversionPattern<cuda_tile::GetGlobalOp> {
   LogicalResult
   matchAndRewrite(cuda_tile::GetGlobalOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto rankedMemRefTy = getReferencedGlobalMemRefTypeOrFail(op, rewriter);
+    Operation *symbolOp =
+        SymbolTable::lookupNearestSymbolFrom(op, op.getNameAttr());
+    if (!symbolOp)
+      return rewriter.notifyMatchFailure(op,
+                                         "referenced global symbol not found");
+
+    FailureOr<MemRefType> rankedMemRefTy = failure();
+    if (auto cudaGlobal = dyn_cast<cuda_tile::GlobalOp>(symbolOp)) {
+      rankedMemRefTy = getGlobalMemRefTypeOrFail(cudaGlobal, rewriter, op);
+    } else if (auto memrefGlobal = dyn_cast<memref::GlobalOp>(symbolOp)) {
+      auto memrefTy = dyn_cast<MemRefType>(memrefGlobal.getType());
+      if (!memrefTy)
+        return rewriter.notifyMatchFailure(
+            op, "referenced memref.global does not have a ranked memref type");
+      rankedMemRefTy = memrefTy;
+    } else {
+      return rewriter.notifyMatchFailure(
+          op,
+          "referenced symbol is neither cuda_tile.global nor memref.global");
+    }
     if (failed(rankedMemRefTy))
       return failure();
 
@@ -1671,6 +1565,7 @@ struct ConvertGetGlobal : public OpConversionPattern<cuda_tile::GetGlobalOp> {
 };
 
 /// Convert cuda_tile.get_index_space_shape.
+///
 /// For
 /// partition_view<tile=(T0xT1x...), tensor_view<?x?x...>, dim_map=[d0,d1,...]>
 /// index_space_shape[i] = ceildiv(tensor_shape[dimMap[i]], tileShape[i]).
@@ -1801,6 +1696,7 @@ using ConvertGetTileBlockId =
     ConvertDimQueryOp<cuda_tile::GetTileBlockIdOp, gpu::BlockIdOp>;
 
 /// Convert cuda_tile.global to memref.global.
+///
 ///   1. Derive a ranked static memref type from the initializer shape/element.
 ///   2. Emit memref.global with the same symbol name and initial value.
 ///   3. Preserve alignment when non-zero; omit it otherwise.
@@ -1817,9 +1713,37 @@ struct ConvertGlobal : public OpConversionPattern<cuda_tile::GlobalOp> {
     if (failed(memrefTy))
       return failure();
 
-    auto initAttr = getGlobalInitializerAttrOrFail(op, rewriter, op);
-    if (failed(initAttr))
-      return failure();
+    auto initAttr = dyn_cast<ElementsAttr>(op.getValue());
+    if (!initAttr)
+      return rewriter.notifyMatchFailure(
+          op, "global initializer must be an elements attribute");
+
+    auto initTy = dyn_cast<ShapedType>(initAttr.getType());
+    if (!initTy || !initTy.hasStaticShape())
+      return rewriter.notifyMatchFailure(
+          op, "global initializer must be a statically shaped elements "
+              "attribute");
+
+    auto tensorTy =
+        RankedTensorType::get(initTy.getShape(), initTy.getElementType());
+    ElementsAttr normalizedInitAttr = initAttr;
+    if (initAttr.getType() != tensorTy) {
+      auto denseAttr = dyn_cast<DenseElementsAttr>(initAttr);
+      if (!denseAttr)
+        return rewriter.notifyMatchFailure(
+            op, "global initializer must be a dense elements attribute when "
+                "retyping is required");
+
+      if (denseAttr.isSplat()) {
+        normalizedInitAttr = ElementsAttr(DenseElementsAttr::get(
+            tensorTy, denseAttr.getSplatValue<Attribute>()));
+      } else {
+        SmallVector<Attribute> values(denseAttr.getValues<Attribute>().begin(),
+                                      denseAttr.getValues<Attribute>().end());
+        normalizedInitAttr =
+            ElementsAttr(DenseElementsAttr::get(tensorTy, values));
+      }
+    }
 
     IntegerAttr alignmentAttr;
     if (op.getAlignment() != 0)
@@ -1827,7 +1751,7 @@ struct ConvertGlobal : public OpConversionPattern<cuda_tile::GlobalOp> {
 
     rewriter.replaceOpWithNewOp<memref::GlobalOp>(
         op, op.getSymName(), /*sym_visibility=*/StringAttr(), *memrefTy,
-        *initAttr, /*constant=*/false, alignmentAttr);
+        normalizedInitAttr, /*constant=*/false, alignmentAttr);
     return success();
   }
 };
@@ -1872,6 +1796,7 @@ struct ConvertIf : public OpConversionPattern<cuda_tile::IfOp> {
 };
 
 /// Convert cuda_tile.iota to vector.step + arith.index_castui.
+///
 ///   1. Emit vector.step : vector<nxindex> to materialize [0..n-1].
 ///   2. Convert lanes to the destination integer element type with
 ///      arith.index_castui to preserve unsigned interpretation.
@@ -1947,8 +1872,34 @@ struct ConvertLoadViewTko
     if (failed(plan))
       return failure();
 
-    Value padding = makePaddingValue(rewriter, loc, vecTy->getElementType(),
-                                     plan->pvInfo.paddingValue);
+    Value padding;
+    if (!plan->pvInfo.paddingValue) {
+      padding = ub::PoisonOp::create(rewriter, loc, vecTy->getElementType());
+    } else if (auto fty = dyn_cast<FloatType>(vecTy->getElementType())) {
+      const llvm::fltSemantics &sem = fty.getFloatSemantics();
+      APFloat val = APFloat::getZero(sem, /*Negative=*/false);
+      switch (plan->pvInfo.paddingValue.getValue()) {
+      case cuda_tile::PaddingValue::zero:
+        val = APFloat::getZero(sem, /*Negative=*/false);
+        break;
+      case cuda_tile::PaddingValue::neg_zero:
+        val = APFloat::getZero(sem, /*Negative=*/true);
+        break;
+      case cuda_tile::PaddingValue::nan:
+        val = APFloat::getNaN(sem);
+        break;
+      case cuda_tile::PaddingValue::pos_inf:
+        val = APFloat::getInf(sem, /*Negative=*/false);
+        break;
+      case cuda_tile::PaddingValue::neg_inf:
+        val = APFloat::getInf(sem, /*Negative=*/true);
+        break;
+      }
+      padding = arith::ConstantFloatOp::create(rewriter, loc, fty, val);
+    } else {
+      padding = arith::ConstantIntOp::create(rewriter, loc,
+                                             vecTy->getElementType(), 0);
+    }
     auto readOp = vector::TransferReadOp::create(
         rewriter, loc, *vecTy, plan->pvInfo.memref, plan->memrefIndices,
         AffineMapAttr::get(plan->permutationMap), padding,
@@ -1964,13 +1915,10 @@ using ConvertLog = ConvertUnarySourceOp<cuda_tile::LogOp, math::LogOp>;
 
 using ConvertLog2 = ConvertUnarySourceOp<cuda_tile::Log2Op, math::Log2Op>;
 
-//===----------------------------------------------------------------------===//
-// View construction: make_tensor_view / make_partition_view
-//===----------------------------------------------------------------------===//
-
-/// Convert cuda_tile.make_partition_view: the partition_view type maps to the
-/// same ranked memref as its underlying tensor_view, so this pattern just
-/// forwards the already-converted memref.
+/// Convert cuda_tile.make_partition_view
+///
+/// The partition_view type maps to the same ranked memref as its underlying
+/// tensor_view, so this pattern just forwards the already-converted memref.
 struct ConvertMakePartitionView
     : public OpConversionPattern<cuda_tile::MakePartitionViewOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -2062,10 +2010,6 @@ using ConvertMinI = ConvertMinMaxIOp<cuda_tile::MinIOp, /*IsMax=*/false>;
 
 /// Convert cuda_tile.mmaf to vector.contract (matmul-style contraction).
 ///
-/// Source-op semantics (from cuda_tile.mmaf verifier):
-///   Unbatched: lhs[M,K] x rhs[K,N] + acc[M,N] -> result[M,N]
-///   Batched:   lhs[B,M,K] x rhs[B,K,N] + acc[B,M,N] -> result[B,M,N]
-///
 ///   1. Convert result tile type to a vector type
 ///   2. Build affine indexing maps and iterator types depending on the rank.
 ///      - Unbatched (3 iterators, d0=m, d1=n, d2=k):
@@ -2101,10 +2045,6 @@ struct ConvertMmaF : public OpConversionPattern<cuda_tile::MmaFOp> {
 };
 
 /// Convert cuda_tile.mmai to vector.contract (matmul-style contraction).
-///
-/// Source-op semantics (from cuda_tile.mmai verifier):
-///   Unbatched: lhs[M,K] x rhs[K,N] + acc[M,N] -> result[M,N]
-///   Batched:   lhs[B,M,K] x rhs[B,K,N] + acc[B,M,N] -> result[B,M,N]
 ///
 /// Lowering mirrors mmaf and uses the same indexing-map / iterator builder.
 /// The only semantic difference here is element type domain (integer).
@@ -2234,8 +2174,7 @@ struct ConvertPow : public OpConversionPattern<cuda_tile::PowOp> {
 
 /// Convert cuda_tile.ptr_to_ptr using memref.cast when representable.
 ///
-/// Pointer model in this pass:
-///   tile<ptr<T>> -> memref<*xT>
+/// Pointer model in this pass: tile<ptr<T>> -> memref<*xT>
 ///
 ///   1. Convert the result pointer tile type to a memref type.
 ///   2. Recover the converted memref source when the adaptor provides a
@@ -2296,8 +2235,8 @@ struct ConvertReduce : public OpConversionPattern<cuda_tile::ReduceOp> {
   LogicalResult
   matchAndRewrite(cuda_tile::ReduceOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto pre = matchSingleOperandCombiningOp(op, adaptor.getOperands(),
-                                             rewriter, "reduce");
+    auto pre =
+        matchSingleOperandCombiningOp(op, adaptor.getOperands(), rewriter);
     if (failed(pre))
       return failure();
     auto [kind, source, srcVecTy, identityAttr] = *pre;
@@ -2347,6 +2286,7 @@ using ConvertRemI =
 
 /// Convert cuda_tile.reshape to vector.shape_cast / vector.broadcast /
 /// vector.extract depending on source/result ranks.
+//
 ///   - vector -> vector: vector.shape_cast
 ///   - scalar -> vector: vector.broadcast (scalar to single-element vector)
 ///   - vector -> scalar: vector.extract at [0,...,0]
@@ -2424,8 +2364,8 @@ struct ConvertScan : public OpConversionPattern<cuda_tile::ScanOp> {
       return rewriter.notifyMatchFailure(
           op, "reverse scan is not representable in vector.scan");
 
-    auto pre = matchSingleOperandCombiningOp(op, adaptor.getOperands(),
-                                             rewriter, "scan");
+    auto pre =
+        matchSingleOperandCombiningOp(op, adaptor.getOperands(), rewriter);
     if (failed(pre))
       return failure();
     auto [kind, source, srcVecTy, identityAttr] = *pre;
