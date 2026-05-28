@@ -1,6 +1,6 @@
 # CudaTileToGPU
 
-Conversion pass and tooling for lowering CudaTile IR to MLIR GPU/vector/scf/arith/memref dialects.
+Conversion pass and tooling for lowering CudaTile IR to MLIR GPU/vector/scf/arith/math/memref dialects.
 
 ## Prerequisites
 
@@ -8,7 +8,11 @@ Conversion pass and tooling for lowering CudaTile IR to MLIR GPU/vector/scf/arit
 - A C++17 compiler
 - Ninja (recommended)
 - An LLVM/MLIR build with CMake package config files (`MLIRConfig.cmake`)
-- A `cuda-tile` build with the above LLVM/MLIR build (see https://github.com/intel/cuda-tile)
+- A `cuda-tile` build produced with that same LLVM/MLIR version
+
+The LLVM/MLIR version must match the one used by your `cuda-tile`.
+See `cuda-tile`'s `README.md` and its `cmake/IncludeLLVM.cmake` to find the
+LLVM version it expects.
 
 This project requires `CUDA_TILE_DIR` at configure time.
 
@@ -25,8 +29,9 @@ cmake -S . -B build -G Ninja \
 Notes:
 
 - `CUDA_TILE_DIR` must point to the root of the `cuda-tile` project (the directory that contains `include/` and `build/`).
+- `MLIR_DIR` must point to the same LLVM/MLIR build that was used to build `cuda-tile`; mixing different LLVM revisions is not supported.
 - If your setup needs it, you can also pass `-DLLVM_DIR=/path/to/llvm-project/build/lib/cmake/llvm`.
-- `test/Conversion/CudaTileToGPU/examples_cudatile_appendix.mlir` includes a gemm example
+- `test/Conversion/CudaTileToGPU/cudatile-appendix.mlir` includes a gemm example.
 
 ## Build
 
@@ -73,5 +78,5 @@ build/tools/cudatile-to-gpu --convert-cuda-tile-to-gpu test/Conversion/CudaTileT
 Example: convert the appendix example and run canonical cleanup passes:
 
 ```bash
-build/tools/cudatile-to-gpu --convert-cuda-tile-to-gpu test/Conversion/CudaTileToGPU/examples_cudatile_appendix.mlir | mlir-opt --loop-invariant-code-motion -cse -canonicalize -cse
+build/tools/cudatile-to-gpu --convert-cuda-tile-to-gpu test/Conversion/CudaTileToGPU/cudatile-appendix.mlir | mlir-opt --loop-invariant-code-motion -cse -canonicalize -cse
 ```
