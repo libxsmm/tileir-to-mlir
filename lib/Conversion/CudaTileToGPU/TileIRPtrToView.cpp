@@ -81,6 +81,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/RegionUtils.h"
 
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
 
@@ -109,6 +110,38 @@ static Value lookThroughAssume(Value v) {
 static bool isScalarTile(Type t) {
   auto tt = dyn_cast<TileType>(t);
   return tt && tt.getShape().empty();
+}
+
+/// Forward, at the builder's current insertion point, any `assume` predicates
+/// that the *source* IR attached to `scalar`, re-emitting them on top of
+/// `scalar`.  This preserves alignment/bounds metadata (e.g. `div_by`) that
+/// Triton placed on base pointers and shape/stride scalars so it survives onto
+/// the rewritten view operands.  Nothing is fabricated: only predicates found
+/// on existing `assume` users of `scalar` are forwarded.  Chains of `assume`
+/// ops (`assume` of an `assume`) are followed transitively, since each link is
+/// a value-preserving passthrough and therefore decorates the same scalar.
+/// The original (now-dead) `assume` ops are cleaned up later by DCE.
+static Value forwardSourceAssumes(OpBuilder &b, Location loc, Value scalar) {
+  SmallVector<AssumePredicateAttrInterface> preds;
+  SmallVector<Value> work{scalar};
+  SmallPtrSet<Value, 4> seen;
+  while (!work.empty()) {
+    Value v = work.pop_back_val();
+    for (Operation *user : v.getUsers()) {
+      auto a = dyn_cast<AssumeOp>(user);
+      if (!a || a.getValue() != v)
+        continue;
+      AssumePredicateAttrInterface p = a.getPredicateAttr();
+      if (!llvm::is_contained(preds, p))
+        preds.push_back(p);
+      if (seen.insert(a.getResult()).second)
+        work.push_back(a.getResult());
+    }
+  }
+  Value result = scalar;
+  for (AssumePredicateAttrInterface p : preds)
+    result = AssumeOp::create(b, loc, result, p).getResult();
+  return result;
 }
 
 /// Strip a chain of `broadcast` and `reshape` ops applied to a scalar tile,
@@ -660,8 +693,19 @@ static LogicalResult lowerAccess(OpBuilder &b, Location loc, Value ptr,
   if (failed(buildViews(b, loc, access, elemTy, padding, bv)))
     return failure();
 
-  auto tvOp = MakeTensorViewOp::create(b, loc, bv.tvTy, access.base,
-                                       bv.dynamicShape, bv.dynamicStride);
+  // Forward any `assume` metadata the source attached to the operands we reuse
+  // (base pointer, dynamic shape/stride scalars) onto the rewritten view.
+  Value base = forwardSourceAssumes(b, loc, access.base);
+  SmallVector<Value> dynShape, dynStride;
+  dynShape.reserve(bv.dynamicShape.size());
+  dynStride.reserve(bv.dynamicStride.size());
+  for (Value v : bv.dynamicShape)
+    dynShape.push_back(forwardSourceAssumes(b, loc, v));
+  for (Value v : bv.dynamicStride)
+    dynStride.push_back(forwardSourceAssumes(b, loc, v));
+
+  auto tvOp =
+      MakeTensorViewOp::create(b, loc, bv.tvTy, base, dynShape, dynStride);
   auto pvOp = MakePartitionViewOp::create(b, loc, bv.pvTy, tvOp.getResult());
   outView = pvOp.getResult();
   outIndices.assign(bv.indices.begin(), bv.indices.end());

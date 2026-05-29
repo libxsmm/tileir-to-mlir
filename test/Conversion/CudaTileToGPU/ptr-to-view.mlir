@@ -301,5 +301,95 @@ module {
       return
     }
 
+    // `assume` metadata that the source attached to operands the rewrite
+    // re-uses (the base pointer and the shape/stride scalars) must be forwarded
+    // onto the new make_tensor_view operands.  Here the base carries div_by<16>
+    // and the shape carries a *chain* of assumes (div_by<8> then bounded),
+    // which must be forwarded transitively and in order.
+    // CHECK-LABEL: entry @forward_assume_1d
+    entry @forward_assume_1d(%arg0: tile<ptr<f32>>, %arg1: tile<i32>) {
+      %cst_1024 = constant <i32: 1024> : tile<i32>
+      %a_base = assume #cuda_tile.div_by<16>, %arg0 : tile<ptr<f32>>
+      %a_shape0 = assume #cuda_tile.div_by<8>, %arg1 : tile<i32>
+      %a_shape1 = assume #cuda_tile.bounded<0, ?>, %a_shape0 : tile<i32>
+      %block_id_x, %block_id_y, %block_id_z = get_tile_block_id : tile<i32>
+      %start = muli %block_id_x, %cst_1024 : tile<i32>
+      %lane = iota : tile<1024xi32>
+      %start_1d = reshape %start : tile<i32> -> tile<1xi32>
+      %start_bc = broadcast %start_1d : tile<1xi32> -> tile<1024xi32>
+      %index = addi %start_bc, %lane : tile<1024xi32>
+      %shape_1d = reshape %a_shape1 : tile<i32> -> tile<1xi32>
+      %shape_bc = broadcast %shape_1d : tile<1xi32> -> tile<1024xi32>
+      %mask = cmpi less_than %index, %shape_bc, signed : tile<1024xi32> -> tile<1024xi1>
+      %base_1d = reshape %a_base : tile<ptr<f32>> -> tile<1xptr<f32>>
+      %base_bc = broadcast %base_1d : tile<1xptr<f32>> -> tile<1024xptr<f32>>
+      %ptr = offset %base_bc, %index : tile<1024xptr<f32>>, tile<1024xi32> -> tile<1024xptr<f32>>
+      // CHECK: %[[AB:.*]] = assume div_by<16>, %arg0 : tile<ptr<f32>>
+      // CHECK: %[[AS0:.*]] = assume div_by<8>, %arg1 : tile<i32>
+      // CHECK: %[[AS1:.*]] = assume bounded<0, ?>, %[[AS0]] : tile<i32>
+      // CHECK: %[[TVF:.*]] = make_tensor_view %[[AB]], shape = [%[[AS1]]], strides = [1] : tile<i32> -> tensor_view<?xf32, strides=[1]>
+      // CHECK: %[[PVF:.*]] = make_partition_view %[[TVF]] : partition_view<tile=(1024), padding_value = zero, tensor_view<?xf32, strides=[1]>>
+      // CHECK: load_view_tko weak %[[PVF]][%{{.*}}]
+      %tile, %token = load_ptr_tko weak %ptr, %mask : tile<1024xptr<f32>>, tile<1024xi1> -> tile<1024xf32>, token
+      return
+    }
+
+    // Forwarding is *selective*: only operands the source actually annotated
+    // get an assume.  Here the base (div_by<16>) and the stride (div_by<8>) are
+    // annotated, but the two shape scalars are not, so they must appear bare in
+    // the make_tensor_view.
+    // CHECK-LABEL: entry @forward_assume_2d
+    entry @forward_assume_2d(%arg0: tile<ptr<f16>>, %arg1: tile<i32>, %arg2: tile<i32>, %arg3: tile<i32>) {
+      %cst_128 = constant <i32: 128> : tile<i32>
+      %cst_64 = constant <i32: 64> : tile<i32>
+      %value = constant <f16: 0.000000e+00> : tile<128x64xf16>
+      %a_base = assume #cuda_tile.div_by<16>, %arg0 : tile<ptr<f16>>
+      %a_stride = assume #cuda_tile.div_by<8>, %arg3 : tile<i32>
+      %block_id_x, %block_id_y, %block_id_z = get_tile_block_id : tile<i32>
+      %row_start = muli %block_id_x, %cst_128 : tile<i32>
+      %col_start = muli %block_id_y, %cst_64 : tile<i32>
+      %row_lane = iota : tile<128xi32>
+      %col_lane = iota : tile<64xi32>
+      %row_start_1d = reshape %row_start : tile<i32> -> tile<1xi32>
+      %row_start_bc = broadcast %row_start_1d : tile<1xi32> -> tile<128xi32>
+      %rows = addi %row_start_bc, %row_lane : tile<128xi32>
+      %col_start_1d = reshape %col_start : tile<i32> -> tile<1xi32>
+      %col_start_bc = broadcast %col_start_1d : tile<1xi32> -> tile<64xi32>
+      %cols = addi %col_start_bc, %col_lane : tile<64xi32>
+      %rows_2d = reshape %rows : tile<128xi32> -> tile<128x1xi32>
+      %cols_2d = reshape %cols : tile<64xi32> -> tile<1x64xi32>
+      %stride_2d = reshape %a_stride : tile<i32> -> tile<1x1xi32>
+      %stride_bc = broadcast %stride_2d : tile<1x1xi32> -> tile<128x1xi32>
+      %linear_rows = muli %rows_2d, %stride_bc : tile<128x1xi32>
+      %base_2d = reshape %a_base : tile<ptr<f16>> -> tile<1x1xptr<f16>>
+      %base_row_bc = broadcast %base_2d : tile<1x1xptr<f16>> -> tile<128x1xptr<f16>>
+      %row_ptr = offset %base_row_bc, %linear_rows : tile<128x1xptr<f16>>, tile<128x1xi32> -> tile<128x1xptr<f16>>
+      %base_col_bc = broadcast %row_ptr : tile<128x1xptr<f16>> -> tile<128x64xptr<f16>>
+      %col_bc = broadcast %cols_2d : tile<1x64xi32> -> tile<128x64xi32>
+      %ptr = offset %base_col_bc, %col_bc : tile<128x64xptr<f16>>, tile<128x64xi32> -> tile<128x64xptr<f16>>
+      %shape_m = reshape %arg1 : tile<i32> -> tile<1x1xi32>
+      %shape_m_bc = broadcast %shape_m : tile<1x1xi32> -> tile<128x1xi32>
+      %row_mask = cmpi less_than %rows_2d, %shape_m_bc, signed : tile<128x1xi32> -> tile<128x1xi1>
+      %shape_n = reshape %arg2 : tile<i32> -> tile<1x1xi32>
+      %shape_n_bc = broadcast %shape_n : tile<1x1xi32> -> tile<1x64xi32>
+      %col_mask = cmpi less_than %cols_2d, %shape_n_bc, signed : tile<1x64xi32> -> tile<1x64xi1>
+      %row_mask_bc = broadcast %row_mask : tile<128x1xi1> -> tile<128x64xi1>
+      %col_mask_bc = broadcast %col_mask : tile<1x64xi1> -> tile<128x64xi1>
+      %row_mask_i16 = exti %row_mask_bc signed : tile<128x64xi1> -> tile<128x64xi16>
+      %col_mask_i16 = exti %col_mask_bc signed : tile<128x64xi1> -> tile<128x64xi16>
+      %mask_i16 = andi %row_mask_i16, %col_mask_i16 : tile<128x64xi16>
+      %mask = trunci %mask_i16 : tile<128x64xi16> -> tile<128x64xi1>
+      // CHECK: %[[AB2:.*]] = assume div_by<16>, %arg0 : tile<ptr<f16>>
+      // CHECK: %[[AST2:.*]] = assume div_by<8>, %arg3 : tile<i32>
+      // CHECK: %[[TVF2:.*]] = make_tensor_view %[[AB2]], shape = [%arg1, %arg2], strides = [%[[AST2]], 1] : tile<i32> -> tensor_view<?x?xf16, strides=[?,1]>
+      // CHECK: make_partition_view %[[TVF2]]
+      // CHECK: store_view_tko weak
+      // The unannotated shape scalars must not gain a fabricated assume.
+      // CHECK-NOT: assume {{.*}}, %arg1
+      // CHECK-NOT: assume {{.*}}, %arg2
+      %token = store_ptr_tko weak %ptr, %value, %mask : tile<128x64xptr<f16>>, tile<128x64xf16>, tile<128x64xi1> -> token
+      return
+    }
+
   }
 }
