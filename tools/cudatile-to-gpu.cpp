@@ -6,6 +6,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Conversion/CudaTileToGPU/CudaTileToGPU.h"
+#include "mlir/Conversion/CudaTileToGPU/TileIRPtrToView.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -35,6 +36,9 @@ int main(int argc, char **argv) {
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return mlir::createConvertTileIRToGPUPass();
   });
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::createTileIRPtrToViewPass();
+  });
 
   mlir::registerTransformsPasses();
 
@@ -49,13 +53,13 @@ int main(int argc, char **argv) {
   }
 
   std::vector<const char *> newArgv(argv, argv + argc);
-  if (!hasPassFlag) {
-    newArgv.push_back("--pass-pipeline=builtin.module("
-                      "convert-cuda-tile-to-gpu,"
-                      "loop-invariant-code-motion,"
-                      "canonicalize,"
-                      "cse)");
-  }
+  // if (!hasPassFlag) {
+  //   newArgv.push_back("--pass-pipeline=builtin.module("
+  //                     "convert-cuda-tile-to-gpu,"
+  //                     "loop-invariant-code-motion,"
+  //                     "canonicalize,"
+  //                     "cse)");
+  // }
   int newArgc = static_cast<int>(newArgv.size());
 
   return mlir::asMainReturnCode(

@@ -1,0 +1,228 @@
+// RUN: cudatile-to-gpu --tileir-ptr-to-view %s | FileCheck %s
+// RUN: cudatile-to-gpu --tileir-ptr-to-view --convert-cuda-tile-to-gpu %s | FileCheck %s --check-prefix=CHECK-GPU
+
+// CHECK-GPU-LABEL: gpu.module @cuda_tile_module {
+
+module {
+  cuda_tile.module @cuda_tile_module {
+
+    // CHECK-LABEL: entry @load_1d
+    // CHECK-GPU-LABEL: gpu.func @load_1d
+    entry @load_1d(%arg0: tile<ptr<f32>>, %arg1: tile<i32>) {
+      %cst_1024 = constant <i32: 1024> : tile<i32>
+      %block_id_x, %block_id_y, %block_id_z = get_tile_block_id : tile<i32>
+      %start = muli %block_id_x, %cst_1024 : tile<i32>
+      %lane = iota : tile<1024xi32>
+      %start_1d = reshape %start : tile<i32> -> tile<1xi32>
+      %start_bc = broadcast %start_1d : tile<1xi32> -> tile<1024xi32>
+      %index = addi %start_bc, %lane : tile<1024xi32>
+      %shape_1d = reshape %arg1 : tile<i32> -> tile<1xi32>
+      %shape_bc = broadcast %shape_1d : tile<1xi32> -> tile<1024xi32>
+      %mask = cmpi less_than %index, %shape_bc, signed : tile<1024xi32> -> tile<1024xi1>
+      %base_1d = reshape %arg0 : tile<ptr<f32>> -> tile<1xptr<f32>>
+      %base_bc = broadcast %base_1d : tile<1xptr<f32>> -> tile<1024xptr<f32>>
+      %ptr = offset %base_bc, %index : tile<1024xptr<f32>>, tile<1024xi32> -> tile<1024xptr<f32>>
+      // CHECK: %[[TV0:.*]] = make_tensor_view %arg0, shape = [%arg1], strides = [1] : tile<i32> -> tensor_view<?xf32, strides=[1]>
+      // CHECK: %[[PV0:.*]] = make_partition_view %[[TV0]] : partition_view<tile=(1024), padding_value = zero, tensor_view<?xf32, strides=[1]>>
+      // CHECK: %[[LD0:.*]], %[[TOK0:.*]] = load_view_tko weak %[[PV0]][%{{.*}}] : partition_view<tile=(1024), padding_value = zero, tensor_view<?xf32, strides=[1]>>, tile<i32> -> tile<1024xf32>, token
+      // CHECK-GPU: %[[LOAD1D_VIEW:.*]] = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%{{.*}}], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1]>>
+      // CHECK-GPU: %[[LOAD1D_TILE:.*]] = vector.transfer_read %[[LOAD1D_VIEW]][%{{.*}}], %{{.*}} : memref<?xf32, strided<[1]>>, vector<1024xf32>
+      %tile, %token = load_ptr_tko weak %ptr, %mask : tile<1024xptr<f32>>, tile<1024xi1> -> tile<1024xf32>, token
+      return
+    }
+
+    // CHECK-LABEL: entry @store_1d
+    // CHECK-GPU-LABEL: gpu.func @store_1d
+    entry @store_1d(%arg0: tile<ptr<f32>>, %arg1: tile<i32>) {
+      %cst_1024 = constant <i32: 1024> : tile<i32>
+      %value = constant <f32: 1.000000e+00> : tile<1024xf32>
+      %block_id_x, %block_id_y, %block_id_z = get_tile_block_id : tile<i32>
+      %start = muli %block_id_x, %cst_1024 : tile<i32>
+      %lane = iota : tile<1024xi32>
+      %start_1d = reshape %start : tile<i32> -> tile<1xi32>
+      %start_bc = broadcast %start_1d : tile<1xi32> -> tile<1024xi32>
+      %index = addi %start_bc, %lane : tile<1024xi32>
+      %shape_1d = reshape %arg1 : tile<i32> -> tile<1xi32>
+      %shape_bc = broadcast %shape_1d : tile<1xi32> -> tile<1024xi32>
+      %mask = cmpi less_than %index, %shape_bc, signed : tile<1024xi32> -> tile<1024xi1>
+      %base_1d = reshape %arg0 : tile<ptr<f32>> -> tile<1xptr<f32>>
+      %base_bc = broadcast %base_1d : tile<1xptr<f32>> -> tile<1024xptr<f32>>
+      %ptr = offset %base_bc, %index : tile<1024xptr<f32>>, tile<1024xi32> -> tile<1024xptr<f32>>
+      // CHECK: %[[TV1:.*]] = make_tensor_view %arg0, shape = [%arg1], strides = [1] : tile<i32> -> tensor_view<?xf32, strides=[1]>
+      // CHECK: %[[PV1:.*]] = make_partition_view %[[TV1]] : partition_view<tile=(1024), padding_value = zero, tensor_view<?xf32, strides=[1]>>
+      // CHECK: %[[ST1:.*]] = store_view_tko weak %{{.*}}, %[[PV1]][%{{.*}}] : tile<1024xf32>, partition_view<tile=(1024), padding_value = zero, tensor_view<?xf32, strides=[1]>>, tile<i32> -> token
+      // CHECK-GPU: %[[STORE1D_VIEW:.*]] = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%{{.*}}], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1]>>
+      // CHECK-GPU: vector.transfer_write %{{.*}}, %[[STORE1D_VIEW]][%{{.*}}] : vector<1024xf32>, memref<?xf32, strided<[1]>>
+      %token = store_ptr_tko weak %ptr, %value, %mask : tile<1024xptr<f32>>, tile<1024xf32>, tile<1024xi1> -> token
+      return
+    }
+
+    // CHECK-LABEL: entry @store_2d
+    // CHECK-GPU-LABEL: gpu.func @store_2d
+    entry @store_2d(%arg0: tile<ptr<f16>>, %arg1: tile<i32>, %arg2: tile<i32>, %arg3: tile<i32>) {
+      %cst_128 = constant <i32: 128> : tile<i32>
+      %cst_64 = constant <i32: 64> : tile<i32>
+      %value = constant <f16: 0.000000e+00> : tile<128x64xf16>
+      %block_id_x, %block_id_y, %block_id_z = get_tile_block_id : tile<i32>
+      %row_start = muli %block_id_x, %cst_128 : tile<i32>
+      %col_start = muli %block_id_y, %cst_64 : tile<i32>
+      %row_lane = iota : tile<128xi32>
+      %col_lane = iota : tile<64xi32>
+      %row_start_1d = reshape %row_start : tile<i32> -> tile<1xi32>
+      %row_start_bc = broadcast %row_start_1d : tile<1xi32> -> tile<128xi32>
+      %rows = addi %row_start_bc, %row_lane : tile<128xi32>
+      %col_start_1d = reshape %col_start : tile<i32> -> tile<1xi32>
+      %col_start_bc = broadcast %col_start_1d : tile<1xi32> -> tile<64xi32>
+      %cols = addi %col_start_bc, %col_lane : tile<64xi32>
+      %rows_2d = reshape %rows : tile<128xi32> -> tile<128x1xi32>
+      %cols_2d = reshape %cols : tile<64xi32> -> tile<1x64xi32>
+      %stride_2d = reshape %arg3 : tile<i32> -> tile<1x1xi32>
+      %stride_bc = broadcast %stride_2d : tile<1x1xi32> -> tile<128x1xi32>
+      %linear_rows = muli %rows_2d, %stride_bc : tile<128x1xi32>
+      %base_2d = reshape %arg0 : tile<ptr<f16>> -> tile<1x1xptr<f16>>
+      %base_row_bc = broadcast %base_2d : tile<1x1xptr<f16>> -> tile<128x1xptr<f16>>
+      %row_ptr = offset %base_row_bc, %linear_rows : tile<128x1xptr<f16>>, tile<128x1xi32> -> tile<128x1xptr<f16>>
+      %base_col_bc = broadcast %row_ptr : tile<128x1xptr<f16>> -> tile<128x64xptr<f16>>
+      %col_bc = broadcast %cols_2d : tile<1x64xi32> -> tile<128x64xi32>
+      %ptr = offset %base_col_bc, %col_bc : tile<128x64xptr<f16>>, tile<128x64xi32> -> tile<128x64xptr<f16>>
+      %shape_m = reshape %arg1 : tile<i32> -> tile<1x1xi32>
+      %shape_m_bc = broadcast %shape_m : tile<1x1xi32> -> tile<128x1xi32>
+      %row_mask = cmpi less_than %rows_2d, %shape_m_bc, signed : tile<128x1xi32> -> tile<128x1xi1>
+      %shape_n = reshape %arg2 : tile<i32> -> tile<1x1xi32>
+      %shape_n_bc = broadcast %shape_n : tile<1x1xi32> -> tile<1x64xi32>
+      %col_mask = cmpi less_than %cols_2d, %shape_n_bc, signed : tile<1x64xi32> -> tile<1x64xi1>
+      %row_mask_bc = broadcast %row_mask : tile<128x1xi1> -> tile<128x64xi1>
+      %col_mask_bc = broadcast %col_mask : tile<1x64xi1> -> tile<128x64xi1>
+      %row_mask_i16 = exti %row_mask_bc signed : tile<128x64xi1> -> tile<128x64xi16>
+      %col_mask_i16 = exti %col_mask_bc signed : tile<128x64xi1> -> tile<128x64xi16>
+      %mask_i16 = andi %row_mask_i16, %col_mask_i16 : tile<128x64xi16>
+      %mask = trunci %mask_i16 : tile<128x64xi16> -> tile<128x64xi1>
+      // CHECK: %[[TV2:.*]] = make_tensor_view %arg0, shape = [%arg1, %arg2], strides = [%arg3, 1] : tile<i32> -> tensor_view<?x?xf16, strides=[?,1]>
+      // CHECK: %[[PV2:.*]] = make_partition_view %[[TV2]] : partition_view<tile=(128x64), padding_value = zero, tensor_view<?x?xf16, strides=[?,1]>>
+      // CHECK: %[[ST2:.*]] = store_view_tko weak %{{.*}}, %[[PV2]][%{{.*}}, %{{.*}}] : tile<128x64xf16>, partition_view<tile=(128x64), padding_value = zero, tensor_view<?x?xf16, strides=[?,1]>>, tile<i32> -> token
+      // CHECK-GPU: %[[STORE2D_VIEW:.*]] = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%{{.*}}, %{{.*}}], strides: [%{{.*}}, 1] : memref<*xf16> to memref<?x?xf16, strided<[?, 1]>>
+      // CHECK-GPU: vector.transfer_write %{{.*}}, %[[STORE2D_VIEW]][%{{.*}}, %{{.*}}] : vector<128x64xf16>, memref<?x?xf16, strided<[?, 1]>>
+      %token = store_ptr_tko weak %ptr, %value, %mask : tile<128x64xptr<f16>>, tile<128x64xf16>, tile<128x64xi1> -> token
+      return
+    }
+
+    // CHECK-LABEL: entry @k_zero
+    entry @k_zero(%arg0: tile<ptr<f32>>, %arg1: tile<i32>) {
+      %cst_1024 = constant <i32: 1024> : tile<i32>
+      %pad = constant <f32: 0.000000e+00> : tile<1024xf32>
+      %block_id_x, %block_id_y, %block_id_z = get_tile_block_id : tile<i32>
+      %start = muli %block_id_x, %cst_1024 : tile<i32>
+      %lane = iota : tile<1024xi32>
+      %start_1d = reshape %start : tile<i32> -> tile<1xi32>
+      %start_bc = broadcast %start_1d : tile<1xi32> -> tile<1024xi32>
+      %index = addi %start_bc, %lane : tile<1024xi32>
+      %shape_1d = reshape %arg1 : tile<i32> -> tile<1xi32>
+      %shape_bc = broadcast %shape_1d : tile<1xi32> -> tile<1024xi32>
+      %mask = cmpi less_than %index, %shape_bc, signed : tile<1024xi32> -> tile<1024xi1>
+      %base_1d = reshape %arg0 : tile<ptr<f32>> -> tile<1xptr<f32>>
+      %base_bc = broadcast %base_1d : tile<1xptr<f32>> -> tile<1024xptr<f32>>
+      %ptr = offset %base_bc, %index : tile<1024xptr<f32>>, tile<1024xi32> -> tile<1024xptr<f32>>
+      // CHECK: %[[TVZ:.*]] = make_tensor_view %arg0, shape = [%arg1], strides = [1] : tile<i32> -> tensor_view<?xf32, strides=[1]>
+      // CHECK: %[[PVZ:.*]] = make_partition_view %[[TVZ]] : partition_view<tile=(1024), padding_value = zero, tensor_view<?xf32, strides=[1]>>
+      // CHECK: %[[LDZ:.*]], %[[TOKZ:.*]] = load_view_tko weak %[[PVZ]][%{{.*}}] : partition_view<tile=(1024), padding_value = zero, tensor_view<?xf32, strides=[1]>>, tile<i32> -> tile<1024xf32>, token
+      %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<1024xptr<f32>>, tile<1024xi1>, tile<1024xf32> -> tile<1024xf32>, token
+      return
+    }
+
+    // CHECK-LABEL: entry @k_neg_zero
+    entry @k_neg_zero(%arg0: tile<ptr<f32>>, %arg1: tile<i32>) {
+      %cst_1024 = constant <i32: 1024> : tile<i32>
+      %pad = constant <f32: -0.000000e+00> : tile<1024xf32>
+      %block_id_x, %block_id_y, %block_id_z = get_tile_block_id : tile<i32>
+      %start = muli %block_id_x, %cst_1024 : tile<i32>
+      %lane = iota : tile<1024xi32>
+      %start_1d = reshape %start : tile<i32> -> tile<1xi32>
+      %start_bc = broadcast %start_1d : tile<1xi32> -> tile<1024xi32>
+      %index = addi %start_bc, %lane : tile<1024xi32>
+      %shape_1d = reshape %arg1 : tile<i32> -> tile<1xi32>
+      %shape_bc = broadcast %shape_1d : tile<1xi32> -> tile<1024xi32>
+      %mask = cmpi less_than %index, %shape_bc, signed : tile<1024xi32> -> tile<1024xi1>
+      %base_1d = reshape %arg0 : tile<ptr<f32>> -> tile<1xptr<f32>>
+      %base_bc = broadcast %base_1d : tile<1xptr<f32>> -> tile<1024xptr<f32>>
+      %ptr = offset %base_bc, %index : tile<1024xptr<f32>>, tile<1024xi32> -> tile<1024xptr<f32>>
+      // CHECK: %[[TVNZ:.*]] = make_tensor_view %arg0, shape = [%arg1], strides = [1] : tile<i32> -> tensor_view<?xf32, strides=[1]>
+      // CHECK: %[[PVNZ:.*]] = make_partition_view %[[TVNZ]] : partition_view<tile=(1024), padding_value = neg_zero, tensor_view<?xf32, strides=[1]>>
+      // CHECK: %[[LDNZ:.*]], %[[TOKNZ:.*]] = load_view_tko weak %[[PVNZ]][%{{.*}}] : partition_view<tile=(1024), padding_value = neg_zero, tensor_view<?xf32, strides=[1]>>, tile<i32> -> tile<1024xf32>, token
+      %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<1024xptr<f32>>, tile<1024xi1>, tile<1024xf32> -> tile<1024xf32>, token
+      return
+    }
+
+    // CHECK-LABEL: entry @k_nan
+    // CHECK-GPU-LABEL: gpu.func @k_nan
+    entry @k_nan(%arg0: tile<ptr<f32>>, %arg1: tile<i32>) {
+      %cst_1024 = constant <i32: 1024> : tile<i32>
+      %pad = constant <f32: 0x7FC00000> : tile<1024xf32>
+      %block_id_x, %block_id_y, %block_id_z = get_tile_block_id : tile<i32>
+      %start = muli %block_id_x, %cst_1024 : tile<i32>
+      %lane = iota : tile<1024xi32>
+      %start_1d = reshape %start : tile<i32> -> tile<1xi32>
+      %start_bc = broadcast %start_1d : tile<1xi32> -> tile<1024xi32>
+      %index = addi %start_bc, %lane : tile<1024xi32>
+      %shape_1d = reshape %arg1 : tile<i32> -> tile<1xi32>
+      %shape_bc = broadcast %shape_1d : tile<1xi32> -> tile<1024xi32>
+      %mask = cmpi less_than %index, %shape_bc, signed : tile<1024xi32> -> tile<1024xi1>
+      %base_1d = reshape %arg0 : tile<ptr<f32>> -> tile<1xptr<f32>>
+      %base_bc = broadcast %base_1d : tile<1xptr<f32>> -> tile<1024xptr<f32>>
+      %ptr = offset %base_bc, %index : tile<1024xptr<f32>>, tile<1024xi32> -> tile<1024xptr<f32>>
+      // CHECK: %[[TVN:.*]] = make_tensor_view %arg0, shape = [%arg1], strides = [1] : tile<i32> -> tensor_view<?xf32, strides=[1]>
+      // CHECK: %[[PVN:.*]] = make_partition_view %[[TVN]] : partition_view<tile=(1024), padding_value = nan, tensor_view<?xf32, strides=[1]>>
+      // CHECK: %[[LDN:.*]], %[[TOKN:.*]] = load_view_tko weak %[[PVN]][%{{.*}}] : partition_view<tile=(1024), padding_value = nan, tensor_view<?xf32, strides=[1]>>, tile<i32> -> tile<1024xf32>, token
+      // CHECK-GPU: %[[NANPAD:.*]] = arith.constant 0x7FC00000 : f32
+      // CHECK-GPU: vector.transfer_read %{{.*}}[%{{.*}}], %[[NANPAD]] : memref<?xf32, strided<[1]>>, vector<1024xf32>
+      %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<1024xptr<f32>>, tile<1024xi1>, tile<1024xf32> -> tile<1024xf32>, token
+      return
+    }
+
+    // CHECK-LABEL: entry @k_pos_inf
+    entry @k_pos_inf(%arg0: tile<ptr<f32>>, %arg1: tile<i32>) {
+      %cst_1024 = constant <i32: 1024> : tile<i32>
+      %pad = constant <f32: 0x7F800000> : tile<1024xf32>
+      %block_id_x, %block_id_y, %block_id_z = get_tile_block_id : tile<i32>
+      %start = muli %block_id_x, %cst_1024 : tile<i32>
+      %lane = iota : tile<1024xi32>
+      %start_1d = reshape %start : tile<i32> -> tile<1xi32>
+      %start_bc = broadcast %start_1d : tile<1xi32> -> tile<1024xi32>
+      %index = addi %start_bc, %lane : tile<1024xi32>
+      %shape_1d = reshape %arg1 : tile<i32> -> tile<1xi32>
+      %shape_bc = broadcast %shape_1d : tile<1xi32> -> tile<1024xi32>
+      %mask = cmpi less_than %index, %shape_bc, signed : tile<1024xi32> -> tile<1024xi1>
+      %base_1d = reshape %arg0 : tile<ptr<f32>> -> tile<1xptr<f32>>
+      %base_bc = broadcast %base_1d : tile<1xptr<f32>> -> tile<1024xptr<f32>>
+      %ptr = offset %base_bc, %index : tile<1024xptr<f32>>, tile<1024xi32> -> tile<1024xptr<f32>>
+      // CHECK: %[[TVPI:.*]] = make_tensor_view %arg0, shape = [%arg1], strides = [1] : tile<i32> -> tensor_view<?xf32, strides=[1]>
+      // CHECK: %[[PVPI:.*]] = make_partition_view %[[TVPI]] : partition_view<tile=(1024), padding_value = pos_inf, tensor_view<?xf32, strides=[1]>>
+      // CHECK: %[[LDPI:.*]], %[[TOKPI:.*]] = load_view_tko weak %[[PVPI]][%{{.*}}] : partition_view<tile=(1024), padding_value = pos_inf, tensor_view<?xf32, strides=[1]>>, tile<i32> -> tile<1024xf32>, token
+      %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<1024xptr<f32>>, tile<1024xi1>, tile<1024xf32> -> tile<1024xf32>, token
+      return
+    }
+
+    // CHECK-LABEL: entry @k_neg_inf
+    entry @k_neg_inf(%arg0: tile<ptr<f32>>, %arg1: tile<i32>) {
+      %cst_1024 = constant <i32: 1024> : tile<i32>
+      %pad = constant <f32: 0xFF800000> : tile<1024xf32>
+      %block_id_x, %block_id_y, %block_id_z = get_tile_block_id : tile<i32>
+      %start = muli %block_id_x, %cst_1024 : tile<i32>
+      %lane = iota : tile<1024xi32>
+      %start_1d = reshape %start : tile<i32> -> tile<1xi32>
+      %start_bc = broadcast %start_1d : tile<1xi32> -> tile<1024xi32>
+      %index = addi %start_bc, %lane : tile<1024xi32>
+      %shape_1d = reshape %arg1 : tile<i32> -> tile<1xi32>
+      %shape_bc = broadcast %shape_1d : tile<1xi32> -> tile<1024xi32>
+      %mask = cmpi less_than %index, %shape_bc, signed : tile<1024xi32> -> tile<1024xi1>
+      %base_1d = reshape %arg0 : tile<ptr<f32>> -> tile<1xptr<f32>>
+      %base_bc = broadcast %base_1d : tile<1xptr<f32>> -> tile<1024xptr<f32>>
+      %ptr = offset %base_bc, %index : tile<1024xptr<f32>>, tile<1024xi32> -> tile<1024xptr<f32>>
+      // CHECK: %[[TVNI:.*]] = make_tensor_view %arg0, shape = [%arg1], strides = [1] : tile<i32> -> tensor_view<?xf32, strides=[1]>
+      // CHECK: %[[PVNI:.*]] = make_partition_view %[[TVNI]] : partition_view<tile=(1024), padding_value = neg_inf, tensor_view<?xf32, strides=[1]>>
+      // CHECK: %[[LDNI:.*]], %[[TOKNI:.*]] = load_view_tko weak %[[PVNI]][%{{.*}}] : partition_view<tile=(1024), padding_value = neg_inf, tensor_view<?xf32, strides=[1]>>, tile<i32> -> tile<1024xf32>, token
+      %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<1024xptr<f32>>, tile<1024xi1>, tile<1024xf32> -> tile<1024xf32>, token
+      return
+    }
+
+  }
+}

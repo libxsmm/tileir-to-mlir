@@ -652,6 +652,16 @@ cuda_tile.module @m {
     return
   }
 
+    // --- sqrt with Triton-style approx + flush_to_zero ---
+    // CHECK-LABEL: gpu.func @test_sqrt_approx_ftz
+    entry @test_sqrt_approx_ftz() {
+      // CHECK: %[[SQRTA_IN:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
+      %in = constant <f32: [1.0, 4.0, 9.0, 16.0]> : tile<4xf32>
+      // CHECK: %[[SQRTA_R:.*]] = math.sqrt %[[SQRTA_IN]] : vector<4xf32>
+      %res = sqrt %in rounding<approx> flush_to_zero : tile<4xf32>
+      return
+    }
+
   // --- andi ---
   // CHECK-LABEL: gpu.func @test_andi
   entry @test_andi() {

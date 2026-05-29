@@ -383,7 +383,11 @@ struct ConvertUnarySourceOp : public OpConversionPattern<SrcOp> {
   }
 };
 
-/// Convert float binary ops that reject flush_to_zero (addf, subf, mulf, divf).
+/// Convert float binary ops to arith float ops.
+///
+/// Triton-emitted addf/subf/mulf/divf may carry rounding<approx> and
+/// flush_to_zero flags. The target arith ops do not model those flags, so we
+/// intentionally drop them here and rely on the backend's default lowering.
 template <typename SrcOp, typename DstOp>
 struct ConvertBinaryFloatOp : public OpConversionPattern<SrcOp> {
   using OpConversionPattern<SrcOp>::OpConversionPattern;
@@ -392,9 +396,6 @@ struct ConvertBinaryFloatOp : public OpConversionPattern<SrcOp> {
   matchAndRewrite(SrcOp op,
                   typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (op.getFlushToZero())
-      return rewriter.notifyMatchFailure(
-          op, "flush_to_zero is not representable in arith float ops");
     rewriter.template replaceOpWithNewOp<DstOp>(op, adaptor.getLhs(),
                                                 adaptor.getRhs());
     return success();
@@ -2427,16 +2428,18 @@ using ConvertSin = ConvertUnarySourceOp<cuda_tile::SinOp, math::SinOp>;
 
 using ConvertSinH = ConvertUnarySourceOp<cuda_tile::SinHOp, math::SinhOp>;
 
-/// Convert cuda_tile.sqrt to math.sqrt; rejects flush_to_zero.
+/// Convert cuda_tile.sqrt to math.sqrt.
+///
+/// The math dialect has no way to represent cuda_tile's rounding_mode or
+/// flush_to_zero attributes. Triton-emitted sqrt commonly carries
+/// rounding<approx> and flush_to_zero, so we drop those attributes here and
+/// rely on the backend's default sqrt lowering.
 struct ConvertSqrt : public OpConversionPattern<cuda_tile::SqrtOp> {
   using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::SqrtOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (op.getFlushToZero())
-      return rewriter.notifyMatchFailure(
-          op, "sqrt flush_to_zero is not representable in math.sqrt");
     rewriter.replaceOpWithNewOp<math::SqrtOp>(op, adaptor.getSource());
     return success();
   }
@@ -2578,6 +2581,8 @@ static void populateTileIRToGPUTypeConverter(TypeConverter &converter,
         return UnrankedMemRefType::get(ptrTy.getPointeeType(), {});
       return Type();
     }
+    if (auto ptrTy = dyn_cast<cuda_tile::PointerType>(elemTy))
+      return MemRefType::get(shape, ptrTy.getPointeeType());
     return VectorType::get(shape, elemTy);
   });
 

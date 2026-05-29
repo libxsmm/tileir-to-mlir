@@ -1,5 +1,6 @@
 add_library(CudaTileToGPU STATIC
   CudaTileToGPU.cpp
+  TileIRPtrToView.cpp
 )
 
 target_link_libraries(CudaTileToGPU
