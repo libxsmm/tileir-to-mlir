@@ -647,7 +647,7 @@ cuda_tile.module @m {
   entry @test_sqrt() {
     // CHECK: %[[SQRT_IN:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
     %in = constant <f32: [1.0, 4.0, 9.0, 16.0]> : tile<4xf32>
-    // CHECK: %[[SQRT_R:.*]] = math.sqrt %[[SQRT_IN]] : vector<4xf32>
+    // CHECK: %[[SQRT_R:.*]] = math.sqrt %[[SQRT_IN]] {"tir-dropped-rounding" = "nearest_even"} : vector<4xf32>
     %res = sqrt %in : tile<4xf32>
     return
   }
@@ -657,7 +657,7 @@ cuda_tile.module @m {
     entry @test_sqrt_approx_ftz() {
       // CHECK: %[[SQRTA_IN:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
       %in = constant <f32: [1.0, 4.0, 9.0, 16.0]> : tile<4xf32>
-      // CHECK: %[[SQRTA_R:.*]] = math.sqrt %[[SQRTA_IN]] : vector<4xf32>
+      // CHECK: %[[SQRTA_R:.*]] = math.sqrt %[[SQRTA_IN]] fastmath<afn> {"tir-dropped-flush-to-zero", "tir-dropped-rounding" = "approx"} : vector<4xf32>
       %res = sqrt %in rounding<approx> flush_to_zero : tile<4xf32>
       return
     }
@@ -783,7 +783,7 @@ cuda_tile.module @m {
     %lhs = constant <f32: [1.0, 2.0, 3.0, 4.0]> : tile<4xf32>
     // CHECK: %[[ADDF_RHS:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
     %rhs = constant <f32: [5.0, 6.0, 7.0, 8.0]> : tile<4xf32>
-    // CHECK: %[[ADDF_R:.*]] = arith.addf %[[ADDF_LHS]], %[[ADDF_RHS]] : vector<4xf32>
+    // CHECK: %[[ADDF_R:.*]] = arith.addf %[[ADDF_LHS]], %[[ADDF_RHS]] {"tir-dropped-rounding" = "nearest_even"} : vector<4xf32>
     %result = addf %lhs, %rhs : tile<4xf32>
     return
   }
@@ -795,7 +795,7 @@ cuda_tile.module @m {
     %lhs = constant <f32: [5.0, 6.0, 7.0, 8.0]> : tile<4xf32>
     // CHECK: %[[SUBF_RHS:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
     %rhs = constant <f32: [1.0, 2.0, 3.0, 4.0]> : tile<4xf32>
-    // CHECK: %[[SUBF_R:.*]] = arith.subf %[[SUBF_LHS]], %[[SUBF_RHS]] : vector<4xf32>
+    // CHECK: %[[SUBF_R:.*]] = arith.subf %[[SUBF_LHS]], %[[SUBF_RHS]] {"tir-dropped-rounding" = "nearest_even"} : vector<4xf32>
     %result = subf %lhs, %rhs : tile<4xf32>
     return
   }
@@ -807,7 +807,7 @@ cuda_tile.module @m {
     %lhs = constant <f32: [1.0, 2.0, 3.0, 4.0]> : tile<4xf32>
     // CHECK: %[[MULF_RHS:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
     %rhs = constant <f32: [2.0, 3.0, 4.0, 5.0]> : tile<4xf32>
-    // CHECK: %[[MULF_R:.*]] = arith.mulf %[[MULF_LHS]], %[[MULF_RHS]] : vector<4xf32>
+    // CHECK: %[[MULF_R:.*]] = arith.mulf %[[MULF_LHS]], %[[MULF_RHS]] {"tir-dropped-rounding" = "nearest_even"} : vector<4xf32>
     %result = mulf %lhs, %rhs : tile<4xf32>
     return
   }
@@ -819,7 +819,7 @@ cuda_tile.module @m {
     %lhs = constant <f32: [4.0, 9.0, 16.0, 25.0]> : tile<4xf32>
     // CHECK: %[[DIVF_RHS:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
     %rhs = constant <f32: [2.0, 3.0, 4.0, 5.0]> : tile<4xf32>
-    // CHECK: %[[DIVF_R:.*]] = arith.divf %[[DIVF_LHS]], %[[DIVF_RHS]] : vector<4xf32>
+    // CHECK: %[[DIVF_R:.*]] = arith.divf %[[DIVF_LHS]], %[[DIVF_RHS]] {"tir-dropped-rounding" = "nearest_even"} : vector<4xf32>
     %result = divf %lhs, %rhs : tile<4xf32>
     return
   }
@@ -833,7 +833,7 @@ cuda_tile.module @m {
     %rhs = constant <f32: [2.0, 3.0, 4.0, 5.0]> : tile<4xf32>
     // CHECK: %[[FMA_ACC:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
     %acc = constant <f32: [0.5, 0.5, 0.5, 0.5]> : tile<4xf32>
-    // CHECK: %[[FMA_R:.*]] = math.fma %[[FMA_LHS]], %[[FMA_RHS]], %[[FMA_ACC]] : vector<4xf32>
+    // CHECK: %[[FMA_R:.*]] = math.fma %[[FMA_LHS]], %[[FMA_RHS]], %[[FMA_ACC]] {"tir-dropped-rounding" = "nearest_even"} : vector<4xf32>
     %result = fma %lhs, %rhs, %acc : tile<4xf32>
     return
   }
@@ -885,7 +885,7 @@ cuda_tile.module @m {
     %f = constant <f32: 4.0> : tile<f32>
     // CHECK: %[[SM_I:.*]] = arith.constant -3 : i32
     %i = constant <i32: -3> : tile<i32>
-    // CHECK: %[[SM_SQRT:.*]] = math.sqrt %[[SM_F]] : f32
+    // CHECK: %[[SM_SQRT:.*]] = math.sqrt %[[SM_F]] {"tir-dropped-rounding" = "nearest_even"} : f32
     %sq = sqrt %f : tile<f32>
     // CHECK: %[[SM_ABSF:.*]] = math.absf %[[SM_F]] : f32
     %af = absf %f : tile<f32>
@@ -927,15 +927,15 @@ cuda_tile.module @m {
     %b = constant <f32: 2.0> : tile<f32>
     // CHECK: %[[SF_C:.*]] = arith.constant 1.000000e+00 : f32
     %c = constant <f32: 1.0> : tile<f32>
-    // CHECK: %[[SF_ADDF:.*]] = arith.addf %[[SF_A]], %[[SF_B]] : f32
+    // CHECK: %[[SF_ADDF:.*]] = arith.addf %[[SF_A]], %[[SF_B]] {"tir-dropped-rounding" = "nearest_even"} : f32
     %add = addf %a, %b : tile<f32>
-    // CHECK: %[[SF_SUBF:.*]] = arith.subf %[[SF_A]], %[[SF_B]] : f32
+    // CHECK: %[[SF_SUBF:.*]] = arith.subf %[[SF_A]], %[[SF_B]] {"tir-dropped-rounding" = "nearest_even"} : f32
     %sub = subf %a, %b : tile<f32>
-    // CHECK: %[[SF_MULF:.*]] = arith.mulf %[[SF_A]], %[[SF_B]] : f32
+    // CHECK: %[[SF_MULF:.*]] = arith.mulf %[[SF_A]], %[[SF_B]] {"tir-dropped-rounding" = "nearest_even"} : f32
     %mul = mulf %a, %b : tile<f32>
-    // CHECK: %[[SF_DIVF:.*]] = arith.divf %[[SF_A]], %[[SF_B]] : f32
+    // CHECK: %[[SF_DIVF:.*]] = arith.divf %[[SF_A]], %[[SF_B]] {"tir-dropped-rounding" = "nearest_even"} : f32
     %div = divf %a, %b : tile<f32>
-    // CHECK: %[[SF_FMA:.*]] = math.fma %[[SF_A]], %[[SF_B]], %[[SF_C]] : f32
+    // CHECK: %[[SF_FMA:.*]] = math.fma %[[SF_A]], %[[SF_B]], %[[SF_C]] {"tir-dropped-rounding" = "nearest_even"} : f32
     %fm = fma %a, %b, %c : tile<f32>
     return
   }
@@ -1146,6 +1146,99 @@ cuda_tile.module @m {
     // CHECK: %[[CI_INS0:.*]] = vector.insert_strided_slice %[[CI_L]], %[[CI_P]] {offsets = [0, 0], strides = [1, 1]} : vector<4x2xi32> into vector<4x4xi32>
     // CHECK: %[[CI_INS1:.*]] = vector.insert_strided_slice %[[CI_R]], %[[CI_INS0]] {offsets = [0, 2], strides = [1, 1]} : vector<4x2xi32> into vector<4x4xi32>
     %0 = cat %l, %r dim = 1 : tile<4x2xi32>, tile<4x2xi32> -> tile<4x4xi32>
+    return
+  }
+
+  // --- addf: rounding<zero> + flush_to_zero both dropped ---
+  // CHECK-LABEL: gpu.func @test_addf_dropped_flags
+  entry @test_addf_dropped_flags() {
+    // CHECK-DAG: %[[DF_LHS:.*]] = arith.constant dense<1.000000e+00> : vector<4xf32>
+    %lhs = constant <f32: 1.0> : tile<4xf32>
+    // CHECK-DAG: %[[DF_RHS:.*]] = arith.constant dense<2.000000e+00> : vector<4xf32>
+    %rhs = constant <f32: 2.0> : tile<4xf32>
+    // CHECK: arith.addf %[[DF_LHS]], %[[DF_RHS]] {"tir-dropped-flush-to-zero", "tir-dropped-rounding" = "zero"} : vector<4xf32>
+    %r = addf %lhs, %rhs rounding<zero> flush_to_zero : tile<4xf32>
+    return
+  }
+
+  // --- divf rounding<approx> + flush_to_zero: rounding captured as arcp, ftz dropped ---
+  // CHECK-LABEL: gpu.func @test_divf_approx_ftz
+  entry @test_divf_approx_ftz() {
+    // CHECK-DAG: %[[DA_LHS:.*]] = arith.constant dense<1.000000e+00> : vector<4xf32>
+    %lhs = constant <f32: 1.0> : tile<4xf32>
+    // CHECK-DAG: %[[DA_RHS:.*]] = arith.constant dense<2.000000e+00> : vector<4xf32>
+    %rhs = constant <f32: 2.0> : tile<4xf32>
+    // CHECK: arith.divf %[[DA_LHS]], %[[DA_RHS]] fastmath<arcp> {"tir-dropped-flush-to-zero", "tir-dropped-rounding" = "approx"} : vector<4xf32>
+    %r = divf %lhs, %rhs rounding<approx> flush_to_zero : tile<4xf32>
+    return
+  }
+
+  // --- divf rounding<zero>: rounding dropped, no arcp in output ---
+  // CHECK-LABEL: gpu.func @test_divf_rounding_dropped
+  entry @test_divf_rounding_dropped() {
+    // CHECK-DAG: %[[DR_LHS:.*]] = arith.constant dense<1.000000e+00> : vector<4xf32>
+    %lhs = constant <f32: 1.0> : tile<4xf32>
+    // CHECK-DAG: %[[DR_RHS:.*]] = arith.constant dense<2.000000e+00> : vector<4xf32>
+    %rhs = constant <f32: 2.0> : tile<4xf32>
+    // CHECK: arith.divf %[[DR_LHS]], %[[DR_RHS]] {"tir-dropped-rounding" = "zero"} : vector<4xf32>
+    %r = divf %lhs, %rhs rounding<zero> : tile<4xf32>
+    return
+  }
+
+  // --- fma: rounding<zero> + flush_to_zero both dropped ---
+  // CHECK-LABEL: gpu.func @test_fma_dropped_flags
+  entry @test_fma_dropped_flags() {
+    // CHECK-DAG: %[[FF_A:.*]] = arith.constant dense<1.000000e+00> : vector<4xf32>
+    %a = constant <f32: 1.0> : tile<4xf32>
+    // CHECK-DAG: %[[FF_B:.*]] = arith.constant dense<2.000000e+00> : vector<4xf32>
+    %b = constant <f32: 2.0> : tile<4xf32>
+    // CHECK-DAG: %[[FF_C:.*]] = arith.constant dense<3.000000e+00> : vector<4xf32>
+    %c = constant <f32: 3.0> : tile<4xf32>
+    // CHECK: math.fma %[[FF_A]], %[[FF_B]], %[[FF_C]] {"tir-dropped-flush-to-zero", "tir-dropped-rounding" = "zero"} : vector<4xf32>
+    %r = fma %a, %b, %c rounding<zero> flush_to_zero : tile<4xf32>
+    return
+  }
+
+  // --- sqrt rounding<zero>: rounding dropped, no afn ---
+  // CHECK-LABEL: gpu.func @test_sqrt_dropped_rounding
+  entry @test_sqrt_dropped_rounding() {
+    // CHECK: %[[SD_IN:.*]] = arith.constant dense<1.000000e+00> : vector<4xf32>
+    %in = constant <f32: 1.0> : tile<4xf32>
+    // CHECK: math.sqrt %[[SD_IN]] {"tir-dropped-rounding" = "zero"} : vector<4xf32>
+    %r = sqrt %in rounding<zero> : tile<4xf32>
+    return
+  }
+
+  // --- tanh rounding<approx>: captured as fastmath<afn>, no tir-dropped attr ---
+  // CHECK-LABEL: gpu.func @test_tanh_approx
+  entry @test_tanh_approx() {
+    // CHECK: %[[TA_IN:.*]] = arith.constant dense<1.000000e+00> : vector<4xf32>
+    %in = constant <f32: 1.0> : tile<4xf32>
+    // CHECK: math.tanh %[[TA_IN]] fastmath<afn> {"tir-dropped-rounding" = "approx"} : vector<4xf32>
+    %r = tanh %in rounding<approx> : tile<4xf32>
+    return
+  }
+
+  // --- negi overflow<no_signed_wrap>: overflow dropped ---
+  // CHECK-LABEL: gpu.func @test_negi_dropped_overflow
+  entry @test_negi_dropped_overflow() {
+    // CHECK: %[[NO_IN:.*]] = arith.constant dense<[0, 1, 2, 3]> : vector<4xi32>
+    %source = constant <i32: [0, 1, 2, 3]> : tile<4xi32>
+    // CHECK: %[[NO_ZERO:.*]] = arith.constant dense<0> : vector<4xi32>
+    // CHECK: arith.subi %[[NO_ZERO]], %[[NO_IN]] {"tir-dropped-overflow" = "no_signed_wrap"} : vector<4xi32>
+    %r = negi %source overflow<no_signed_wrap> : tile<4xi32>
+    return
+  }
+
+  // --- maxf flush_to_zero: ftz dropped ---
+  // CHECK-LABEL: gpu.func @test_maxf_ftz
+  entry @test_maxf_ftz() {
+    // CHECK-DAG: %[[MF_LHS:.*]] = arith.constant dense<1.000000e+00> : vector<4xf32>
+    %lhs = constant <f32: 1.0> : tile<4xf32>
+    // CHECK-DAG: %[[MF_RHS:.*]] = arith.constant dense<2.000000e+00> : vector<4xf32>
+    %rhs = constant <f32: 2.0> : tile<4xf32>
+    // CHECK: arith.maxnumf %[[MF_LHS]], %[[MF_RHS]] {"tir-dropped-flush-to-zero"} : vector<4xf32>
+    %r = maxf %lhs, %rhs flush_to_zero : tile<4xf32>
     return
   }
 

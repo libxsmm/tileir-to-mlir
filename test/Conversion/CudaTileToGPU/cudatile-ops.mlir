@@ -284,7 +284,7 @@ cuda_tile.module @ops_module {
     %rhs0 = constant <i8: 0> : tile<8x2xi8>
     // CHECK: %[[MMAI_ACC0:.*]] = arith.constant dense<0> : vector<4x2xi32>
     %acc0 = constant <i32: 0> : tile<4x2xi32>
-    // CHECK: %[[MMAI_R0:.*]] = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %[[MMAI_LHS0]], %[[MMAI_RHS0]], %[[MMAI_ACC0]] : vector<4x8xi8>, vector<8x2xi8> into vector<4x2xi32>
+    // CHECK: %[[MMAI_R0:.*]] = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %[[MMAI_LHS0]], %[[MMAI_RHS0]], %[[MMAI_ACC0]] {"tir-dropped-signedness-lhs" = "signed", "tir-dropped-signedness-rhs" = "signed"} : vector<4x8xi8>, vector<8x2xi8> into vector<4x2xi32>
     %0 = mmai %lhs0, %rhs0, %acc0 signed signed : tile<4x8xi8>, tile<8x2xi8>, tile<4x2xi32>
 
     // CHECK: %[[MMAI_LHS1:.*]] = arith.constant dense<0> : vector<2x4x8xi8>
@@ -293,7 +293,7 @@ cuda_tile.module @ops_module {
     %rhs1 = constant <i8: 0> : tile<2x8x2xi8>
     // CHECK: %[[MMAI_ACC1:.*]] = arith.constant dense<0> : vector<2x4x2xi32>
     %acc1 = constant <i32: 0> : tile<2x4x2xi32>
-    // CHECK: %[[MMAI_R1:.*]] = vector.contract {indexing_maps = [#map3, #map4, #map5], iterator_types = ["parallel", "parallel", "parallel", "reduction"], kind = #vector.kind<add>} %[[MMAI_LHS1]], %[[MMAI_RHS1]], %[[MMAI_ACC1]] : vector<2x4x8xi8>, vector<2x8x2xi8> into vector<2x4x2xi32>
+    // CHECK: %[[MMAI_R1:.*]] = vector.contract {indexing_maps = [#map3, #map4, #map5], iterator_types = ["parallel", "parallel", "parallel", "reduction"], kind = #vector.kind<add>} %[[MMAI_LHS1]], %[[MMAI_RHS1]], %[[MMAI_ACC1]] {"tir-dropped-signedness-lhs" = "unsigned", "tir-dropped-signedness-rhs" = "unsigned"} : vector<2x4x8xi8>, vector<2x8x2xi8> into vector<2x4x2xi32>
     %1 = mmai %lhs1, %rhs1, %acc1 unsigned unsigned : tile<2x4x8xi8>, tile<2x8x2xi8>, tile<2x4x2xi32>
     return
   }
@@ -338,7 +338,7 @@ cuda_tile.module @ops_module {
     // CHECK: %[[NEGI_IN:.*]] = arith.constant dense<[0, 1, 2, 3]> : vector<4xi16>
     %source = constant <i16: [0, 1, 2, 3]> : tile<4xi16>
     // CHECK: %[[NEGI_ZERO:.*]] = arith.constant dense<0> : vector<4xi16>
-    // CHECK: %[[NEGI_R:.*]] = arith.subi %[[NEGI_ZERO]], %[[NEGI_IN]] : vector<4xi16>
+    // CHECK: %[[NEGI_R:.*]] = arith.subi %[[NEGI_ZERO]], %[[NEGI_IN]] {"tir-dropped-overflow" = "none"} : vector<4xi16>
     %result = negi %source : tile<4xi16>
     return
   }
@@ -380,7 +380,7 @@ cuda_tile.module @ops_module {
   entry @test_tanh() {
     // CHECK: %[[TANH_IN:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
     %in = constant <f32: [0.0, 1.0, 2.0, 3.0]> : tile<4xf32>
-    // CHECK: %[[TANH_R:.*]] = math.tanh %[[TANH_IN]] : vector<4xf32>
+    // CHECK: %[[TANH_R:.*]] = math.tanh %[[TANH_IN]] {"tir-dropped-rounding" = "full"} : vector<4xf32>
     %res0 = tanh %in : tile<4xf32>
     return
   }
@@ -655,6 +655,26 @@ cuda_tile.module @ops_module {
     // CHECK: %[[CAT0_L:.*]] = vector.insert_strided_slice %[[CAT_LHS]], %[[CAT0_P]] {offsets = [0, 0], strides = [1, 1]} : vector<2x4xf32> into vector<4x4xf32>
     // CHECK: %[[CAT0_R:.*]] = vector.insert_strided_slice %[[CAT_RHS]], %[[CAT0_L]] {offsets = [2, 0], strides = [1, 1]} : vector<2x4xf32> into vector<4x4xf32>
     %1 = cat %arg0, %arg1 dim = 0 : tile<2x4xf32>, tile<2x4xf32> -> tile<4x4xf32>
+    return
+  }
+
+  // --- exp2: flush_to_zero dropped ---
+  // CHECK-LABEL: gpu.func @test_exp2_ftz
+  entry @test_exp2_ftz() {
+    // CHECK: %[[EF_IN:.*]] = arith.constant dense<[0.000000e+00, 1.000000e+00, 2.000000e+00, 3.000000e+00]> : vector<4xf32>
+    %in = constant <f32: [0.0, 1.0, 2.0, 3.0]> : tile<4xf32>
+    // CHECK: math.exp2 %[[EF_IN]] {"tir-dropped-flush-to-zero"} : vector<4xf32>
+    %r = exp2 %in flush_to_zero : tile<4xf32>
+    return
+  }
+
+  // --- rsqrt: flush_to_zero dropped ---
+  // CHECK-LABEL: gpu.func @test_rsqrt_ftz
+  entry @test_rsqrt_ftz() {
+    // CHECK: %[[RF_IN:.*]] = arith.constant dense<[0.000000e+00, 1.000000e+00, 2.000000e+00, 3.000000e+00]> : vector<4xf32>
+    %in = constant <f32: [0.0, 1.0, 2.0, 3.0]> : tile<4xf32>
+    // CHECK: math.rsqrt %[[RF_IN]] {"tir-dropped-flush-to-zero"} : vector<4xf32>
+    %r = rsqrt %in flush_to_zero : tile<4xf32>
     return
   }
 
