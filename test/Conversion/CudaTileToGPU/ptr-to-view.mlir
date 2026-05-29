@@ -224,5 +224,82 @@ module {
       return
     }
 
+    // Tests ptr-to-view rewriting of loop-carried pointer iter_args.
+    // The pattern: a 2D ptr is built outside the loop (with one dim having a
+    // static tile index and the other having just an iota), then the loop advances
+    // the iota-only dimension each iteration via `offset(iterArg, constant_step)`.
+    // CHECK-LABEL: entry @load_in_loop
+    // CHECK-GPU-LABEL: gpu.func @load_in_loop
+    entry @load_in_loop (
+        %base: tile<ptr<f16>>,
+        %M: tile<i32>, %K: tile<i32>,
+        %stride: tile<i32>, %num_tiles: tile<i32>) {
+
+      %cst_0_i32 = constant <i32: 0> : tile<i32>
+      %cst_1_i32 = constant <i32: 1> : tile<i32>
+      %cst_128_i32 = constant <i32: 128> : tile<i32>
+      %cst_32_step = constant <i32: 32> : tile<128x32xi32>
+      %cst_pad = constant <f16: 0.000000e+00> : tile<128x32xf16>
+      %cst_0_f32 = constant <f32: 0.000000e+00> : tile<128x64xf32>
+
+      // Compute tile index for dim-0: blockId * 128.
+      %blockId_x, %blockId_y, %blockId_z = get_tile_block_id : tile<i32>
+      %row_start = muli %blockId_x, %cst_128_i32 : tile<i32>
+
+      // Build initial 2D ptr: dim-0 = row_start + iota (with stride),
+      //                        dim-1 = iota (contiguous, no start).
+      %iota_128 = iota : tile<128xi32>
+      %rs_1d = reshape %row_start : tile<i32> -> tile<1xi32>
+      %rs_bc = broadcast %rs_1d : tile<1xi32> -> tile<128xi32>
+      %off0_1d = addi %rs_bc, %iota_128 : tile<128xi32>
+      %off0_2d = reshape %off0_1d : tile<128xi32> -> tile<128x1xi32>
+      %stride_2d = reshape %stride : tile<i32> -> tile<1x1xi32>
+      %stride_bc = broadcast %stride_2d : tile<1x1xi32> -> tile<128x1xi32>
+      %off0_strided = muli %off0_2d, %stride_bc : tile<128x1xi32>
+
+      %base_2d = reshape %base : tile<ptr<f16>> -> tile<1x1xptr<f16>>
+      %base_col = broadcast %base_2d : tile<1x1xptr<f16>> -> tile<128x1xptr<f16>>
+      %ptr1 = offset %base_col, %off0_strided : tile<128x1xptr<f16>>, tile<128x1xi32> -> tile<128x1xptr<f16>>
+
+      %iota_32 = iota : tile<32xi32>
+      %iota_row = reshape %iota_32 : tile<32xi32> -> tile<1x32xi32>
+      %ptr1_bc = broadcast %ptr1 : tile<128x1xptr<f16>> -> tile<128x32xptr<f16>>
+      %iota_bc = broadcast %iota_row : tile<1x32xi32> -> tile<128x32xi32>
+      %ptr_init = offset %ptr1_bc, %iota_bc : tile<128x32xptr<f16>>, tile<128x32xi32> -> tile<128x32xptr<f16>>
+
+      // Mask: dim-0 < M, dim-1 < K.
+      %M_2d = reshape %M : tile<i32> -> tile<1x1xi32>
+      %M_bc = broadcast %M_2d : tile<1x1xi32> -> tile<128x1xi32>
+      %cmp0 = cmpi less_than %off0_2d, %M_bc, signed : tile<128x1xi32> -> tile<128x1xi1>
+      %K_2d = reshape %K : tile<i32> -> tile<1x1xi32>
+      %K_bc = broadcast %K_2d : tile<1x1xi32> -> tile<1x32xi32>
+      %cmp1 = cmpi less_than %iota_row, %K_bc, signed : tile<1x32xi32> -> tile<1x32xi1>
+      %cmp0_bc = broadcast %cmp0 : tile<128x1xi1> -> tile<128x32xi1>
+      %cmp1_bc = broadcast %cmp1 : tile<1x32xi1> -> tile<128x32xi1>
+      %mask = andi %cmp0_bc, %cmp1_bc : tile<128x32xi1>
+
+      // For loop: ptr advances dim-1 by 32 each iteration.
+      // CHECK: for %[[IDX:.*]] in
+      // CHECK:   make_tensor_view %arg0
+      // CHECK:   make_partition_view
+      // CHECK:   load_view_tko weak %{{.*}}[%{{.*}}, %[[IDX]]]
+      // CHECK-NOT: load_ptr_tko
+      // CHECK-GPU: scf.for %[[IV:.*]] =
+      // CHECK-GPU:   memref.reinterpret_cast
+      // CHECK-GPU:   vector.transfer_read
+      %for:2 = for %loopIdx in (%cst_0_i32 to %num_tiles, step %cst_1_i32) : tile<i32>
+          iter_values(%iterPtr = %ptr_init, %iterAcc = %cst_0_f32)
+          -> (tile<128x32xptr<f16>>, tile<128x64xf32>) {
+        %tile, %tok = load_ptr_tko weak %iterPtr, %mask, %cst_pad
+            : tile<128x32xptr<f16>>, tile<128x32xi1>, tile<128x32xf16>
+            -> tile<128x32xf16>, token
+        %next_ptr = offset %iterPtr, %cst_32_step
+            : tile<128x32xptr<f16>>, tile<128x32xi32> -> tile<128x32xptr<f16>>
+        continue %next_ptr, %iterAcc
+            : tile<128x32xptr<f16>>, tile<128x64xf32>
+      }
+      return
+    }
+
   }
 }

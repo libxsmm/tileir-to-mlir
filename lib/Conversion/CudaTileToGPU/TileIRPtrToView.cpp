@@ -5,6 +5,67 @@
 // cuda_tile.load_ptr_tko/store_ptr_tko and rewrites it into the higher-level
 // make_tensor_view + make_partition_view + load_view_tko/store_view_tko form.
 //
+// ============================================================================
+// Detected pattern (per load/store, shown for a 2-D tile<NxM x T>)
+// ============================================================================
+//
+//   // base pointer (scalar)
+//   %base : tile<ptr<T>>
+//
+//   // per-dim index construction (one offset op per dimension)
+//   %iota0  = iota                           : tile<N x i32>
+//   %start0 = ...                            : tile<ptr<T>>  // scalar
+//   %off0   = addi broadcast(reshape(%start0)), reshape(%iota0)
+//                                            : tile<N x i32>
+//   // optional: %off0 = muli %off0, broadcast(reshape(%stride0))
+//   %ptr1   = offset %base,   reshape(%off0) : tile<N x 1 x ptr<T>>
+//
+//   %iota1  = iota                           : tile<M x i32>
+//   %start1 = ...                            : tile<ptr<T>>  // scalar
+//   %off1   = addi broadcast(reshape(%start1)), reshape(%iota1)
+//                                            : tile<M x i32>
+//   // optional: %off1 = muli %off1, broadcast(reshape(%stride1))
+//   %ptr    = offset %ptr1,   reshape(%off1) : tile<N x M x ptr<T>>
+//
+//   // mask encodes per-dim bounds
+//   %mask   = andi cmpi(lt, reshape(%iota0), broadcast(reshape(%size0))),
+//                  cmpi(lt, reshape(%iota1), broadcast(reshape(%size1)))
+//                                            : tile<N x M x i1>
+//
+//   %result = load_ptr_tko %ptr, %mask [, %pad] : tile<N x M x T>
+//
+// The start values are expected to be of the form `muli(%idx_d, tile_size_d)`,
+// allowing the per-dimension partition index %idx_d to be recovered.
+//
+// The rewrite is intentionally conservative: it bails (leaving the original
+// load_ptr_tko/store_ptr_tko untouched) whenever it cannot fully recover the
+// access, rather than fabricating a shape/stride.  In particular it requires:
+//   * a recovered global size (from the mask) for every dimension;
+//   * the innermost dimension to be contiguous (unit stride) and every other
+//     dimension to carry an explicitly recovered stride -- this matches the
+//     canonical row-major layout emitted by the TileIR frontend
+//     (`tt.make_tensor_desc` lowers to `strides=[..., 1]`);
+//   * exactly one loop-advancing (start-less) dimension when the access is
+//     carried by a `for` iter_arg.
+//
+// ============================================================================
+// Produced pattern
+// ============================================================================
+//
+//   // recovered scalars: %idx0 = start0 / N, %idx1 = start1 / M
+//   %tv  = make_tensor_view %base [%size0, %size1] [%stride0, 1]
+//              : tensor_view<T, [?, ?], [?, 1]>
+//   %pv  = make_partition_view %tv
+//              : partition_view<tile_shape=[N, M], dim_map=[0, 1], ...>
+//   %result = load_view_tko %pv [%idx0, %idx1] : tile<N x M x T>
+//
+// The store pattern is identical except that load_ptr_tko/load_view_tko are
+// replaced by store_ptr_tko/store_view_tko (no padding argument).
+//
+// After the rewrites, dead pure ops left over from the pointer-arithmetic
+// chains (offset, broadcast, reshape, iota, muli, addi, cmpi, andi, exti,
+// trunci) are removed iteratively.
+//
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Conversion/CudaTileToGPU/TileIRPtrToView.h"
@@ -96,6 +157,15 @@ struct PtrAccess {
   Value base;
   /// Per-tile-dimension info, ordered by dimension.
   SmallVector<DimInfo> dims;
+  /// If the pointer source was a for-loop iter_arg, this captures the context.
+  struct LoopInfo {
+    ForOp forOp;
+    /// Index of this iter_arg within the ForOp's region iter values.
+    unsigned iterArgIndex = 0;
+    /// The loop induction variable (tile<i32>).
+    Value inductionVar;
+  };
+  std::optional<LoopInfo> loop;
 };
 
 /// Look at `addend` (a tile expression of shape `tileShape`) and try to figure
@@ -279,6 +349,9 @@ static void analyzeMask(Value mask, unsigned rank,
 /// transparent reshape/broadcast ops on the ptr side, collecting one DimInfo
 /// per encountered offset addend.  On success `out.base` is the scalar base
 /// pointer and `out.dims` has been populated for every covered dimension.
+///
+/// If the pointer source is a for-loop iter_arg, the function traces through
+/// to the initial value and records loop advancement info in `out.loop`.
 static LogicalResult analyzePtr(Value ptr, ArrayRef<int64_t> tileShape,
                                 PtrAccess &out) {
   out.dims.assign(tileShape.size(), DimInfo{});
@@ -314,6 +387,44 @@ static LogicalResult analyzePtr(Value ptr, ArrayRef<int64_t> tileShape,
       out.dims[dim].stride = info.stride;
       covered[dim] = true;
       cur = off.getPtr();
+      continue;
+    }
+    // Handle for-loop iter_arg: trace through to initial value and record
+    // per-iteration advancement.
+    if (auto blockArg = dyn_cast<BlockArgument>(cur)) {
+      auto *parentOp = blockArg.getOwner()->getParentOp();
+      auto forOp = dyn_cast_or_null<ForOp>(parentOp);
+      if (!forOp)
+        break; // Not a for-loop iter_arg — treat as base pointer.
+      // Must be an iter_arg (not the induction variable).
+      unsigned argNum = blockArg.getArgNumber();
+      if (argNum < forOp.getNumInductionVars())
+        return failure();
+      unsigned iterIdx = argNum - forOp.getNumInductionVars();
+
+      // Analyze per-iteration step from the ContinueOp (loop terminator).
+      // The yielded value should be `offset(same_iter_arg, step_addend)`.
+      auto contOp = cast<ContinueOp>(forOp.getBody()->getTerminator());
+      Value yieldedPtr = contOp.getOperand(iterIdx);
+      Value yieldCur = lookThroughAssume(yieldedPtr);
+      if (auto yOff = yieldCur.getDefiningOp<OffsetOp>()) {
+        Value yPtr = lookThroughAssume(yOff.getPtr());
+        if (yPtr != blockArg)
+          return failure();
+      } else {
+        return failure();
+      }
+
+      // Record loop info.  The exact advancing dimension will be determined
+      // later based on which dim has no start in the initial value analysis.
+      PtrAccess::LoopInfo li;
+      li.forOp = forOp;
+      li.iterArgIndex = iterIdx;
+      li.inductionVar = forOp.getInductionVar();
+      out.loop = std::move(li);
+
+      // Follow to the initial value of this iter_arg.
+      cur = forOp.getInitValues()[iterIdx];
       continue;
     }
     break;
@@ -400,50 +511,102 @@ static Value buildZeroI32(OpBuilder &b, Location loc) {
 /// Materialise the views and per-dim indices required to express `access` as
 /// a load_view_tko / store_view_tko at the current builder location.  Returns
 /// failure when the per-dim partition index cannot be recovered.
+///
+/// When `access.loop` is set, the index for the advancing dimension becomes
+/// `initial_idx + loopIdx` (the loop induction variable).
 static LogicalResult buildViews(OpBuilder &b, Location loc,
                                 const PtrAccess &access, Type elementType,
                                 PaddingValueAttr padding, BuiltViews &out) {
   MLIRContext *ctx = b.getContext();
   unsigned rank = access.dims.size();
 
+  // When the access advances through a loop iter_arg, exactly one tile
+  // dimension must lack a `start` (that is the dimension the loop advances).
+  // More than one start-less dimension makes the advancing dimension
+  // ambiguous, so we bail rather than guess.
+  if (access.loop) {
+    unsigned numStartless = 0;
+    for (const DimInfo &di : access.dims)
+      if (!di.start)
+        ++numStartless;
+    if (numStartless != 1)
+      return failure();
+  }
+
   // 1) Compute per-dim partition indices by stripping the `tileSize * idx`
   //    multiplication out of the `start` scalar.  Bail early when this fails
   //    (the rewrite would otherwise lose information about the alignment of
   //    each tile within the global tensor).
+  //
+  //    When the access comes from a for-loop iter_arg, the advancing dimension
+  //    (the one with no start in the initial pattern) uses the loop induction
+  //    variable as its partition index.
   SmallVector<Value> indices;
   indices.reserve(rank);
   for (unsigned d = 0; d < rank; ++d) {
     const DimInfo &di = access.dims[d];
-    if (!di.start) {
+
+    // When a loop is present, the advancing dimension is identified as
+    // the one without a start value.
+    bool isLoopAdvancingDim = access.loop && !di.start;
+
+    if (!di.start && !isLoopAdvancingDim) {
       indices.push_back(buildZeroI32(b, loc));
       continue;
     }
-    Value idx = extractTileMultiplier(di.start, di.tileSize);
-    if (!idx)
-      return failure();
-    indices.push_back(idx);
+
+    // Compute the base index (from initial ptr pattern).
+    Value baseIdx;
+    if (di.start) {
+      baseIdx = extractTileMultiplier(di.start, di.tileSize);
+      if (!baseIdx)
+        return failure();
+    }
+
+    if (isLoopAdvancingDim) {
+      // The partition index for this dim is just loopIdx (induction var).
+      Value loopIdx = access.loop->inductionVar;
+      if (baseIdx) {
+        baseIdx = AddIOp::create(b, loc, baseIdx, loopIdx);
+      } else {
+        baseIdx = loopIdx;
+      }
+    }
+
+    indices.push_back(baseIdx ? baseIdx : buildZeroI32(b, loc));
   }
 
-  // 2) Build the TensorViewType.  Shape is dynamic per-dim (extracted from
-  //    the recovered mask sizes, or falls back to the tile size).  The
-  //    innermost dim is contiguous (stride == 1); other dims are dynamic
-  //    when their stride was recovered from a `muli`, else also 1.
+  // 2) Validate the recovered layout and build the TensorViewType.  We refuse
+  //    to fabricate missing information:
+  //      * every dimension must have a recovered global size (from the mask),
+  //        otherwise the tensor extent -- and thus the masking behaviour --
+  //        would be unknown;
+  //      * only the innermost dimension may be contiguous (unit stride); every
+  //        other dimension must carry an explicitly recovered stride.  This
+  //        matches the canonical layout produced by the TileIR frontend.
+  for (unsigned d = 0; d < rank; ++d) {
+    const DimInfo &di = access.dims[d];
+    if (!di.size)
+      return failure();
+    bool isMinor = (d == rank - 1);
+    if (isMinor && di.stride)
+      return failure(); // innermost dim must be contiguous
+    if (!isMinor && !di.stride)
+      return failure(); // outer dims must have an explicit stride
+  }
+
+  // Shape is fully dynamic (taken from the recovered mask sizes).  Strides are
+  // dynamic for the outer dims and a static 1 for the contiguous innermost dim.
   SmallVector<int64_t> shape(rank, TensorViewType::kDynamic);
   SmallVector<int64_t> strides(rank, TensorViewType::kDynamic);
   SmallVector<Value> dynShape, dynStride;
   for (unsigned d = 0; d < rank; ++d) {
     const DimInfo &di = access.dims[d];
-    if (di.size) {
-      dynShape.push_back(di.size);
-    } else {
-      // No mask info: shape unknown.  Fall back to a static tile-aligned shape.
-      shape[d] = di.tileSize;
-    }
-    if (di.stride) {
+    dynShape.push_back(di.size);
+    if (di.stride)
       dynStride.push_back(di.stride);
-    } else {
+    else
       strides[d] = 1;
-    }
   }
   auto tvTy = TensorViewType::get(ctx, elementType, shape, strides);
 
@@ -473,14 +636,45 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
 // Rewrite drivers
 //===----------------------------------------------------------------------===//
 
+/// Analyze the pointer-arithmetic chain feeding a load/store (`ptr` + `mask`)
+/// and materialise the corresponding `make_tensor_view` + `make_partition_view`
+/// at the builder's current insertion point.  On success `outView` is the
+/// partition-view value and `outIndices` are the per-dim partition indices to
+/// pass to the load_view_tko/store_view_tko.  `mask` must be non-null.
+static LogicalResult lowerAccess(OpBuilder &b, Location loc, Value ptr,
+                                 Value mask, ArrayRef<int64_t> tileShape,
+                                 Type elemTy, PaddingValueAttr padding,
+                                 Value &outView,
+                                 SmallVectorImpl<Value> &outIndices) {
+  PtrAccess access;
+  if (failed(analyzePtr(ptr, tileShape, access)))
+    return failure();
+
+  // Recover per-dim global sizes from the mask.
+  SmallVector<Value> dimSizes;
+  analyzeMask(mask, tileShape.size(), dimSizes);
+  for (unsigned d = 0; d < tileShape.size(); ++d)
+    access.dims[d].size = dimSizes[d];
+
+  BuiltViews bv;
+  if (failed(buildViews(b, loc, access, elemTy, padding, bv)))
+    return failure();
+
+  auto tvOp = MakeTensorViewOp::create(b, loc, bv.tvTy, access.base,
+                                       bv.dynamicShape, bv.dynamicStride);
+  auto pvOp = MakePartitionViewOp::create(b, loc, bv.pvTy, tvOp.getResult());
+  outView = pvOp.getResult();
+  outIndices.assign(bv.indices.begin(), bv.indices.end());
+  return success();
+}
+
 static LogicalResult rewriteLoad(LoadPtrTkoOp op) {
   Location loc = op.getLoc();
   auto resultTy = cast<TileType>(op.getResult().getType());
   Type elemTy = resultTy.getElementType();
   ArrayRef<int64_t> tileShape = resultTy.getShape();
 
-  // The pass currently requires a mask so that we can recover the per-dim
-  // global sizes.
+  // The pass requires a mask so that we can recover the per-dim global sizes.
   if (!op.getMask()) {
     op.emitRemark("tileir-ptr-to-view: load has no mask; skipping");
     return failure();
@@ -495,35 +689,21 @@ static LogicalResult rewriteLoad(LoadPtrTkoOp op) {
     }
   }
 
-  PtrAccess access;
-  if (failed(analyzePtr(op.getSource(), tileShape, access))) {
+  OpBuilder b(op);
+  Value view;
+  SmallVector<Value> indices;
+  if (failed(lowerAccess(b, loc, op.getSource(), op.getMask(), tileShape,
+                         elemTy, padding, view, indices))) {
     op.emitRemark("tileir-ptr-to-view: pointer-arithmetic pattern not "
                   "recognised; skipping");
     return failure();
   }
 
-  // Recover per-dim sizes from the mask.
-  SmallVector<Value> dimSizes;
-  analyzeMask(op.getMask(), tileShape.size(), dimSizes);
-  for (unsigned d = 0; d < tileShape.size(); ++d)
-    access.dims[d].size = dimSizes[d];
-
-  OpBuilder b(op);
-  BuiltViews bv;
-  if (failed(buildViews(b, loc, access, elemTy, padding, bv))) {
-    op.emitRemark("tileir-ptr-to-view: could not recover per-dim partition "
-                  "index; skipping");
-    return failure();
-  }
-  auto tvOp = MakeTensorViewOp::create(b, loc, bv.tvTy, access.base,
-                                       bv.dynamicShape, bv.dynamicStride);
-  auto pvOp = MakePartitionViewOp::create(b, loc, bv.pvTy, tvOp.getResult());
-
   auto moAttr = MemoryOrderingSemanticsAttr::get(op.getContext(),
                                                  MemoryOrderingSemantics::WEAK);
   auto newOp = LoadViewTkoOp::create(
       b, loc, resultTy, op.getResultToken().getType(), moAttr,
-      /*memory_scope=*/nullptr, pvOp.getResult(), bv.indices,
+      /*memory_scope=*/nullptr, view, indices,
       /*token=*/op.getToken(), op.getOptimizationHintsAttr());
   op.getResult().replaceAllUsesWith(newOp.getTile());
   op.getResultToken().replaceAllUsesWith(newOp.getResultToken());
@@ -542,35 +722,26 @@ static LogicalResult rewriteStore(StorePtrTkoOp op) {
     return failure();
   }
 
-  PtrAccess access;
-  if (failed(analyzePtr(op.getDestination(), tileShape, access))) {
+  OpBuilder b(op);
+  // Stores mask out-of-bounds elements, so the padding value is never observed;
+  // we use `zero` to match the canonical partition view emitted by the TileIR
+  // frontend.
+  PaddingValueAttr padding =
+      PaddingValueAttr::get(op.getContext(), PaddingValue::zero);
+  Value view;
+  SmallVector<Value> indices;
+  if (failed(lowerAccess(b, loc, op.getDestination(), op.getMask(), tileShape,
+                         elemTy, padding, view, indices))) {
     op.emitRemark("tileir-ptr-to-view: pointer-arithmetic pattern not "
                   "recognised; skipping");
     return failure();
   }
-  SmallVector<Value> dimSizes;
-  analyzeMask(op.getMask(), tileShape.size(), dimSizes);
-  for (unsigned d = 0; d < tileShape.size(); ++d)
-    access.dims[d].size = dimSizes[d];
-
-  OpBuilder b(op);
-  BuiltViews bv;
-  PaddingValueAttr padding =
-      PaddingValueAttr::get(op.getContext(), PaddingValue::zero);
-  if (failed(buildViews(b, loc, access, elemTy, padding, bv))) {
-    op.emitRemark("tileir-ptr-to-view: could not recover per-dim partition "
-                  "index; skipping");
-    return failure();
-  }
-  auto tvOp = MakeTensorViewOp::create(b, loc, bv.tvTy, access.base,
-                                       bv.dynamicShape, bv.dynamicStride);
-  auto pvOp = MakePartitionViewOp::create(b, loc, bv.pvTy, tvOp.getResult());
 
   auto moAttr = MemoryOrderingSemanticsAttr::get(op.getContext(),
                                                  MemoryOrderingSemantics::WEAK);
   auto newOp = StoreViewTkoOp::create(
       b, loc, op.getResultToken().getType(), moAttr, /*memory_scope=*/nullptr,
-      op.getValue(), pvOp.getResult(), bv.indices, /*token=*/op.getToken(),
+      op.getValue(), view, indices, /*token=*/op.getToken(),
       op.getOptimizationHintsAttr());
   op.getResultToken().replaceAllUsesWith(newOp.getResultToken());
   op.erase();
@@ -613,23 +784,102 @@ struct TileIRPtrToViewPass
     for (auto s : stores)
       (void)rewriteStore(s);
 
-    // Clean up now-dead pure cuda_tile ops left over from the ptr-arithmetic
-    // chains.
+    // Remove dead iter_args from for loops.  After loads/stores are rewritten
+    // the ptr-typed results become unused; rebuild the loop without them.
+    //
+    // This is done by hand because cuda_tile's ForOp does not implement
+    // RegionBranchOpInterface/LoopLikeOpInterface and ships no canonicalizer,
+    // so the upstream dead-iter-arg elimination cannot be reused here.
+    SmallVector<ForOp> forOps;
+    mod.walk([&](ForOp op) { forOps.push_back(op); });
+    for (ForOp forOp : forOps) {
+      unsigned numIter = forOp.getNumResults();
+      if (numIter == 0)
+        continue;
+      SmallVector<unsigned> keepIter;
+      for (unsigned i = 0; i < numIter; ++i) {
+        if (!forOp.getResult(i).use_empty())
+          keepIter.push_back(i);
+      }
+      if (keepIter.size() == numIter)
+        continue;
+
+      unsigned numInduction = forOp.getNumInductionVars();
+      OpBuilder builder(forOp);
+      SmallVector<Value> newInits;
+      for (unsigned i : keepIter)
+        newInits.push_back(forOp.getInitValues()[i]);
+
+      auto newFor =
+          ForOp::create(builder, forOp.getLoc(), forOp.getLowerBound(),
+                        forOp.getUpperBound(), forOp.getStep(), newInits);
+
+      // Map old block args → new block args.
+      Block *oldBody = forOp.getBody();
+      Block *newBody = newFor.getBody();
+      oldBody->getArgument(0).replaceAllUsesWith(newBody->getArgument(0));
+      for (unsigned newIdx = 0; newIdx < keepIter.size(); ++newIdx) {
+        unsigned oldIdx = keepIter[newIdx];
+        oldBody->getArgument(numInduction + oldIdx)
+            .replaceAllUsesWith(newBody->getArgument(numInduction + newIdx));
+      }
+      // Dropped iter_args: erase all their uses (which are dead ops feeding
+      // only the continue).
+      SmallVector<unsigned> dropIter;
+      for (unsigned i = 0; i < numIter; ++i) {
+        if (forOp.getResult(i).use_empty())
+          dropIter.push_back(i);
+      }
+      for (unsigned i : dropIter) {
+        Value deadArg = oldBody->getArgument(numInduction + i);
+        // Collect and erase users of the dead arg (they only feed continue).
+        SmallVector<Operation *> toErase;
+        for (OpOperand &use : deadArg.getUses()) {
+          Operation *user = use.getOwner();
+          if (!isa<ContinueOp>(user))
+            toErase.push_back(user);
+        }
+        for (Operation *op : toErase)
+          op->dropAllUses();
+        for (Operation *op : toErase)
+          op->erase();
+      }
+
+      // Splice old body ops into new body (replacing its auto-generated
+      // terminator if any).
+      if (newBody->mightHaveTerminator())
+        newBody->getTerminator()->erase();
+      newBody->getOperations().splice(newBody->end(), oldBody->getOperations());
+
+      // Fix the continue op to only yield the kept values.
+      auto contOp = cast<ContinueOp>(newBody->getTerminator());
+      SmallVector<Value> newYields;
+      for (unsigned i : keepIter)
+        newYields.push_back(contOp.getOperand(i));
+      builder.setInsertionPoint(contOp);
+      ContinueOp::create(builder, contOp.getLoc(), newYields);
+      contOp.erase();
+
+      // Replace kept results and erase old for.
+      for (unsigned newIdx = 0; newIdx < keepIter.size(); ++newIdx)
+        forOp.getResult(keepIter[newIdx])
+            .replaceAllUsesWith(newFor.getResult(newIdx));
+      forOp.erase();
+    }
+
+    // Clean up now-dead ops left over from the ptr-arithmetic chains.  We rely
+    // on the generic `isOpTriviallyDead` (all the ptr-arith ops are `Pure`)
+    // plus an explicit case for the non-Pure `assume` op, which carries no
+    // memory effects we need to preserve once its result is unused.
     bool changed = true;
     while (changed) {
       changed = false;
       SmallVector<Operation *> toErase;
       mod.walk([&](Operation *op) {
-        if (op->getNumResults() == 0)
-          return;
         if (!op->use_empty())
           return;
-        if (!isa<OffsetOp, BroadcastOp, ReshapeOp, IotaOp, MulIOp, AddIOp,
-                 CmpIOp, AndIOp, ExtIOp, TruncIOp>(op))
-          return;
-        if (!isMemoryEffectFree(op))
-          return;
-        toErase.push_back(op);
+        if (isOpTriviallyDead(op) || isa<AssumeOp>(op))
+          toErase.push_back(op);
       });
       for (auto *op : toErase) {
         op->erase();
