@@ -1430,22 +1430,46 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
       return rewriter.notifyMatchFailure(
           op, "for bounds could not be converted to index");
 
-    // Check if the upper bound originates from get_index_space_shape.
-    // If so, rescale the loop to iterate in element-index space and introduce
-    // a divui at the top of the body to recover the tile-space index for
-    // existing consumers.
+    // Determine the tile size along the loop axis by inspecting how the
+    // induction variable is consumed by load_view_tko / store_view_tko ops.
+    // These ops carry the authoritative partition_view tile shape that
+    // `buildTransferViewAccessPlan` also uses to scale per-tile indices into
+    // element-space memref indices. Using the same source-of-truth here
+    // guarantees the loop step (`tileSize` per iteration) and the per-tile
+    // index scaling (`tileSize` per index increment) are derived from the
+    // same value, regardless of how the original loop bound was computed
+    // (e.g. `get_index_space_shape` vs. a hand-written `divi(_, N)`).
     int64_t tileSize = 0;
-    if (auto issOp = op.getUpperBound()
-                         .getDefiningOp<cuda_tile::GetIndexSpaceShapeOp>()) {
-      unsigned resultIdx = 0;
-      for (auto result : issOp->getResults()) {
-        if (result == op.getUpperBound())
-          break;
-        ++resultIdx;
+    Value origIV = op.getInductionVar();
+    auto inspectViewUse = [&](Value view, ValueRange indices) -> bool {
+      auto pvTy = dyn_cast<cuda_tile::PartitionViewType>(view.getType());
+      if (!pvTy)
+        return true;
+      auto shape = pvTy.getTileShape().asArrayRef();
+      for (auto [pos, idx] : llvm::enumerate(indices)) {
+        if (idx != origIV)
+          continue;
+        if (pos >= shape.size())
+          return false;
+        int64_t sz = shape[pos];
+        if (sz <= 0)
+          return false;
+        if (tileSize != 0 && tileSize != sz)
+          return false;
+        tileSize = sz;
       }
-      auto pvType =
-          cast<cuda_tile::PartitionViewType>(issOp.getSrc().getType());
-      tileSize = pvType.getTileShape().asArrayRef()[resultIdx];
+      return true;
+    };
+    for (Operation *user : origIV.getUsers()) {
+      bool ok = true;
+      if (auto ld = dyn_cast<cuda_tile::LoadViewTkoOp>(user))
+        ok = inspectViewUse(ld.getView(), ld.getIndex());
+      else if (auto st = dyn_cast<cuda_tile::StoreViewTkoOp>(user))
+        ok = inspectViewUse(st.getView(), st.getIndex());
+      if (!ok) {
+        tileSize = 0;
+        break;
+      }
     }
 
     if (tileSize > 0) {
