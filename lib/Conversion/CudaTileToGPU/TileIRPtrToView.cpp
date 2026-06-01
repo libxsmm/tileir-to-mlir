@@ -77,10 +77,13 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/RegionUtils.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
@@ -112,37 +115,119 @@ static bool isScalarTile(Type t) {
   return tt && tt.getShape().empty();
 }
 
-/// Forward, at the builder's current insertion point, any `assume` predicates
-/// that the *source* IR attached to `scalar`, re-emitting them on top of
-/// `scalar`.  This preserves alignment/bounds metadata (e.g. `div_by`) that
-/// Triton placed on base pointers and shape/stride scalars so it survives onto
-/// the rewritten view operands.  Nothing is fabricated: only predicates found
-/// on existing `assume` users of `scalar` are forwarded.  Chains of `assume`
-/// ops (`assume` of an `assume`) are followed transitively, since each link is
-/// a value-preserving passthrough and therefore decorates the same scalar.
-/// The original (now-dead) `assume` ops are cleaned up later by DCE.
-static Value forwardSourceAssumes(OpBuilder &b, Location loc, Value scalar) {
-  SmallVector<AssumePredicateAttrInterface> preds;
-  SmallVector<Value> work{scalar};
-  SmallPtrSet<Value, 4> seen;
-  while (!work.empty()) {
-    Value v = work.pop_back_val();
-    for (Operation *user : v.getUsers()) {
-      auto a = dyn_cast<AssumeOp>(user);
-      if (!a || a.getValue() != v)
-        continue;
-      AssumePredicateAttrInterface p = a.getPredicateAttr();
-      if (!llvm::is_contained(preds, p))
-        preds.push_back(p);
-      if (seen.insert(a.getResult()).second)
-        work.push_back(a.getResult());
-    }
-  }
-  Value result = scalar;
-  for (AssumePredicateAttrInterface p : preds)
-    result = AssumeOp::create(b, loc, result, p).getResult();
-  return result;
+/// The "definition point" operation for `v`: its defining op, or the first op
+/// of its owning block when `v` is a block argument (block args are available
+/// at block entry, i.e. before every op in the block).  Returns null only for a
+/// block argument of an empty block.
+static Operation *defPointOp(Value v) {
+  if (Operation *d = v.getDefiningOp())
+    return d;
+  Block *b = cast<BlockArgument>(v).getOwner();
+  return b->empty() ? nullptr : &b->front();
 }
+
+/// Set `b`'s insertion point immediately after the latest-defined value among
+/// `values` (all of which dominate `anchor`, hence are totally ordered by
+/// dominance), so the ops built there appear as early as legally possible.
+/// Falls back to `anchor` when `values` is empty.  `dom` must be valid for the
+/// region being edited (only operations are added to existing blocks here, so a
+/// single instance stays valid across the rewrite).
+static void setInsertionPointAfterLatestDef(OpBuilder &b, DominanceInfo &dom,
+                                            ArrayRef<Value> values,
+                                            Operation *anchor) {
+  if (values.empty()) {
+    b.setInsertionPoint(anchor);
+    return;
+  }
+  Value latest = values.front();
+  for (Value v : values.drop_front()) {
+    Operation *lp = defPointOp(latest);
+    Operation *vp = defPointOp(v);
+    // `v` is strictly later than `latest` iff `latest`'s point dominates `v`'s.
+    if (lp && vp && dom.properlyDominates(lp, vp))
+      latest = v;
+  }
+  if (Operation *d = latest.getDefiningOp())
+    b.setInsertionPointAfter(d);
+  else
+    b.setInsertionPointToStart(cast<BlockArgument>(latest).getOwner());
+}
+
+/// Forwards `assume` metadata that the *source* IR attached to the values the
+/// rewrite reuses (base pointers and shape/stride scalars) onto the new view
+/// operands.  This preserves alignment/bounds metadata (e.g. `div_by`) that
+/// Triton attached, so it survives onto `make_tensor_view`.
+///
+/// Forwarding is deduplicated and shared across all accesses:
+///   * an existing source `assume` op carrying the wanted predicate is reused
+///     directly when it dominates the use (so e.g. a `div_by<16>` on `%argN`
+///     feeds every view that references `%argN` instead of being re-emitted);
+///   * otherwise a single fresh `assume` is created immediately after the
+///     definition of the value it annotates, and cached for reuse.
+/// Chains of `assume` ops (`assume` of an `assume`) are followed transitively,
+/// since each link is a value-preserving passthrough decorating the same
+/// scalar.  Nothing is fabricated: only predicates the source already attached
+/// are forwarded.  Original now-dead `assume` ops are cleaned up later by DCE.
+struct AssumeForwarder {
+  DominanceInfo &dom;
+  DenseMap<std::pair<Value, Attribute>, Value> cache;
+
+  explicit AssumeForwarder(DominanceInfo &dom) : dom(dom) {}
+
+  /// Returns `scalar` decorated with all source assume predicates.  `anchor` is
+  /// the load/store op the rewritten access is being built for.
+  Value forward(Value scalar, Operation *anchor) {
+    SmallVector<AssumePredicateAttrInterface> preds;
+    SmallVector<Value> work{scalar};
+    SmallPtrSet<Value, 4> seen;
+    while (!work.empty()) {
+      Value v = work.pop_back_val();
+      for (Operation *user : v.getUsers()) {
+        auto a = dyn_cast<AssumeOp>(user);
+        if (!a || a.getValue() != v)
+          continue;
+        AssumePredicateAttrInterface p = a.getPredicateAttr();
+        if (!llvm::is_contained(preds, p))
+          preds.push_back(p);
+        if (seen.insert(a.getResult()).second)
+          work.push_back(a.getResult());
+      }
+    }
+    Value result = scalar;
+    for (AssumePredicateAttrInterface p : preds)
+      result = getOrCreate(result, p, anchor);
+    return result;
+  }
+
+private:
+  Value getOrCreate(Value base, AssumePredicateAttrInterface pred,
+                    Operation *anchor) {
+    std::pair<Value, Attribute> key{base, pred};
+    if (Value cached = cache.lookup(key))
+      return cached;
+
+    // Prefer reusing an existing source `assume` op carrying this predicate.
+    for (Operation *user : base.getUsers()) {
+      auto a = dyn_cast<AssumeOp>(user);
+      if (!a || a.getValue() != base || a.getPredicateAttr() != pred)
+        continue;
+      if (!dom.dominates(a.getResult(), anchor))
+        continue;
+      cache[key] = a.getResult();
+      return a.getResult();
+    }
+
+    // Otherwise create one fresh assume right after the def of `base`.
+    OpBuilder b(base.getContext());
+    if (auto barg = dyn_cast<BlockArgument>(base))
+      b.setInsertionPointToStart(barg.getOwner());
+    else
+      b.setInsertionPointAfter(base.getDefiningOp());
+    Value res = AssumeOp::create(b, base.getLoc(), base, pred).getResult();
+    cache[key] = res;
+    return res;
+  }
+};
 
 /// Strip a chain of `broadcast` and `reshape` ops applied to a scalar tile,
 /// returning the scalar tile value.  Assume ops are also transparent.
@@ -473,12 +558,8 @@ static LogicalResult analyzePtr(Value ptr, ArrayRef<int64_t> tileShape,
 /// padding values.  Returns null when no match.
 static PaddingValueAttr matchPadding(MLIRContext *ctx, Value v) {
   v = lookThroughAssume(v);
-  auto cst = v.getDefiningOp<ConstantOp>();
-  if (!cst)
-    return nullptr;
-  auto attr = cst.getValueAttr();
-  auto fp = dyn_cast<DenseFPElementsAttr>(attr);
-  if (!fp || !fp.isSplat())
+  DenseFPElementsAttr fp;
+  if (!matchPattern(v, m_Constant(&fp)) || !fp.isSplat())
     return nullptr;
   APFloat val = fp.getSplatValue<APFloat>();
   PaddingValue pv;
@@ -520,14 +601,10 @@ static Value extractTileMultiplier(Value start, int64_t tileSize) {
   for (auto [a, b] : {std::pair<Value, Value>(mul.getLhs(), mul.getRhs()),
                       std::pair<Value, Value>(mul.getRhs(), mul.getLhs())}) {
     Value cstSide = lookThroughAssume(a);
-    if (auto cst = cstSide.getDefiningOp<ConstantOp>()) {
-      auto attr = cst.getValueAttr();
-      if (auto ints = dyn_cast<DenseIntElementsAttr>(attr)) {
-        if (ints.isSplat() &&
-            ints.getSplatValue<APInt>().getSExtValue() == tileSize)
-          return b;
-      }
-    }
+    DenseIntElementsAttr ints;
+    if (matchPattern(cstSide, m_Constant(&ints)) && ints.isSplat() &&
+        ints.getSplatValue<APInt>().getSExtValue() == tileSize)
+      return b;
   }
   return nullptr;
 }
@@ -677,6 +754,7 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
 static LogicalResult lowerAccess(OpBuilder &b, Location loc, Value ptr,
                                  Value mask, ArrayRef<int64_t> tileShape,
                                  Type elemTy, PaddingValueAttr padding,
+                                 AssumeForwarder &fwd, Operation *anchor,
                                  Value &outView,
                                  SmallVectorImpl<Value> &outIndices) {
   PtrAccess access;
@@ -695,24 +773,34 @@ static LogicalResult lowerAccess(OpBuilder &b, Location loc, Value ptr,
 
   // Forward any `assume` metadata the source attached to the operands we reuse
   // (base pointer, dynamic shape/stride scalars) onto the rewritten view.
-  Value base = forwardSourceAssumes(b, loc, access.base);
+  Value base = fwd.forward(access.base, anchor);
   SmallVector<Value> dynShape, dynStride;
   dynShape.reserve(bv.dynamicShape.size());
   dynStride.reserve(bv.dynamicStride.size());
   for (Value v : bv.dynamicShape)
-    dynShape.push_back(forwardSourceAssumes(b, loc, v));
+    dynShape.push_back(fwd.forward(v, anchor));
   for (Value v : bv.dynamicStride)
-    dynStride.push_back(forwardSourceAssumes(b, loc, v));
+    dynStride.push_back(fwd.forward(v, anchor));
+
+  // Build the views right after the last definition among their operands so
+  // they appear as early as legally possible (e.g. hoisted out of a loop whose
+  // induction variable they do not depend on), rather than at the load/store.
+  SmallVector<Value> viewOperands;
+  viewOperands.push_back(base);
+  viewOperands.append(dynShape.begin(), dynShape.end());
+  viewOperands.append(dynStride.begin(), dynStride.end());
+  OpBuilder vb(b.getContext());
+  setInsertionPointAfterLatestDef(vb, fwd.dom, viewOperands, anchor);
 
   auto tvOp =
-      MakeTensorViewOp::create(b, loc, bv.tvTy, base, dynShape, dynStride);
-  auto pvOp = MakePartitionViewOp::create(b, loc, bv.pvTy, tvOp.getResult());
+      MakeTensorViewOp::create(vb, loc, bv.tvTy, base, dynShape, dynStride);
+  auto pvOp = MakePartitionViewOp::create(vb, loc, bv.pvTy, tvOp.getResult());
   outView = pvOp.getResult();
   outIndices.assign(bv.indices.begin(), bv.indices.end());
   return success();
 }
 
-static LogicalResult rewriteLoad(LoadPtrTkoOp op) {
+static LogicalResult rewriteLoad(LoadPtrTkoOp op, AssumeForwarder &fwd) {
   Location loc = op.getLoc();
   auto resultTy = cast<TileType>(op.getResult().getType());
   Type elemTy = resultTy.getElementType();
@@ -737,7 +825,7 @@ static LogicalResult rewriteLoad(LoadPtrTkoOp op) {
   Value view;
   SmallVector<Value> indices;
   if (failed(lowerAccess(b, loc, op.getSource(), op.getMask(), tileShape,
-                         elemTy, padding, view, indices))) {
+                         elemTy, padding, fwd, op, view, indices))) {
     op.emitRemark("tileir-ptr-to-view: pointer-arithmetic pattern not "
                   "recognised; skipping");
     return failure();
@@ -755,7 +843,7 @@ static LogicalResult rewriteLoad(LoadPtrTkoOp op) {
   return success();
 }
 
-static LogicalResult rewriteStore(StorePtrTkoOp op) {
+static LogicalResult rewriteStore(StorePtrTkoOp op, AssumeForwarder &fwd) {
   Location loc = op.getLoc();
   auto valueTy = cast<TileType>(op.getValue().getType());
   Type elemTy = valueTy.getElementType();
@@ -775,7 +863,7 @@ static LogicalResult rewriteStore(StorePtrTkoOp op) {
   Value view;
   SmallVector<Value> indices;
   if (failed(lowerAccess(b, loc, op.getDestination(), op.getMask(), tileShape,
-                         elemTy, padding, view, indices))) {
+                         elemTy, padding, fwd, op, view, indices))) {
     op.emitRemark("tileir-ptr-to-view: pointer-arithmetic pattern not "
                   "recognised; skipping");
     return failure();
@@ -823,10 +911,16 @@ struct TileIRPtrToViewPass
         stores.push_back(s);
     });
 
+    // Dominance is queried to decide whether an existing source `assume` may be
+    // reused and to place the new view ops after their latest-defined operand.
+    // The load/store rewrites only add ops to existing blocks (never add, move,
+    // or erase blocks), so a single instance stays valid across the phase.
+    DominanceInfo domInfo(mod);
+    AssumeForwarder fwd(domInfo);
     for (auto l : loads)
-      (void)rewriteLoad(l);
+      (void)rewriteLoad(l, fwd);
     for (auto s : stores)
-      (void)rewriteStore(s);
+      (void)rewriteStore(s, fwd);
 
     // Remove dead iter_args from for loops.  After loads/stores are rewritten
     // the ptr-typed results become unused; rebuild the loop without them.

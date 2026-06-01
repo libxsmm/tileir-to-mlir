@@ -278,10 +278,13 @@ module {
       %cmp1_bc = broadcast %cmp1 : tile<1x32xi1> -> tile<128x32xi1>
       %mask = andi %cmp0_bc, %cmp1_bc : tile<128x32xi1>
 
-      // For loop: ptr advances dim-1 by 32 each iteration.
+      // For loop: ptr advances dim-1 by 32 each iteration.  The view does not
+      // depend on the loop induction variable, so it is hoisted out of the loop
+      // (placed right after the last operand it uses) rather than rebuilt each
+      // iteration.
+      // CHECK: make_tensor_view %arg0
+      // CHECK: make_partition_view
       // CHECK: for %[[IDX:.*]] in
-      // CHECK:   make_tensor_view %arg0
-      // CHECK:   make_partition_view
       // CHECK:   load_view_tko weak %{{.*}}[%{{.*}}, %[[IDX]]]
       // CHECK-NOT: load_ptr_tko
       // CHECK-GPU: scf.for %[[IV:.*]] =
