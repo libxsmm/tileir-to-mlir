@@ -1,6 +1,6 @@
-//===- TileIRPtrToView.cpp - Triton ptr-arith -> CudaTile view ops --------===//
+//===- TileIRPtrToView.cpp - ptr-arith -> CudaTile view ops ---------------===//
 //
-// Pre-conversion pass that recognises the canonical Triton-emitted
+// Pre-conversion pass that recognises the canonical
 // iota+reshape+broadcast+offset pointer-arithmetic feeding a
 // cuda_tile.load_ptr_tko/store_ptr_tko and rewrites it into the higher-level
 // make_tensor_view + make_partition_view + load_view_tko/store_view_tko form.
@@ -37,14 +37,12 @@
 // The start values are expected to be of the form `muli(%idx_d, tile_size_d)`,
 // allowing the per-dimension partition index %idx_d to be recovered.
 //
-// The rewrite is intentionally conservative: it bails (leaving the original
-// load_ptr_tko/store_ptr_tko untouched) whenever it cannot fully recover the
-// access, rather than fabricating a shape/stride.  In particular it requires:
+// The rewrite is conservative: it leaves the original
+// load_ptr_tko/store_ptr_tko untouched whenever it cannot fully recover the
+// access, rather than fabricating a shape/stride. In particular it requires:
 //   * a recovered global size (from the mask) for every dimension;
 //   * the innermost dimension to be contiguous (unit stride) and every other
-//     dimension to carry an explicitly recovered stride -- this matches the
-//     canonical row-major layout emitted by the TileIR frontend
-//     (`tt.make_tensor_desc` lowers to `strides=[..., 1]`);
+//     dimension to carry an explicitly recovered stride (row-major layout);
 //   * exactly one loop-advancing (start-less) dimension when the access is
 //     carried by a `for` iter_arg.
 //
@@ -153,10 +151,10 @@ static void setInsertionPointAfterLatestDef(OpBuilder &b, DominanceInfo &dom,
     b.setInsertionPointToStart(cast<BlockArgument>(latest).getOwner());
 }
 
-/// Forwards `assume` metadata that the *source* IR attached to the values the
+/// Forwards `assume` metadata that the source IR attached to the values the
 /// rewrite reuses (base pointers and shape/stride scalars) onto the new view
-/// operands.  This preserves alignment/bounds metadata (e.g. `div_by`) that
-/// Triton attached, so it survives onto `make_tensor_view`.
+/// operands, preserving alignment/bounds metadata (e.g. `div_by`) on
+/// `make_tensor_view`.
 ///
 /// Forwarding is deduplicated and shared across all accesses:
 ///   * an existing source `assume` op carrying the wanted predicate is reused
@@ -166,8 +164,7 @@ static void setInsertionPointAfterLatestDef(OpBuilder &b, DominanceInfo &dom,
 ///     definition of the value it annotates, and cached for reuse.
 /// Chains of `assume` ops (`assume` of an `assume`) are followed transitively,
 /// since each link is a value-preserving passthrough decorating the same
-/// scalar.  Nothing is fabricated: only predicates the source already attached
-/// are forwarded.  Original now-dead `assume` ops are cleaned up later by DCE.
+/// scalar. Only predicates the source already attached are forwarded.
 struct AssumeForwarder {
   DominanceInfo &dom;
   DenseMap<std::pair<Value, Attribute>, Value> cache;
@@ -252,7 +249,7 @@ static Value matchScalarBroadcastReshape(Value v) {
   return nullptr;
 }
 
-/// Per-dimension information recovered from a Triton ptr-arithmetic chain.
+/// Per-dimension information recovered from a ptr-arithmetic chain.
 struct DimInfo {
   /// Tile-side size (= shape of the tile produced by the load/store).
   int64_t tileSize = 0;
@@ -922,7 +919,7 @@ struct TileIRPtrToViewPass
     for (auto s : stores)
       (void)rewriteStore(s, fwd);
 
-    // Remove dead iter_args from for loops.  After loads/stores are rewritten
+    // Remove dead iter_args from for loops. After loads/stores are rewritten
     // the ptr-typed results become unused; rebuild the loop without them.
     //
     // This is done by hand because cuda_tile's ForOp does not implement
@@ -1005,10 +1002,9 @@ struct TileIRPtrToViewPass
       forOp.erase();
     }
 
-    // Clean up now-dead ops left over from the ptr-arithmetic chains.  We rely
-    // on the generic `isOpTriviallyDead` (all the ptr-arith ops are `Pure`)
-    // plus an explicit case for the non-Pure `assume` op, which carries no
-    // memory effects we need to preserve once its result is unused.
+    // Erase the now-dead ptr-arithmetic ops to a fixed point.
+    // `isOpTriviallyDead` covers the Pure ptr-arith ops; `assume` is handled
+    // explicitly because it is not Pure but is safe to drop once unused.
     bool changed = true;
     while (changed) {
       changed = false;

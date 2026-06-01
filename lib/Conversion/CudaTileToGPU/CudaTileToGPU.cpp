@@ -385,9 +385,9 @@ struct ConvertUnarySourceOp : public OpConversionPattern<SrcOp> {
 
 /// Convert float binary ops to arith float ops.
 ///
-/// Triton-emitted addf/subf/mulf may carry rounding modes and flush_to_zero
-/// flags. Those have no equivalent in the arith FastMath flags and are
-/// dropped here.
+/// The rounding_mode and flush_to_zero flags are not representable in arith
+/// FastMath flags; they are preserved on the result op as the discardable
+/// attributes `tir-dropped-rounding` and `tir-dropped-flush-to-zero`.
 template <typename SrcOp, typename DstOp>
 struct ConvertBinaryFloatOp : public OpConversionPattern<SrcOp> {
   using OpConversionPattern<SrcOp>::OpConversionPattern;
@@ -1070,11 +1070,10 @@ struct ConvertCmpI : public OpConversionPattern<cuda_tile::CmpIOp> {
 ///   - Ranked tiles: Convert to an arith.constant with a DenseElementsAttr of
 ///     the target vector type (splat values use the splat form, e.g.
 ///     `arith.constant dense<7> : vector<1x1xi32>`).
-///   - Scalar integer conversion preserves the integer type; explicit casts to
-///     `index` are inserted later at the ops that require them.
-///   - Pointer types in scalar tiles are intermediate and will become dead
-///   after
-///     make_tensor_view ops are erased; conversion preserves them as-is.
+///   - Scalar integer conversion preserves the integer type; casts to `index`
+///     are inserted at the ops that require them.
+///   - Scalar pointer tiles are forwarded unchanged; the type converter maps
+///     them to `memref<*xT>`.
 struct ConvertConstant : public OpConversionPattern<cuda_tile::ConstantOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -1130,9 +1129,10 @@ using ConvertCosH = ConvertUnarySourceOp<cuda_tile::CosHOp, math::CoshOp>;
 
 /// Convert cuda_tile.divf to arith.divf.
 ///
-/// rounding<approx> maps to the `arcp` (allow reciprocal) FastMath flag on
-/// arith.divf. Other rounding modes and flush_to_zero have no equivalent in
-/// the arith FastMath flags; those are dropped.
+/// `rounding<approx>` maps to the `arcp` (allow reciprocal) FastMath flag.
+/// All other rounding modes and `flush_to_zero` are not representable in arith
+/// FastMath flags and are preserved on the result as `tir-dropped-rounding`
+/// and `tir-dropped-flush-to-zero`.
 struct ConvertDivF : public OpConversionPattern<cuda_tile::DivFOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -1235,14 +1235,14 @@ using ConvertExp = ConvertUnarySourceOp<cuda_tile::ExpOp, math::ExpOp>;
 
 /// Convert cuda_tile.exp2 to math.exp2.
 ///
-/// flush_to_zero has no equivalent in the math FastMath flags; it is dropped.
+/// `flush_to_zero` is not representable in math FastMath flags and is preserved
+/// on the result as `tir-dropped-flush-to-zero` when set.
 struct ConvertExp2 : public OpConversionPattern<cuda_tile::Exp2Op> {
   using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::Exp2Op op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // flush_to_zero has no equivalent in math.exp2 FastMath flags; drop it.
     bool ftz = op.getFlushToZero();
     auto newOp =
         rewriter.replaceOpWithNewOp<math::Exp2Op>(op, adaptor.getSource());
@@ -1379,16 +1379,15 @@ using ConvertFloor = ConvertUnarySourceOp<cuda_tile::FloorOp, math::FloorOp>;
 
 /// Convert cuda_tile.fma to math.fma.
 ///
-/// rounding_mode and flush_to_zero have no equivalent in the math FastMath
-/// flags; those are dropped.
+/// `rounding_mode` and `flush_to_zero` are not representable in math FastMath
+/// flags and are preserved on the result as `tir-dropped-rounding` and
+/// `tir-dropped-flush-to-zero`.
 struct ConvertFma : public OpConversionPattern<cuda_tile::FmaOp> {
   using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::FmaOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // rounding_mode and flush_to_zero have no equivalent in math.fma
-    // FastMath flags; drop them.
     auto rounding = op.getRoundingMode();
     bool ftz = op.getFlushToZero();
     auto newOp = rewriter.replaceOpWithNewOp<math::FmaOp>(
@@ -1404,15 +1403,15 @@ struct ConvertFma : public OpConversionPattern<cuda_tile::FmaOp> {
 
 /// Convert cuda_tile.for to scf.for.
 ///
-///   - Create scf.ForOp with converted bounds and initial values.
-///   - Bounds are cast to `index`. When the upper bound comes from
-///     get_index_space_shape, rescale lb/ub/step by the tile size so the loop
-///     runs in element space, then reconstruct the original tile-space IV
-///     inside the loop body with divui.
-///   - Convert region types in old body using type converter.
-///   - Merge old body into new body, replacing block args (induction var +
-///     iter args).
-///   - Replace old op with new ForOp results.
+///   - Create scf.ForOp with bounds cast to `index` and initial values
+///     forwarded.
+///   - If the induction variable indexes a `partition_view` along a statically
+///     known tile-shape axis (directly, or as the value-preserving
+///     `divi(muli(iv, N), N)`), rescale `lb`/`ub`/`step` from tile space to
+///     element space by that tile size and replace body uses of the IV with
+///     `divui(new_iv, tile_size)` so the tile-space index is recovered.
+///   - Convert the region types and merge the original body into the new one,
+///     replacing the induction-variable and iter-arg block arguments.
 struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -1430,49 +1429,105 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
       return rewriter.notifyMatchFailure(
           op, "for bounds could not be converted to index");
 
-    // Determine the tile size along the loop axis by inspecting how the
-    // induction variable is consumed by load_view_tko / store_view_tko ops.
-    // These ops carry the authoritative partition_view tile shape that
-    // `buildTransferViewAccessPlan` also uses to scale per-tile indices into
-    // element-space memref indices. Using the same source-of-truth here
-    // guarantees the loop step (`tileSize` per iteration) and the per-tile
-    // index scaling (`tileSize` per index increment) are derived from the
-    // same value, regardless of how the original loop bound was computed
-    // (e.g. `get_index_space_shape` vs. a hand-written `divi(_, N)`).
-    int64_t tileSize = 0;
+    // Infer the loop-axis tile size from the partition_view tile shapes at the
+    // load_view_tko/store_view_tko indices that are semantically the induction
+    // variable. The same tile shape is what buildTransferViewAccessPlan
+    // multiplies by when forming element-space memref indices, so deriving the
+    // loop step from it keeps step and per-tile index scaling consistent.
+    //
+    // Frontends sometimes materialize that tile-space index as
+    // `divi(muli(iv, N), N)` rather than a direct `%iv`. For round-to-zero
+    // division `(iv * N) / N == iv` exactly, so such indices are normalized to
+    // a direct IV use; that lets the merged body see the recovered tile index
+    // `divui(new_iv, N)` directly and keeps the transfer lowering on the same
+    // path as a plain `%iv` index. Detection is read-only; the normalization is
+    // applied through the rewriter only once we commit to rescaling.
     Value origIV = op.getInductionVar();
-    auto inspectViewUse = [&](Value view, ValueRange indices) -> bool {
+    auto stripAssume = [](Value value) {
+      while (auto assume = value.getDefiningOp<cuda_tile::AssumeOp>())
+        value = assume.getValue();
+      return value;
+    };
+    auto matchScalarI32Constant = [&](Value value) -> std::optional<int64_t> {
+      value = stripAssume(value);
+      DenseIntElementsAttr ints;
+      if (!matchPattern(value, m_Constant(&ints)) || !ints.isSplat())
+        return std::nullopt;
+      return ints.getSplatValue<APInt>().getSExtValue();
+    };
+    // Returns true when `idx` is semantically `origIV` as a tile index of the
+    // given size: either a direct use, or `divi(muli(iv, N), N)`
+    // (round-to-zero).
+    auto matchesLoopTileIndex = [&](Value idx, int64_t expectedTileSize) {
+      idx = stripAssume(idx);
+      if (idx == origIV)
+        return true;
+      auto div = idx.getDefiningOp<cuda_tile::DivIOp>();
+      if (!div || div.getRounding() != cuda_tile::RoundingMode::ZERO)
+        return false;
+      if (matchScalarI32Constant(div.getRhs()) != expectedTileSize)
+        return false;
+      auto mul = stripAssume(div.getLhs()).getDefiningOp<cuda_tile::MulIOp>();
+      if (!mul)
+        return false;
+      for (auto [maybeIV, maybeCst] :
+           {std::pair<Value, Value>(mul.getLhs(), mul.getRhs()),
+            std::pair<Value, Value>(mul.getRhs(), mul.getLhs())})
+        if (stripAssume(maybeIV) == origIV &&
+            matchScalarI32Constant(maybeCst) == expectedTileSize)
+          return true;
+      return false;
+    };
+
+    // Read-only scan: derive the tile size and remember which (op, operand)
+    // index positions need normalizing to a direct IV use.
+    int64_t tileSize = 0;
+    SmallVector<std::pair<Operation *, unsigned>> normalizeTargets;
+    auto inspectViewUse = [&](Operation *owner, Value view,
+                              OperandRange indices) -> bool {
       auto pvTy = dyn_cast<cuda_tile::PartitionViewType>(view.getType());
       if (!pvTy)
         return true;
       auto shape = pvTy.getTileShape().asArrayRef();
       for (auto [pos, idx] : llvm::enumerate(indices)) {
-        if (idx != origIV)
-          continue;
         if (pos >= shape.size())
           return false;
         int64_t sz = shape[pos];
         if (sz <= 0)
           return false;
+        if (!matchesLoopTileIndex(idx, sz))
+          continue;
         if (tileSize != 0 && tileSize != sz)
           return false;
         tileSize = sz;
+        if (idx != origIV)
+          normalizeTargets.emplace_back(owner, pos);
       }
       return true;
     };
-    for (Operation *user : origIV.getUsers()) {
+    WalkResult walkResult = op.getBody()->walk([&](Operation *bodyOp) {
       bool ok = true;
-      if (auto ld = dyn_cast<cuda_tile::LoadViewTkoOp>(user))
-        ok = inspectViewUse(ld.getView(), ld.getIndex());
-      else if (auto st = dyn_cast<cuda_tile::StoreViewTkoOp>(user))
-        ok = inspectViewUse(st.getView(), st.getIndex());
-      if (!ok) {
-        tileSize = 0;
-        break;
-      }
-    }
+      if (auto ld = dyn_cast<cuda_tile::LoadViewTkoOp>(bodyOp))
+        ok = inspectViewUse(ld, ld.getView(), ld.getIndex());
+      else if (auto st = dyn_cast<cuda_tile::StoreViewTkoOp>(bodyOp))
+        ok = inspectViewUse(st, st.getView(), st.getIndex());
+      return ok ? WalkResult::advance() : WalkResult::interrupt();
+    });
+    if (walkResult.wasInterrupted())
+      tileSize = 0;
 
     if (tileSize > 0) {
+      // Normalize the matched `divi(muli(iv, N), N)` indices to a direct IV use
+      // (value-preserving) so the merged body indexes with `divui(new_iv, N)`.
+      for (auto [owner, pos] : normalizeTargets) {
+        unsigned idxPos = pos;
+        MutableOperandRange indices =
+            isa<cuda_tile::LoadViewTkoOp>(owner)
+                ? cast<cuda_tile::LoadViewTkoOp>(owner).getIndexMutable()
+                : cast<cuda_tile::StoreViewTkoOp>(owner).getIndexMutable();
+        rewriter.modifyOpInPlace(
+            owner, [&] { indices.slice(idxPos, 1).assign(origIV); });
+      }
       Value tileSizeVal =
           arith::ConstantIndexOp::create(rewriter, loc, tileSize);
       lb = arith::MulIOp::create(rewriter, loc, lb, tileSizeVal);
@@ -1502,8 +1557,8 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
 
     Value iv;
     if (tileSize > 0) {
-      // The loop now iterates in element space. Introduce a divui to recover
-      // the tile-space index that existing body ops expect.
+      // The loop iterates in element space; recover the tile-space index
+      // that body ops expect with divui(iv, tileSize).
       Value tileSizeVal =
           arith::ConstantIndexOp::create(rewriter, loc, tileSize);
       Value tileIdx = arith::DivUIOp::create(
@@ -1922,14 +1977,10 @@ using ConvertIToF = ConvertFromToSignednessCastWithRoundingOp<
 ///     extent. Otherwise the transfer_read masks and substitutes the
 ///     `padding` value, which is taken from `partition_view.padding_value`.
 ///
-/// Restrictions / guards (return notifyMatchFailure on violation):
-///   - Only `weak` memory_ordering_semantics is supported. Relaxed/acquire
-///     have no equivalent in `vector.transfer_read`.
+/// Restrictions (return notifyMatchFailure on violation):
+///   - Only `weak` memory_ordering_semantics is supported.
 ///   - `memory_scope` is not supported.
-///   - `result_token` must be unused: this lowering drops the token, so any
-///     consumer would be left dangling.
-///     (`cuda_tile.assume`/no consumers is the common case after the rest of
-///     the conversion runs.)
+///   - `result_token` must have no live uses; this lowering drops the token.
 struct ConvertLoadViewTko
     : public OpConversionPattern<cuda_tile::LoadViewTkoOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -1986,7 +2037,6 @@ struct ConvertLoadViewTko
         AffineMapAttr::get(plan->permutationMap), padding,
         /*mask=*/Value(), rewriter.getBoolArrayAttr(plan->inBounds));
 
-    // result_token has no live uses (guarded above); drop it.
     rewriter.replaceOp(op, {readOp.getResult(), Value()});
     return success();
   }
@@ -2427,14 +2477,14 @@ struct ConvertReturn : public OpConversionPattern<cuda_tile::ReturnOp> {
 
 /// Convert cuda_tile.rsqrt to math.rsqrt.
 ///
-/// flush_to_zero has no equivalent in the math FastMath flags; it is dropped.
+/// `flush_to_zero` is not representable in math FastMath flags and is
+/// preserved on the result as `tir-dropped-flush-to-zero` when set.
 struct ConvertRsqrt : public OpConversionPattern<cuda_tile::RsqrtOp> {
   using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::RsqrtOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // flush_to_zero has no equivalent in math.rsqrt FastMath flags; drop it.
     bool ftz = op.getFlushToZero();
     auto newOp =
         rewriter.replaceOpWithNewOp<math::RsqrtOp>(op, adaptor.getSource());
@@ -2527,9 +2577,10 @@ using ConvertSinH = ConvertUnarySourceOp<cuda_tile::SinHOp, math::SinhOp>;
 
 /// Convert cuda_tile.sqrt to math.sqrt.
 ///
-/// rounding<approx> maps to the `afn` (allow approximate functions) FastMath
-/// flag on math.sqrt. Other rounding modes and flush_to_zero have no
-/// equivalent in the math FastMath flags; those are dropped.
+/// `rounding<approx>` maps to the `afn` (allow approximate functions) FastMath
+/// flag. All other rounding modes and `flush_to_zero` are not representable in
+/// math FastMath flags and are preserved on the result as
+/// `tir-dropped-rounding` and `tir-dropped-flush-to-zero`.
 struct ConvertSqrt : public OpConversionPattern<cuda_tile::SqrtOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -2802,16 +2853,16 @@ struct ConvertTileIRToGPUPass
     if (failed(applyPartialConversion(module, target, std::move(patterns))))
       return signalPassFailure();
 
-    // Post-conversion cleanup: fold muli(divui(x, c), c) -> x.
-    // The divui result may pass through index_cast ops before reaching the
-    // muli, so we look through index_casts to find the underlying divui.
-    // The divisor and multiplier may be separate constant ops with the same
-    // value, so we compare constant attribute values.
+    // Fold muli(divui(x, c), c) -> x. These patterns are produced when
+    // ConvertFor rescales loop bounds and inserts a divui in the body; once
+    // a transfer op then multiplies the recovered tile-space index by the
+    // same tile size, the round-trip collapses. The divui result may be
+    // wrapped in index_cast ops, and the two `c` operands may be distinct
+    // constant ops with the same value.
     module.walk([](arith::MulIOp op) {
       for (auto [mulOperand, otherOperand] :
            {std::pair(op.getLhs(), op.getRhs()),
             std::pair(op.getRhs(), op.getLhs())}) {
-        // Look through index_casts.
         Value v = mulOperand;
         while (auto cast = v.getDefiningOp<arith::IndexCastOp>())
           v = cast.getIn();
@@ -2823,7 +2874,6 @@ struct ConvertTileIRToGPUPass
           op->erase();
           return;
         }
-        // Check if they are distinct constants with the same value.
         auto divCst = divOp.getRhs().getDefiningOp<arith::ConstantIndexOp>();
         auto mulCst = otherOperand.getDefiningOp<arith::ConstantIndexOp>();
         if (divCst && mulCst && divCst.value() == mulCst.value()) {
@@ -2834,7 +2884,8 @@ struct ConvertTileIRToGPUPass
       }
     });
 
-    // Clean up any leftover unrealized_conversion_casts that became dead.
+    // Erase unrealized_conversion_casts left dead by pattern application,
+    // to a fixed point.
     bool changed = true;
     while (changed) {
       changed = false;
