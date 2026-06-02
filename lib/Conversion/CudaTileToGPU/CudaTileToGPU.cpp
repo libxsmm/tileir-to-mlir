@@ -43,8 +43,8 @@
 // cuda_tile::IToFOp
 // cuda_tile::IfOp
 // cuda_tile::IotaOp
-// cuda_tile::LoadViewTkoOp
-// cuda_tile::LogOp
+// cuda_tile::LoadPtrTkoOp (scalar/rank-0 only; higher-rank requires
+// --tileir-ptr-to-view) cuda_tile::LoadViewTkoOp cuda_tile::LogOp
 // cuda_tile::Log2Op
 // cuda_tile::MakePartitionViewOp
 // cuda_tile::MakeTensorViewOp
@@ -77,8 +77,8 @@
 // cuda_tile::SinOp
 // cuda_tile::SinHOp
 // cuda_tile::SqrtOp
-// cuda_tile::StoreViewTkoOp
-// cuda_tile::SubFOp
+// cuda_tile::StorePtrTkoOp (scalar/rank-0 only; higher-rank requires
+// --tileir-ptr-to-view) cuda_tile::StoreViewTkoOp cuda_tile::SubFOp
 // cuda_tile::SubIOp
 // cuda_tile::TanOp
 // cuda_tile::TanHOp
@@ -93,13 +93,11 @@
 // cuda_tile::BreakOp
 // cuda_tile::IntToPtrOp
 // cuda_tile::JoinTokensOp
-// cuda_tile::LoadPtrTkoOp
 // cuda_tile::LoopOp
 // cuda_tile::MakeTokenOp
 // cuda_tile::OffsetOp
 // cuda_tile::PrintTkoOp
 // cuda_tile::PtrToIntOp
-// cuda_tile::StorePtrTkoOp
 
 #include "mlir/Conversion/CudaTileToGPU/CudaTileToGPU.h"
 
@@ -2356,6 +2354,92 @@ struct ConvertNegI : public OpConversionPattern<cuda_tile::NegIOp> {
   }
 };
 
+/// Convert scalar (rank-0) cuda_tile.load_ptr_tko on a `tile<ptr<T>>` to a
+/// `memref.reinterpret_cast` + `memref.load`. The source `tile<ptr<T>>` is
+/// converted to `memref<*xT>`; a rank-0 reinterpret_cast (offset 0) recovers
+/// the scalar memref the load reads from.
+///
+/// Higher-rank pointer loads must first be lifted by `--tileir-ptr-to-view`.
+struct ConvertLoadPtrTkoScalar
+    : public OpConversionPattern<cuda_tile::LoadPtrTkoOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::LoadPtrTkoOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto tileTy = cast<cuda_tile::TileType>(op.getResult().getType());
+    if (!tileTy.getShape().empty())
+      return rewriter.notifyMatchFailure(
+          op, "only scalar (rank-0) load_ptr_tko is supported here");
+    if (op.getMask())
+      return rewriter.notifyMatchFailure(
+          op, "masked scalar load_ptr_tko is not supported");
+    if (failed(checkCommonTkoGuards(op, rewriter)))
+      return failure();
+
+    auto srcUnranked =
+        dyn_cast<UnrankedMemRefType>(adaptor.getSource().getType());
+    if (!srcUnranked)
+      return rewriter.notifyMatchFailure(
+          op, "expected unranked memref pointer source");
+
+    Location loc = op.getLoc();
+    auto rank0Ty = MemRefType::get({}, srcUnranked.getElementType(),
+                                   MemRefLayoutAttrInterface{},
+                                   srcUnranked.getMemorySpace());
+    auto rc = memref::ReinterpretCastOp::create(
+        rewriter, loc, rank0Ty, adaptor.getSource(),
+        /*offset=*/rewriter.getIndexAttr(0),
+        /*sizes=*/SmallVector<OpFoldResult>{},
+        /*strides=*/SmallVector<OpFoldResult>{});
+    Value scalar =
+        memref::LoadOp::create(rewriter, loc, rc.getResult(), ValueRange{});
+    rewriter.replaceOp(op, {scalar, Value()});
+    return success();
+  }
+};
+
+/// Convert scalar (rank-0) cuda_tile.store_ptr_tko on a `tile<ptr<T>>` to a
+/// `memref.reinterpret_cast` + `memref.store`. Mirrors ConvertLoadPtrTkoScalar.
+struct ConvertStorePtrTkoScalar
+    : public OpConversionPattern<cuda_tile::StorePtrTkoOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::StorePtrTkoOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto tileTy = cast<cuda_tile::TileType>(op.getValue().getType());
+    if (!tileTy.getShape().empty())
+      return rewriter.notifyMatchFailure(
+          op, "only scalar (rank-0) store_ptr_tko is supported here");
+    if (op.getMask())
+      return rewriter.notifyMatchFailure(
+          op, "masked scalar store_ptr_tko is not supported");
+    if (failed(checkCommonTkoGuards(op, rewriter)))
+      return failure();
+
+    auto dstUnranked =
+        dyn_cast<UnrankedMemRefType>(adaptor.getDestination().getType());
+    if (!dstUnranked)
+      return rewriter.notifyMatchFailure(
+          op, "expected unranked memref pointer destination");
+
+    Location loc = op.getLoc();
+    auto rank0Ty = MemRefType::get({}, dstUnranked.getElementType(),
+                                   MemRefLayoutAttrInterface{},
+                                   dstUnranked.getMemorySpace());
+    auto rc = memref::ReinterpretCastOp::create(
+        rewriter, loc, rank0Ty, adaptor.getDestination(),
+        /*offset=*/rewriter.getIndexAttr(0),
+        /*sizes=*/SmallVector<OpFoldResult>{},
+        /*strides=*/SmallVector<OpFoldResult>{});
+    memref::StoreOp::create(rewriter, loc, adaptor.getValue(), rc.getResult(),
+                            ValueRange{});
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 using ConvertOrI = ConvertBinaryLhsRhsOp<cuda_tile::OrIOp, arith::OrIOp>;
 
 /// Convert cuda_tile.permute to vector.transpose.
@@ -2866,14 +2950,15 @@ static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
       ConvertFma, ConvertFor, ConvertFToF, ConvertFToI, ConvertGetGlobal,
       ConvertGetIndexSpaceShape, ConvertGetNumTileBlocks, ConvertGetTensorShape,
       ConvertGetTileBlockId, ConvertGlobal, ConvertIf, ConvertIota, ConvertIToF,
-      ConvertLoadViewTko, ConvertLog, ConvertLog2, ConvertMakePartitionView,
-      ConvertMakeTensorView, ConvertMaxF, ConvertMaxI, ConvertMinF, ConvertMinI,
-      ConvertMmaF, ConvertMmaI, ConvertModule, ConvertMulF, ConvertMulhiI,
-      ConvertMulI, ConvertOffsetScalarPtr, ConvertNegF, ConvertNegI, ConvertOrI,
-      ConvertPermute, ConvertPow, ConvertPtrToPtrCastOrFail, ConvertReduce,
-      ConvertRemF, ConvertRemI, ConvertReshape, ConvertReturn, ConvertRsqrt,
-      ConvertScan, ConvertSelect, ConvertShLI, ConvertShRI, ConvertSin,
-      ConvertSinH, ConvertSqrt, ConvertStoreViewTko, ConvertSubF, ConvertSubI,
+      ConvertLoadPtrTkoScalar, ConvertLoadViewTko, ConvertLog, ConvertLog2,
+      ConvertMakePartitionView, ConvertMakeTensorView, ConvertMaxF, ConvertMaxI,
+      ConvertMinF, ConvertMinI, ConvertMmaF, ConvertMmaI, ConvertModule,
+      ConvertMulF, ConvertMulhiI, ConvertMulI, ConvertOffsetScalarPtr,
+      ConvertNegF, ConvertNegI, ConvertOrI, ConvertPermute, ConvertPow,
+      ConvertPtrToPtrCastOrFail, ConvertReduce, ConvertRemF, ConvertRemI,
+      ConvertReshape, ConvertReturn, ConvertRsqrt, ConvertScan, ConvertSelect,
+      ConvertShLI, ConvertShRI, ConvertSin, ConvertSinH, ConvertSqrt,
+      ConvertStorePtrTkoScalar, ConvertStoreViewTko, ConvertSubF, ConvertSubI,
       ConvertTan, ConvertTanH, ConvertTruncI, ConvertXOrI, ConvertYield>(
       converter, ctx);
 }

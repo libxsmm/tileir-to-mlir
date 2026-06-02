@@ -290,6 +290,30 @@ cuda_tile.module @m {
     %tok = store_view_tko weak %tile, %pv[%c0, %c1] : tile<4x2xf16>, partition_view<tile=(4x2), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>, tile<i32> -> token
   }
 
+  // --- scalar load_ptr_tko: lowers directly to reinterpret_cast + memref.load ---
+  // CHECK-LABEL: gpu.func @test_scalar_load_ptr
+  // CHECK-SAME: %[[SLP_UPTR:[a-zA-Z0-9_]+]]: memref<*xf32>
+  entry @test_scalar_load_ptr(%p: !cuda_tile.tile<!cuda_tile.ptr<f32>>) {
+    // CHECK: %[[SLP_R0:.*]] = memref.reinterpret_cast %[[SLP_UPTR]] to offset: [0], sizes: [], strides: [] : memref<*xf32> to memref<f32>
+    // CHECK: %[[SLP_VAL:.*]] = memref.load %[[SLP_R0]][] : memref<f32>
+    // CHECK-NOT: load_ptr_tko
+    %v, %tok = load_ptr_tko weak %p : tile<ptr<f32>> -> tile<f32>, token
+    return
+  }
+
+  // --- scalar store_ptr_tko: lowers directly to reinterpret_cast + memref.store ---
+  // CHECK-LABEL: gpu.func @test_scalar_store_ptr
+  // CHECK-SAME: %[[SSP_UPTR:[a-zA-Z0-9_]+]]: memref<*xf32>
+  entry @test_scalar_store_ptr(%p: !cuda_tile.tile<!cuda_tile.ptr<f32>>) {
+    %v = constant <f32: 1.000000e+00> : tile<f32>
+    // CHECK: %[[SSP_VAL:.*]] = arith.constant 1.000000e+00 : f32
+    // CHECK: %[[SSP_R0:.*]] = memref.reinterpret_cast %[[SSP_UPTR]] to offset: [0], sizes: [], strides: [] : memref<*xf32> to memref<f32>
+    // CHECK: memref.store %[[SSP_VAL]], %[[SSP_R0]][] : memref<f32>
+    // CHECK-NOT: store_ptr_tko
+    %tok = store_ptr_tko weak %p, %v : tile<ptr<f32>>, tile<f32> -> token
+    return
+  }
+
   // --- reduce (1D -> scalar, mulf) ---
   // CHECK-LABEL: gpu.func @test_reduce_mulf_1d
   entry @test_reduce_mulf_1d() {

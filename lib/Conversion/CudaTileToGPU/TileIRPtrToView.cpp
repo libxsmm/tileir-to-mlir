@@ -816,8 +816,12 @@ static LogicalResult rewriteLoad(LoadPtrTkoOp op, AssumeForwarder &fwd) {
   ArrayRef<int64_t> tileShape = resultTy.getShape();
 
   // The pass requires a mask so that we can recover the per-dim global sizes.
+  // Rank-0 (scalar) loads carry no per-dim information and are lowered
+  // directly by --convert-cuda-tile-to-gpu, so we silently skip them here
+  // rather than emitting a misleading remark.
   if (!op.getMask()) {
-    op.emitRemark("tileir-ptr-to-view: load has no mask; skipping");
+    if (!tileShape.empty())
+      op.emitRemark("tileir-ptr-to-view: load has no mask; skipping");
     return failure();
   }
 
@@ -858,8 +862,12 @@ static LogicalResult rewriteStore(StorePtrTkoOp op, AssumeForwarder &fwd) {
   Type elemTy = valueTy.getElementType();
   ArrayRef<int64_t> tileShape = valueTy.getShape();
 
+  // Same rationale as in rewriteLoad: scalar (rank-0) stores are handled by
+  // the direct --convert-cuda-tile-to-gpu pattern; only emit the remark for
+  // higher-rank stores that genuinely need a mask.
   if (!op.getMask()) {
-    op.emitRemark("tileir-ptr-to-view: store has no mask; skipping");
+    if (!tileShape.empty())
+      op.emitRemark("tileir-ptr-to-view: store has no mask; skipping");
     return failure();
   }
 
