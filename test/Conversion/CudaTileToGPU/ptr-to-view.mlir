@@ -394,5 +394,37 @@ module {
       return
     }
 
+    // CHECK-LABEL: @test_barrier_layer_norm_bwd 
+    // CHECK-SAME: [[varg0:%.*]]: tile<ptr<f16>>, [[varg1:%.*]]: tile<i32>, [[varg2:%.*]]: tile<i32>) {
+    entry @test_barrier_layer_norm_bwd(%arg4: tile<ptr<f16>>, %arg9: tile<i32>, %arg10: tile<i32>) {
+      
+      // CHECK: [[vassume:%.*]] = assume div_by<16>, [[varg2]] : tile<i32>
+      %assume = assume div_by<16>, %arg10 : tile<i32>
+      // CHECK: [[vassume_0:%.*]] = assume div_by<16>, [[varg1]] : tile<i32>
+      %assume_0 = assume div_by<16>, %arg9 : tile<i32>
+      // CHECK: [[vassume_1:%.*]] = assume div_by<16>, [[varg0]] : tile<ptr<f16>>
+      %assume_5 = assume div_by<16>, %arg4 : tile<ptr<f16>>
+      // CHECK: [[vblockId_x:%.*]], [[vblockId_y:%.*]], [[vblockId_z:%.*]] = get_tile_block_id : tile<i32>
+      %blockId_x, %blockId_y, %blockId_z = get_tile_block_id : tile<i32>
+      
+      // CHECK: [[v0:%.*]] = muli [[vblockId_x]], [[vassume_0]] : tile<i32>
+      // CHECK: [[v1:%.*]] = offset [[vassume_1]], [[v0]] : tile<ptr<f16>>, tile<i32> -> tile<ptr<f16>>
+      // CHECK: [[vtview:%.*]] = make_tensor_view [[v1]], shape = [[[vassume]]], strides = [1] : tile<i32> -> tensor_view<?xf16, strides=[1]>
+      // CHECK: [[vpview:%.*]] = make_partition_view [[vtview]] : partition_view<tile=(1024), padding_value = zero, tensor_view<?xf16, strides=[1]>>
+      // CHECK: [[vcst_0_i32:%.*]] = constant <i32: 0> : tile<i32>
+      // CHECK: [[vtile:%.*]], [[vresult_token:%.*]] = load_view_tko weak [[vpview]][[[vcst_0_i32]]] : partition_view<tile=(1024), padding_value = zero, tensor_view<?xf16, strides=[1]>>, tile<i32> -> tile<1024xf16>, token
+
+      %0 = iota : tile<1024xi32>
+      %reshape = reshape %assume : tile<i32> -> tile<1xi32>
+      %bcast = broadcast %reshape : tile<1xi32> -> tile<1024xi32>
+      %1 = cmpi less_than %0, %bcast, signed : tile<1024xi32> -> tile<1024xi1>
+      %2 = muli %blockId_x, %assume_0 : tile<i32>
+      %3 = offset %assume_5, %2 : tile<ptr<f16>>, tile<i32> -> tile<ptr<f16>>
+      %reshape_14 = reshape %3 : tile<ptr<f16>> -> tile<1xptr<f16>>
+      %bcast_15 = broadcast %reshape_14 : tile<1xptr<f16>> -> tile<1024xptr<f16>>
+      %14 = offset %bcast_15, %0 : tile<1024xptr<f16>>, tile<1024xi32> -> tile<1024xptr<f16>>
+      %cst_0_f16 = constant <f16: 0.000000e+00> : tile<1024xf16>
+      %result, %result_token = load_ptr_tko weak %14, %1, %cst_0_f16 : tile<1024xptr<f16>>, tile<1024xi1>, tile<1024xf16> -> tile<1024xf16>, token
+    }
   }
 }

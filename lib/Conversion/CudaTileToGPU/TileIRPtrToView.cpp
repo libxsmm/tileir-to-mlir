@@ -491,18 +491,29 @@ static LogicalResult analyzePtr(Value ptr, ArrayRef<int64_t> tileShape,
     if (auto off = cur.getDefiningOp<OffsetOp>()) {
       DimInfo info;
       int dim = -1;
-      if (failed(decomposeAddend(off.getOffset(), tileShape, dim, info)))
-        return failure();
-      if (dim < 0 || dim >= (int)tileShape.size())
-        return failure();
-      if (covered[dim])
-        return failure();
-      // Preserve the recovered tile size from analysis.
-      out.dims[dim].start = info.start;
-      out.dims[dim].stride = info.stride;
-      covered[dim] = true;
-      cur = off.getPtr();
-      continue;
+      if (succeeded(decomposeAddend(off.getOffset(), tileShape, dim, info))) {
+        if (dim < 0 || dim >= (int)tileShape.size())
+          return failure();
+        if (covered[dim])
+          return failure();
+        // Preserve the recovered tile size from analysis.
+        out.dims[dim].start = info.start;
+        out.dims[dim].stride = info.stride;
+        covered[dim] = true;
+        cur = off.getPtr();
+        continue;
+      }
+
+      // Unrecognised offset addend. If the offset op itself produces a scalar
+      // pointer tile (e.g. `offset(base, row_start)` that pre-shifts the base
+      // to the beginning of a row), stop tracing here and use `cur` as the
+      // base.  The pre-computed start is already baked into the pointer;
+      // partition index 0 will land on the correct element without needing to
+      // recover the multiplier.
+      if (isScalarTile(cur.getType()))
+        break;
+
+      return failure();
     }
     // Handle for-loop iter_arg: trace through to initial value and record
     // per-iteration advancement.
@@ -612,7 +623,8 @@ static Value buildZeroI32(OpBuilder &b, Location loc) {
   auto i32 = b.getI32Type();
   auto tileTy = TileType::get(b.getContext(), {}, i32);
   auto attr = DenseElementsAttr::get(tileTy, APInt(32, 0));
-  return ConstantOp::create(b, loc, tileTy, cast<DenseTypedElementsAttr>(attr));
+  return ConstantOp::create(b, loc, tileTy,
+                            cast<DenseIntOrFPElementsAttr>(attr));
 }
 
 /// Materialise the views and per-dim indices required to express `access` as

@@ -2256,6 +2256,81 @@ struct ConvertMulhiI : public OpConversionPattern<cuda_tile::MulhiIOp> {
 using ConvertMulI =
     ConvertBinaryLhsRhsWithOverflowOp<cuda_tile::MulIOp, arith::MulIOp>;
 
+/// Convert scalar cuda_tile.offset on pointer tiles to a memref view.
+///
+/// Pointer model in this pass: tile<ptr<T>> -> memref<*xT>. For
+/// `offset(ptr, off)` with a scalar `off`, build a rank-1 memref view with
+/// dynamic offset and unit size/stride, then cast back to memref<*xT>. The
+/// unranked cast carries the buffer pointer at the offset position, so a
+/// downstream make_tensor_view's reinterpret_cast (offset 0) correctly starts
+/// at the shifted location.
+struct ConvertOffsetScalarPtr
+    : public OpConversionPattern<cuda_tile::OffsetOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::OffsetOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto offTy = dyn_cast<cuda_tile::TileType>(op.getOffset().getType());
+    if (!offTy || !offTy.getShape().empty())
+      return rewriter.notifyMatchFailure(
+          op, "only scalar pointer offsets are supported");
+
+    // Restrict to the pass's pointer model: tile<ptr<T>> -> memref<*xT>.
+    // Lowering through a ranked source memref would be unsafe because
+    // memref.reinterpret_cast's offset is absolute to the underlying buffer
+    // and would silently discard any pre-existing offset / strided layout on
+    // the source view.
+    auto srcUnranked = dyn_cast<UnrankedMemRefType>(adaptor.getPtr().getType());
+    auto dstUnranked = dyn_cast_or_null<UnrankedMemRefType>(
+        getTypeConverter()->convertType(op.getType()));
+    if (!srcUnranked || !dstUnranked)
+      return rewriter.notifyMatchFailure(
+          op, "expected unranked memref pointer model on both source and "
+              "result");
+
+    Type elemTy = srcUnranked.getElementType();
+    Attribute memSpace = srcUnranked.getMemorySpace();
+    if (dstUnranked.getElementType() != elemTy)
+      return rewriter.notifyMatchFailure(
+          op, "source and result element types must match");
+    if (dstUnranked.getMemorySpace() != memSpace)
+      return rewriter.notifyMatchFailure(
+          op, "source and result memory spaces must match");
+
+    // Offset element type must be an integer; reject pointer/float scalars.
+    if (!isa<IntegerType>(offTy.getElementType()))
+      return rewriter.notifyMatchFailure(op,
+                                         "offset element type must be integer");
+
+    Value offIdx = castValueToType(rewriter, op.getLoc(), adaptor.getOffset(),
+                                   rewriter.getIndexType());
+    if (!offIdx)
+      return rewriter.notifyMatchFailure(
+          op, "offset addend could not be converted to index");
+
+    auto rank1ViewTy = MemRefType::get(
+        {1}, elemTy,
+        StridedLayoutAttr::get(rewriter.getContext(), ShapedType::kDynamic,
+                               SmallVector<int64_t>{1}),
+        memSpace);
+
+    auto rc = memref::ReinterpretCastOp::create(
+        rewriter, op.getLoc(), rank1ViewTy, adaptor.getPtr(),
+        OpFoldResult(offIdx),
+        SmallVector<OpFoldResult>{rewriter.getIndexAttr(1)},
+        SmallVector<OpFoldResult>{rewriter.getIndexAttr(1)});
+
+    Value result = rc.getResult();
+    if (result.getType() != dstUnranked)
+      result =
+          memref::CastOp::create(rewriter, op.getLoc(), dstUnranked, result);
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
 using ConvertNegF = ConvertUnarySourceOp<cuda_tile::NegFOp, arith::NegFOp>;
 
 /// Convert cuda_tile.negi to arith.subi(0, source).
@@ -2794,12 +2869,13 @@ static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
       ConvertLoadViewTko, ConvertLog, ConvertLog2, ConvertMakePartitionView,
       ConvertMakeTensorView, ConvertMaxF, ConvertMaxI, ConvertMinF, ConvertMinI,
       ConvertMmaF, ConvertMmaI, ConvertModule, ConvertMulF, ConvertMulhiI,
-      ConvertMulI, ConvertNegF, ConvertNegI, ConvertOrI, ConvertPermute,
-      ConvertPow, ConvertPtrToPtrCastOrFail, ConvertReduce, ConvertRemF,
-      ConvertRemI, ConvertReshape, ConvertReturn, ConvertRsqrt, ConvertScan,
-      ConvertSelect, ConvertShLI, ConvertShRI, ConvertSin, ConvertSinH,
-      ConvertSqrt, ConvertStoreViewTko, ConvertSubF, ConvertSubI, ConvertTan,
-      ConvertTanH, ConvertTruncI, ConvertXOrI, ConvertYield>(converter, ctx);
+      ConvertMulI, ConvertOffsetScalarPtr, ConvertNegF, ConvertNegI, ConvertOrI,
+      ConvertPermute, ConvertPow, ConvertPtrToPtrCastOrFail, ConvertReduce,
+      ConvertRemF, ConvertRemI, ConvertReshape, ConvertReturn, ConvertRsqrt,
+      ConvertScan, ConvertSelect, ConvertShLI, ConvertShRI, ConvertSin,
+      ConvertSinH, ConvertSqrt, ConvertStoreViewTko, ConvertSubF, ConvertSubI,
+      ConvertTan, ConvertTanH, ConvertTruncI, ConvertXOrI, ConvertYield>(
+      converter, ctx);
 }
 
 //===----------------------------------------------------------------------===//

@@ -62,6 +62,55 @@ cuda_tile.module @m {
     return
   }
 
+  // --- scalar offset on a pointer tile ---
+  // CHECK-LABEL: gpu.func @test_offset_scalar_i32
+  // CHECK-SAME: %[[OFS_BASE:[a-zA-Z0-9_]+]]: memref<*xf16>, %[[OFS_O:[a-zA-Z0-9_]+]]: i32
+  entry @test_offset_scalar_i32(%p: !cuda_tile.tile<!cuda_tile.ptr<f16>>, %o: !cuda_tile.tile<i32>) {
+    // CHECK: %[[OFS_I:.*]] = arith.index_cast %[[OFS_O]] : i32 to index
+    // CHECK: %[[OFS_R:.*]] = memref.reinterpret_cast %[[OFS_BASE]] to offset: [%[[OFS_I]]], sizes: [1], strides: [1] : memref<*xf16> to memref<1xf16, strided<[1], offset: ?>>
+    // CHECK: memref.cast %[[OFS_R]] : memref<1xf16, strided<[1], offset: ?>> to memref<*xf16>
+    %q = offset %p, %o : tile<ptr<f16>>, tile<i32> -> tile<ptr<f16>>
+    return
+  }
+
+  // --- scalar offset with i64 index width ---
+  // CHECK-LABEL: gpu.func @test_offset_scalar_i64
+  // CHECK-SAME: %[[OFS64_BASE:[a-zA-Z0-9_]+]]: memref<*xf32>, %[[OFS64_O:[a-zA-Z0-9_]+]]: i64
+  entry @test_offset_scalar_i64(%p: !cuda_tile.tile<!cuda_tile.ptr<f32>>, %o: !cuda_tile.tile<i64>) {
+    // CHECK: %[[OFS64_I:.*]] = arith.index_cast %[[OFS64_O]] : i64 to index
+    // CHECK: memref.reinterpret_cast %[[OFS64_BASE]] to offset: [%[[OFS64_I]]], sizes: [1], strides: [1] : memref<*xf32> to memref<1xf32, strided<[1], offset: ?>>
+    %q = offset %p, %o : tile<ptr<f32>>, tile<i64> -> tile<ptr<f32>>
+    return
+  }
+
+  // --- scalar offset feeding make_tensor_view (composition) ---
+  // The view's reinterpret_cast must use offset 0 on the offset-shifted memref
+  // so the absolute-offset semantics of reinterpret_cast does not discard the
+  // pointer shift introduced by the offset op.
+  // CHECK-LABEL: gpu.func @test_offset_then_view
+  // CHECK-SAME: %[[OTV_BASE:[a-zA-Z0-9_]+]]: memref<*xf16>, %[[OTV_O:[a-zA-Z0-9_]+]]: i32, %[[OTV_M:[a-zA-Z0-9_]+]]: i32
+  entry @test_offset_then_view(%p: !cuda_tile.tile<!cuda_tile.ptr<f16>>, %o: !cuda_tile.tile<i32>, %m: !cuda_tile.tile<i32>) {
+    // CHECK: %[[OTV_I:.*]] = arith.index_cast %[[OTV_O]] : i32 to index
+    // CHECK: %[[OTV_R:.*]] = memref.reinterpret_cast %[[OTV_BASE]] to offset: [%[[OTV_I]]], sizes: [1], strides: [1] : memref<*xf16> to memref<1xf16, strided<[1], offset: ?>>
+    // CHECK: %[[OTV_CAST:.*]] = memref.cast %[[OTV_R]] : memref<1xf16, strided<[1], offset: ?>> to memref<*xf16>
+    %q = offset %p, %o : tile<ptr<f16>>, tile<i32> -> tile<ptr<f16>>
+    // CHECK: %[[OTV_MI:.*]] = arith.index_cast %[[OTV_M]] : i32 to index
+    // CHECK: memref.reinterpret_cast %[[OTV_CAST]] to offset: [0], sizes: [%[[OTV_MI]], 8], strides: [8, 1] : memref<*xf16> to memref<?x8xf16, strided<[8, 1]>>
+    %tv = make_tensor_view %q, shape = [%m, 8], strides = [8, 1] : tile<i32> -> tensor_view<?x8xf16, strides=[8,1]>
+    return
+  }
+
+  // --- offset across a ptr_to_ptr chain (asserts unranked-only path) ---
+  // CHECK-LABEL: gpu.func @test_offset_after_ptr_to_ptr
+  // CHECK-SAME: %[[OPP_BASE:[a-zA-Z0-9_]+]]: memref<*xf16>, %[[OPP_O:[a-zA-Z0-9_]+]]: i32
+  entry @test_offset_after_ptr_to_ptr(%p: !cuda_tile.tile<!cuda_tile.ptr<f16>>, %o: !cuda_tile.tile<i32>) {
+    %q = ptr_to_ptr %p : tile<ptr<f16>> -> tile<ptr<f16>>
+    // CHECK: %[[OPP_I:.*]] = arith.index_cast %[[OPP_O]] : i32 to index
+    // CHECK: memref.reinterpret_cast %[[OPP_BASE]] to offset: [%[[OPP_I]]], sizes: [1], strides: [1]
+    %r = offset %q, %o : tile<ptr<f16>>, tile<i32> -> tile<ptr<f16>>
+    return
+  }
+
   // --- 2D array constant (not covered by cuda_tile_ir_ops) ---
   // CHECK-LABEL: gpu.func @test_constant_2d_array
   entry @test_constant_2d_array() {
