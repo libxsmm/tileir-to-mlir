@@ -901,9 +901,18 @@ struct ConvertBroadcast : public OpConversionPattern<cuda_tile::BroadcastOp> {
     Type resultTy = getTypeConverter()->convertType(op.getType());
     if (!resultTy)
       return rewriter.notifyMatchFailure(op, "cannot convert result type");
-    auto dstVecTy = cast<VectorType>(resultTy);
-    rewriter.replaceOpWithNewOp<vector::BroadcastOp>(op, dstVecTy,
-                                                     adaptor.getSource());
+
+    if (auto dstVecTy = dyn_cast<VectorType>(resultTy)) {
+      rewriter.replaceOpWithNewOp<vector::BroadcastOp>(op, dstVecTy,
+                                                       adaptor.getSource());
+    } else if (adaptor.getSource().getType() == resultTy) {
+      // Trivial case: source and result types coincide (e.g. rank-0 broadcast).
+      rewriter.replaceOp(op, adaptor.getSource());
+    } else {
+      return rewriter.notifyMatchFailure(
+          op, "unsupported broadcast result type (not a vector)");
+    }
+
     return success();
   }
 };

@@ -425,6 +425,36 @@ module {
       %14 = offset %bcast_15, %0 : tile<1024xptr<f16>>, tile<1024xi32> -> tile<1024xptr<f16>>
       %cst_0_f16 = constant <f16: 0.000000e+00> : tile<1024xf16>
       %result, %result_token = load_ptr_tko weak %14, %1, %cst_0_f16 : tile<1024xptr<f16>>, tile<1024xi1>, tile<1024xf16> -> tile<1024xf16>, token
+      return
+    }
+
+    // CHECK-LABEL: entry @load_loop_iv_base
+    // CHECK-GPU-LABEL: gpu.func @load_loop_iv_base
+    entry @load_loop_iv_base(%arg0: tile<ptr<f32>>, %N: tile<i32>) {
+      %c0 = constant <i32: 0> : tile<i32>
+      %c32 = constant <i32: 32> : tile<i32>
+      %iota = iota : tile<32xi32>
+      %N_1d = reshape %N : tile<i32> -> tile<1xi32>
+      %N_bc = broadcast %N_1d : tile<1xi32> -> tile<32xi32>
+      
+      // CHECK: %[[TV:.*]] = make_tensor_view %arg0, shape = [%arg1], strides = [1]
+      // CHECK: %[[PV:.*]] = make_partition_view %[[TV]] : partition_view<tile=(32), {{.*}}>
+      // CHECK: for %[[IV:.*]] in
+      // CHECK:   %[[C32:.*]] = constant <i32: 32> : tile<i32>
+      // CHECK:   %[[DIV:.*]] = divi %[[IV]], %[[C32]] unsigned
+      // CHECK:   load_view_tko weak %[[PV]][%[[DIV]]]
+      for %iv in (%c0 to %N, step %c32) : tile<i32> {
+        %iv_1d = reshape %iv : tile<i32> -> tile<1xi32>
+        %iv_bc = broadcast %iv_1d : tile<1xi32> -> tile<32xi32>
+        %off = addi %iv_bc, %iota : tile<32xi32>
+        %mask = cmpi less_than %off, %N_bc, signed : tile<32xi32> -> tile<32xi1>
+        %base_1d = reshape %arg0 : tile<ptr<f32>> -> tile<1xptr<f32>>
+        %base_bc = broadcast %base_1d : tile<1xptr<f32>> -> tile<32xptr<f32>>
+        %ptr = offset %base_bc, %off : tile<32xptr<f32>>, tile<32xi32> -> tile<32xptr<f32>>
+        %tile, %tok = load_ptr_tko weak %ptr, %mask : tile<32xptr<f32>>, tile<32xi1> -> tile<32xf32>, token
+        continue
+      }
+      return
     }
   }
 }

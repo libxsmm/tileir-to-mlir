@@ -400,6 +400,48 @@ static LogicalResult decomposeAddend(Value addend, ArrayRef<int64_t> tileShape,
 /// `cmpi less_than` / `andi` / `exti` / `trunci` / `broadcast` / `reshape`
 /// ops.  Each `cmpi less_than` compares a `reshape(iota...)` against a
 /// broadcast-of-reshape-of-scalar — that scalar is the per-dim size.
+/// Locate which dimension `val` bounds. We look through reshapes, broadcasts,
+/// and addi's to find the dimension index.
+static int findDimFromIndexValue(Value val, unsigned rank) {
+  while (val) {
+    val = lookThroughAssume(val);
+    if (!val)
+      return -1;
+    if (auto rs = val.getDefiningOp<ReshapeOp>()) {
+      auto shape = cast<TileType>(rs.getResult().getType()).getShape();
+      if (shape.size() != rank)
+        return -1;
+      int found = -1;
+      for (int i = 0, e = shape.size(); i < e; ++i) {
+        if (shape[i] == 1)
+          continue;
+        if (found != -1)
+          return -1;
+        found = i;
+      }
+      return found;
+    }
+    if (auto bcast = val.getDefiningOp<BroadcastOp>()) {
+      val = bcast.getSource();
+      continue;
+    }
+    if (auto add = val.getDefiningOp<AddIOp>()) {
+      // Check both sides of the add.
+      int d = findDimFromIndexValue(add.getLhs(), rank);
+      if (d >= 0)
+        return d;
+      val = add.getRhs();
+      continue;
+    }
+    if (auto tt = dyn_cast<TileType>(val.getType())) {
+      if (tt.getShape().size() == 1 && rank == 1)
+        return 0;
+    }
+    break;
+  }
+  return -1;
+}
+
 static void analyzeMask(Value mask, unsigned rank,
                         SmallVectorImpl<Value> &dimSize) {
   dimSize.assign(rank, Value());
@@ -427,28 +469,7 @@ static void analyzeMask(Value mask, unsigned rank,
       continue;
     }
     if (auto cmp = v.getDefiningOp<CmpIOp>()) {
-      // The index side may itself be reshape(iota+start) or
-      // reshape(reshape...). Locate dim from the reshape that produces the
-      // cmp's lhs.
-      Value lhs = lookThroughAssume(cmp.getLhs());
-      int dim = -1;
-      if (auto rs = lhs.getDefiningOp<ReshapeOp>()) {
-        auto shape = cast<TileType>(rs.getResult().getType()).getShape();
-        if (shape.size() != rank)
-          continue;
-        for (int i = 0, e = shape.size(); i < e; ++i) {
-          if (shape[i] == 1)
-            continue;
-          if (dim != -1) {
-            dim = -1;
-            break;
-          }
-          dim = i;
-        }
-      } else if (auto tt = dyn_cast<TileType>(lhs.getType())) {
-        if (tt.getShape().size() == 1 && rank == 1)
-          dim = 0;
-      }
+      int dim = findDimFromIndexValue(cmp.getLhs(), rank);
       if (dim < 0)
         continue;
       Value size = matchScalarBroadcastReshape(cmp.getRhs());
@@ -678,8 +699,33 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
     Value baseIdx;
     if (di.start) {
       baseIdx = extractTileMultiplier(di.start, di.tileSize);
-      if (!baseIdx)
-        return failure();
+      if (!baseIdx) {
+        // Fallback: if start is a for-loop induction variable whose constant
+        // step equals tileSize, emit loopIdx / tileSize to recover the
+        // tile-level partition index.
+        Value s = lookThroughAssume(di.start);
+        if (auto blockArg = dyn_cast<BlockArgument>(s)) {
+          auto *parentOp = blockArg.getOwner()->getParentOp();
+          if (auto forOp = dyn_cast_or_null<ForOp>(parentOp);
+              forOp && blockArg == forOp.getInductionVar()) {
+            DenseIntElementsAttr stepAttr;
+            if (matchPattern(forOp.getStep(), m_Constant(&stepAttr)) &&
+                stepAttr.isSplat() &&
+                stepAttr.getSplatValue<APInt>().getSExtValue() == di.tileSize) {
+              auto i32 = b.getI32Type();
+              auto tileTy = TileType::get(b.getContext(), {}, i32);
+              auto cst = DenseElementsAttr::get(tileTy, APInt(32, di.tileSize));
+              Value tileSizeCst = ConstantOp::create(
+                  b, loc, tileTy, cast<DenseIntOrFPElementsAttr>(cst));
+              baseIdx = DivIOp::create(b, loc, di.start, tileSizeCst,
+                                       Signedness::Unsigned)
+                            .getResult();
+            }
+          }
+        }
+        if (!baseIdx)
+          return failure();
+      }
     }
 
     if (isLoopAdvancingDim) {
