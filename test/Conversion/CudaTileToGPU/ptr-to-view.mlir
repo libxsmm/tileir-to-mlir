@@ -623,5 +623,78 @@ module {
       %st = store_ptr_tko weak %sptr, %for#1, %mask : tile<32xptr<i32>>, tile<32xi32>, tile<32xi1> -> token
       return
     }
+
+    // -----------------------------------------------------------------------
+    // Matmul-style loop-carried pointer (Triton LHS access). The pointer is a
+    // `for` iter_arg that advances along the contiguous K dimension by exactly
+    // one tile each iteration. The load masks ONLY the K dimension, written in
+    // residual form `K - loopIdx*16`; the M dimension is unmasked. PtrToView
+    // must:
+    //   * recover the absolute K extent (%K) from the residual bound,
+    //   * give the unmasked M dimension a static (in-bounds) extent of 64,
+    //   * use blockId for M and the induction var for K as partition indices,
+    //   * hoist the now loop-invariant view out of the loop.
+    // The advance (16 elements) equals step(1) * tileSize(16) * stride(1), so
+    // the raw induction variable is a faithful K partition index.
+    // -----------------------------------------------------------------------
+    // CHECK-LABEL: entry @matmul_lhs_loop
+    // CHECK-GPU-LABEL: gpu.func @matmul_lhs_loop
+    entry @matmul_lhs_loop(%A: tile<ptr<f32>>, %M: tile<i32>, %K: tile<i32>, %stride_am: tile<i32>) {
+      %c0 = constant <i32: 0> : tile<i32>
+      %c1 = constant <i32: 1> : tile<i32>
+      %c16 = constant <i32: 16> : tile<i32>
+      %c64 = constant <i32: 64> : tile<i32>
+      %c16_2d = constant <i32: 16> : tile<64x16xi32>
+      %pad = constant <f32: 0.000000e+00> : tile<64x16xf32>
+
+      %blockId_x, %blockId_y, %blockId_z = get_tile_block_id : tile<i32>
+      %row_start = muli %blockId_x, %c64 : tile<i32>
+
+      // dim0 = (row_start + iota) * stride_am.
+      %iota64 = iota : tile<64xi32>
+      %rs_1d = reshape %row_start : tile<i32> -> tile<1xi32>
+      %rs_bc = broadcast %rs_1d : tile<1xi32> -> tile<64xi32>
+      %rows = addi %rs_bc, %iota64 : tile<64xi32>
+      %rows_2d = reshape %rows : tile<64xi32> -> tile<64x1xi32>
+      %stride_2d = reshape %stride_am : tile<i32> -> tile<1x1xi32>
+      %stride_bc = broadcast %stride_2d : tile<1x1xi32> -> tile<64x1xi32>
+      %rows_strided = muli %rows_2d, %stride_bc : tile<64x1xi32>
+
+      // dim1 = iota (contiguous, no start).
+      %iota16 = iota : tile<16xi32>
+      %cols_2d = reshape %iota16 : tile<16xi32> -> tile<1x16xi32>
+
+      %rows_bc = broadcast %rows_strided : tile<64x1xi32> -> tile<64x16xi32>
+      %cols_bc = broadcast %cols_2d : tile<1x16xi32> -> tile<64x16xi32>
+      %off = addi %rows_bc, %cols_bc : tile<64x16xi32>
+      %A_2d = reshape %A : tile<ptr<f32>> -> tile<1x1xptr<f32>>
+      %A_bc = broadcast %A_2d : tile<1x1xptr<f32>> -> tile<64x16xptr<f32>>
+      %ptr_init = offset %A_bc, %off : tile<64x16xptr<f32>>, tile<64x16xi32> -> tile<64x16xptr<f32>>
+
+      // The view is loop-invariant: M is a static tile extent (unmasked), K is
+      // the absolute extent recovered from the residual mask, row-major stride.
+      // CHECK: %[[TV:.*]] = make_tensor_view %{{.*}}, shape = [64, %{{.*}}], strides = [%{{.*}}, 1] : tile<i32> -> tensor_view<64x?xf32, strides=[?,1]>
+      // CHECK: %[[PV:.*]] = make_partition_view %[[TV]] : partition_view<tile=(64x16), {{.*}}>
+      // CHECK: for %[[IV:.*]] in
+      // CHECK:   load_view_tko weak %[[PV]][%{{.*}}, %[[IV]]]
+      // CHECK-NOT: load_ptr_tko
+      // CHECK-GPU: memref.reinterpret_cast %{{.*}} to offset: [0], sizes: [64, %{{.*}}], strides: [%{{.*}}, 1]
+      // CHECK-GPU: scf.for
+      // CHECK-GPU:   vector.transfer_read %{{.*}}[%{{.*}}, %{{.*}}], %{{.*}} {in_bounds = [true, false]}
+      %for = for %loopIdx in (%c0 to %K, step %c1) : tile<i32>
+          iter_values(%iterPtr = %ptr_init) -> (tile<64x16xptr<f32>>) {
+        // residual mask: iota16 < (K - loopIdx*16).
+        %koff = muli %loopIdx, %c16 : tile<i32>
+        %resid = subi %K, %koff : tile<i32>
+        %resid_2d = reshape %resid : tile<i32> -> tile<1x1xi32>
+        %resid_bc = broadcast %resid_2d : tile<1x1xi32> -> tile<1x16xi32>
+        %kcmp = cmpi less_than %cols_2d, %resid_bc, signed : tile<1x16xi32> -> tile<1x16xi1>
+        %mask = broadcast %kcmp : tile<1x16xi1> -> tile<64x16xi1>
+        %v, %t = load_ptr_tko weak %iterPtr, %mask, %pad : tile<64x16xptr<f32>>, tile<64x16xi1>, tile<64x16xf32> -> tile<64x16xf32>, token
+        %next = offset %iterPtr, %c16_2d : tile<64x16xptr<f32>>, tile<64x16xi32> -> tile<64x16xptr<f32>>
+        continue %next : tile<64x16xptr<f32>>
+      }
+      return
+    }
   }
 }

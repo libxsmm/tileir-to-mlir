@@ -274,6 +274,11 @@ struct PtrAccess {
   Value base;
   /// Per-tile-dimension info, ordered by dimension.
   SmallVector<DimInfo> dims;
+  /// True when the access mask was *fully* understood by `analyzeMask` (every
+  /// op in the mask tree was recognised).  Only then is a dimension that the
+  /// mask does not bound provably unmasked, allowing it to be lowered as an
+  /// unchecked (in-bounds) access; otherwise a missing size forces a bail.
+  bool maskFullyRecognized = false;
   /// If the pointer source was a for-loop iter_arg, this captures the context.
   struct LoopInfo {
     ForOp forOp;
@@ -281,6 +286,10 @@ struct PtrAccess {
     unsigned iterArgIndex = 0;
     /// The loop induction variable (tile<i32>).
     Value inductionVar;
+    /// The per-iteration pointer advance offset (the `offset` addend yielded by
+    /// the loop's `continue`).  Used to verify that the loop advances by
+    /// exactly one tile along the advancing dimension.
+    Value advanceOffset;
   };
   std::optional<LoopInfo> loop;
 };
@@ -444,15 +453,30 @@ static int findDimFromIndexValue(Value val, unsigned rank) {
   return -1;
 }
 
-static void analyzeMask(Value mask, unsigned rank,
+/// Recover the per-dim global sizes encoded in `mask` and report whether the
+/// whole mask was understood.
+///
+/// Walks the `andi`/`exti`/`trunci`/`broadcast` tree down to `cmpi less_than`
+/// leaves; each leaf compares a `reshape(iota...)` (the per-tile index along
+/// one dimension) against a broadcast-of-reshape-of-scalar size, which is
+/// recorded for that dimension.
+///
+/// Returns `true` only when every op encountered was one of the recognised
+/// shapes (so any dimension left without a size is *provably* unbounded by the
+/// mask).  Returns `false` as soon as an unrecognised op or comparison is seen,
+/// in which case the caller must not treat missing sizes as "unmasked".
+static bool analyzeMask(Value mask, unsigned rank,
                         SmallVectorImpl<Value> &dimSize) {
   dimSize.assign(rank, Value());
+  bool ok = true;
   SmallVector<Value> work;
   work.push_back(mask);
   while (!work.empty()) {
     Value v = lookThroughAssume(work.pop_back_val());
-    if (!v)
+    if (!v) {
+      ok = false;
       continue;
+    }
     if (auto a = v.getDefiningOp<AndIOp>()) {
       work.push_back(a.getLhs());
       work.push_back(a.getRhs());
@@ -471,16 +495,29 @@ static void analyzeMask(Value mask, unsigned rank,
       continue;
     }
     if (auto cmp = v.getDefiningOp<CmpIOp>()) {
+      // Only `index < size` bounds a dimension; any other predicate changes the
+      // masking semantics and must not be silently ignored.
+      if (cmp.getComparisonPredicate() != ComparisonPredicate::LESS_THAN) {
+        ok = false;
+        continue;
+      }
       int dim = findDimFromIndexValue(cmp.getLhs(), rank);
-      if (dim < 0)
+      Value size =
+          dim < 0 ? Value() : matchScalarBroadcastReshape(cmp.getRhs());
+      if (dim < 0 || !size) {
+        ok = false;
         continue;
-      Value size = matchScalarBroadcastReshape(cmp.getRhs());
-      if (!size)
-        continue;
+      }
       if (!dimSize[dim])
         dimSize[dim] = size;
+      else if (dimSize[dim] != size)
+        ok = false; // conflicting bounds for the same dimension
+      continue;
     }
+    // Any other op in the mask tree means we did not fully understand it.
+    ok = false;
   }
+  return ok;
 }
 
 /// Collect addends from an addi tree, but only split an addi node when
@@ -615,10 +652,12 @@ static LogicalResult analyzePtr(Value ptr, ArrayRef<int64_t> tileShape,
       auto contOp = cast<ContinueOp>(forOp.getBody()->getTerminator());
       Value yieldedPtr = contOp.getOperand(iterIdx);
       Value yieldCur = lookThroughAssume(yieldedPtr);
+      Value advanceOffset;
       if (auto yOff = yieldCur.getDefiningOp<OffsetOp>()) {
         Value yPtr = lookThroughAssume(yOff.getPtr());
         if (yPtr != blockArg)
           return failure();
+        advanceOffset = yOff.getOffset();
       } else {
         return failure();
       }
@@ -629,6 +668,7 @@ static LogicalResult analyzePtr(Value ptr, ArrayRef<int64_t> tileShape,
       li.forOp = forOp;
       li.iterArgIndex = iterIdx;
       li.inductionVar = forOp.getInductionVar();
+      li.advanceOffset = advanceOffset;
       out.loop = std::move(li);
 
       // Follow to the initial value of this iter_arg.
@@ -696,6 +736,70 @@ static Value extractTileMultiplier(Value start, int64_t tileSize) {
         ints.getSplatValue<APInt>().getSExtValue() == tileSize)
       return b;
   }
+  return nullptr;
+}
+
+/// Returns `true` iff `v` is a splat integer constant equal to `c`.
+static bool isSplatIntEqual(Value v, int64_t c) {
+  DenseIntElementsAttr ints;
+  return matchPattern(lookThroughAssume(v), m_Constant(&ints)) &&
+         ints.isSplat() && ints.getSplatValue<APInt>().getSExtValue() == c;
+}
+
+/// Verify that a loop's per-iteration pointer advance moves exactly one tile
+/// along the advancing dimension, i.e. that the (uniform) `advance` element
+/// offset equals `step * tileSize * stride`.  This is the precondition under
+/// which the raw induction variable can be used directly as the advancing
+/// dimension's partition index.
+///
+/// `stride` is null for the contiguous (unit-stride) case.  Returns `true` only
+/// for an exactly matching advance; any other (or unrecognised) advance is
+/// rejected so the rewrite bails rather than emitting a wrong stride.
+static bool loopAdvanceIsOneTile(Value advance, int64_t stepTimesTile,
+                                 Value stride) {
+  // The advance is a tile-shaped value; reduce it to its uniform scalar.
+  if (Value scalar = matchScalarBroadcastReshape(advance)) {
+    scalar = lookThroughAssume(scalar);
+    if (!stride)
+      return isSplatIntEqual(scalar, stepTimesTile);
+    // Expect `stride * stepTimesTile` (operands in either order).
+    auto mul = scalar.getDefiningOp<MulIOp>();
+    if (!mul)
+      return false;
+    for (auto [a, b] : {std::pair<Value, Value>(mul.getLhs(), mul.getRhs()),
+                        std::pair<Value, Value>(mul.getRhs(), mul.getLhs())})
+      if (lookThroughAssume(a) == stride && isSplatIntEqual(b, stepTimesTile))
+        return true;
+    return false;
+  }
+  // A directly-splatted constant advance (no broadcast) only matches the
+  // unit-stride case; a runtime stride cannot equal a constant advance.
+  if (!stride)
+    return isSplatIntEqual(advance, stepTimesTile);
+  return false;
+}
+
+/// For the loop-advancing dimension, recover the *absolute* global size from a
+/// mask whose bound was written in residual (Triton) form
+/// `K - inductionVar * tileSize`.  The absolute size is then `K`.  When `size`
+/// is not in residual form it is assumed to already be absolute and returned
+/// unchanged; when it is a `subi` that does not match the residual shape, null
+/// is returned so the caller bails (strict).
+static Value recoverAbsoluteAdvancingSize(Value size, Value inductionVar,
+                                          int64_t tileSize) {
+  Value s = lookThroughAssume(size);
+  auto sub = s.getDefiningOp<SubIOp>();
+  if (!sub)
+    return size; // already absolute
+  Value k = sub.getLhs();
+  Value residual = lookThroughAssume(sub.getRhs());
+  auto mul = residual.getDefiningOp<MulIOp>();
+  if (!mul)
+    return nullptr;
+  for (auto [a, b] : {std::pair<Value, Value>(mul.getLhs(), mul.getRhs()),
+                      std::pair<Value, Value>(mul.getRhs(), mul.getLhs())})
+    if (lookThroughAssume(a) == inductionVar && isSplatIntEqual(b, tileSize))
+      return lookThroughAssume(k);
   return nullptr;
 }
 
@@ -790,6 +894,23 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
     }
 
     if (isLoopAdvancingDim) {
+      // Verify the loop advances by exactly one tile along this dimension, so
+      // the raw induction variable is a faithful partition index: the loop must
+      // start at 0 and each step must move the pointer by
+      // `step*tileSize*stride` elements.  Otherwise the access cannot be
+      // modelled and we bail.
+      ForOp forOp = access.loop->forOp;
+      if (!isSplatIntEqual(forOp.getLowerBound(), 0))
+        return failure();
+      DenseIntElementsAttr stepAttr;
+      if (!matchPattern(forOp.getStep(), m_Constant(&stepAttr)) ||
+          !stepAttr.isSplat())
+        return failure();
+      int64_t step = stepAttr.getSplatValue<APInt>().getSExtValue();
+      if (!loopAdvanceIsOneTile(access.loop->advanceOffset, step * di.tileSize,
+                                di.stride))
+        return failure();
+
       // The partition index for this dim is just loopIdx (induction var).
       Value loopIdx = access.loop->inductionVar;
       if (baseIdx) {
@@ -802,18 +923,35 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
     indices.push_back(baseIdx ? baseIdx : buildZeroI32(b, loc));
   }
 
-  // 2) Validate the recovered layout and build the TensorViewType.  We refuse
-  //    to fabricate missing information:
-  //      * every dimension must have a recovered global size (from the mask),
-  //        otherwise the tensor extent -- and thus the masking behaviour --
-  //        would be unknown;
-  //      * only the innermost dimension may be contiguous (unit stride); every
-  //        other dimension must carry an explicitly recovered stride.  This
-  //        matches the canonical layout produced by the TileIR frontend.
+  // 2) Recover each dimension's *absolute* global size and validate the layout.
+  //    A dimension is either:
+  //      * masked -- `size` holds its global extent.  For the loop-advancing
+  //        dimension the bound is usually written in residual (Triton) form
+  //        `K - loopIdx*tileSize`; recover the absolute `K` from it.
+  //      * unmasked -- the source loads it unconditionally.  This is only sound
+  //        when the entire mask was understood (`maskFullyRecognized`), so that
+  //        the dimension is *provably* unbounded; we then give it a static,
+  //        tile-sized extent which the lowering turns into an unchecked
+  //        (in-bounds) access, faithfully reproducing the source.
+  //    Layout: only the innermost dimension may be contiguous (unit stride);
+  //    every outer dimension must carry an explicitly recovered stride.  This
+  //    matches the canonical layout produced by the TileIR frontend.
+  SmallVector<Value> absSize(rank); // null => unmasked (static tile extent)
   for (unsigned d = 0; d < rank; ++d) {
     const DimInfo &di = access.dims[d];
-    if (!di.size)
-      return failure();
+    Value size = di.size;
+    if (size) {
+      if (access.loop && !di.start) {
+        size = recoverAbsoluteAdvancingSize(size, access.loop->inductionVar,
+                                            di.tileSize);
+        if (!size)
+          return failure(); // residual bound not understood
+      }
+    } else if (!access.maskFullyRecognized) {
+      return failure(); // cannot prove this dimension is unmasked
+    }
+    absSize[d] = size;
+
     bool isMinor = (d == rank - 1);
     if (isMinor && di.stride)
       return failure(); // innermost dim must be contiguous
@@ -821,14 +959,20 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
       return failure(); // outer dims must have an explicit stride
   }
 
-  // Shape is fully dynamic (taken from the recovered mask sizes).  Strides are
-  // dynamic for the outer dims and a static 1 for the contiguous innermost dim.
+  // Build the tensor-view shape/strides.  Masked dims take a dynamic extent
+  // from the recovered absolute size; unmasked dims take a static tile-sized
+  // extent (a multiple of the tile size) so the access lowers unchecked.
+  // Strides are dynamic for the outer dims and a static 1 for the contiguous
+  // innermost dim.
   SmallVector<int64_t> shape(rank, TensorViewType::kDynamic);
   SmallVector<int64_t> strides(rank, TensorViewType::kDynamic);
   SmallVector<Value> dynShape, dynStride;
   for (unsigned d = 0; d < rank; ++d) {
     const DimInfo &di = access.dims[d];
-    dynShape.push_back(di.size);
+    if (absSize[d])
+      dynShape.push_back(absSize[d]);
+    else
+      shape[d] = di.tileSize; // static => unchecked (in-bounds) access
     if (di.stride)
       dynStride.push_back(di.stride);
     else
@@ -879,7 +1023,7 @@ static LogicalResult lowerAccess(OpBuilder &b, Location loc, Value ptr,
 
   // Recover per-dim global sizes from the mask.
   SmallVector<Value> dimSizes;
-  analyzeMask(mask, tileShape.size(), dimSizes);
+  access.maskFullyRecognized = analyzeMask(mask, tileShape.size(), dimSizes);
   for (unsigned d = 0; d < tileShape.size(); ++d)
     access.dims[d].size = dimSizes[d];
 
