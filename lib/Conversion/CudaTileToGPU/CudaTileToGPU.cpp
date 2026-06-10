@@ -902,15 +902,25 @@ struct ConvertBroadcast : public OpConversionPattern<cuda_tile::BroadcastOp> {
     if (!resultTy)
       return rewriter.notifyMatchFailure(op, "cannot convert result type");
 
+    Value source = adaptor.getSource();
     if (auto dstVecTy = dyn_cast<VectorType>(resultTy)) {
-      rewriter.replaceOpWithNewOp<vector::BroadcastOp>(op, dstVecTy,
-                                                       adaptor.getSource());
+      // Handles both data tiles (vector<NxMxelemTy>) and ranked pointer tiles
+      // (vector<NxMxindex>). For pointer tiles, the source may be an unranked
+      // memref (scalar ptr) that needs to be turned into an index first.
+      if (isa<UnrankedMemRefType>(source.getType())) {
+        // Scalar pointer being broadcast to ranked pointer tile.
+        // We broadcast an index of 0 (since the base pointer is extracted later
+        // directly from the source by the load/store lowerings).
+        Value zero = arith::ConstantIndexOp::create(rewriter, op.getLoc(), 0);
+        rewriter.replaceOpWithNewOp<vector::BroadcastOp>(op, dstVecTy, zero);
+      } else {
+        rewriter.replaceOpWithNewOp<vector::BroadcastOp>(op, dstVecTy, source);
+      }
     } else if (adaptor.getSource().getType() == resultTy) {
-      // Trivial case: source and result types coincide (e.g. rank-0 broadcast).
       rewriter.replaceOp(op, adaptor.getSource());
     } else {
-      return rewriter.notifyMatchFailure(
-          op, "unsupported broadcast result type (not a vector)");
+      return rewriter.notifyMatchFailure(op,
+                                         "unsupported broadcast result type");
     }
 
     return success();
@@ -2449,6 +2459,213 @@ struct ConvertStorePtrTkoScalar
   }
 };
 
+/// Walk the original cuda_tile ptr value backward through offset/broadcast/
+/// reshape/assume to find the scalar base pointer (tile<ptr<T>>).
+static Value findOriginalBasePtr(Value ptrTile) {
+  while (ptrTile) {
+    if (auto ty = dyn_cast<cuda_tile::TileType>(ptrTile.getType())) {
+      if (ty.getShape().empty())
+        break;
+    }
+    if (auto assume = ptrTile.getDefiningOp<cuda_tile::AssumeOp>()) {
+      ptrTile = assume.getValue();
+      continue;
+    }
+    if (auto bcast = ptrTile.getDefiningOp<cuda_tile::BroadcastOp>()) {
+      ptrTile = bcast.getSource();
+      continue;
+    }
+    if (auto rs = ptrTile.getDefiningOp<cuda_tile::ReshapeOp>()) {
+      ptrTile = rs.getSource();
+      continue;
+    }
+    if (auto off = ptrTile.getDefiningOp<cuda_tile::OffsetOp>()) {
+      ptrTile = off.getPtr();
+      continue;
+    }
+    break;
+  }
+  return ptrTile;
+}
+
+/// Convert ranked (non-scalar) cuda_tile.offset on pointer tiles.
+///
+/// After type conversion, the pointer operand is vector<...xindex> (per-element
+/// byte offsets from buffer start) and the integer offset is vector<...xiN>.
+/// The result is: element-wise (ptr_offsets + index_cast(int_offsets)).
+struct ConvertOffsetRanked : public OpConversionPattern<cuda_tile::OffsetOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::OffsetOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto resTileTy = cast<cuda_tile::TileType>(op.getType());
+    if (resTileTy.getShape().empty())
+      return rewriter.notifyMatchFailure(op, "scalar offset handled elsewhere");
+
+    Value ptrVec = adaptor.getPtr();
+    Value offVec = adaptor.getOffset();
+
+    auto ptrVecTy = dyn_cast<VectorType>(ptrVec.getType());
+    if (!ptrVecTy || !isa<IndexType>(ptrVecTy.getElementType()))
+      return rewriter.notifyMatchFailure(
+          op, "expected vector<...xindex> for ranked pointer");
+
+    // Cast offset to index type.
+    auto offVecTy = cast<VectorType>(offVec.getType());
+    if (!isa<IndexType>(offVecTy.getElementType())) {
+      auto idxVecTy =
+          VectorType::get(offVecTy.getShape(), rewriter.getIndexType());
+      offVec =
+          arith::IndexCastOp::create(rewriter, op.getLoc(), idxVecTy, offVec);
+    }
+
+    rewriter.replaceOpWithNewOp<arith::AddIOp>(op, ptrVec, offVec);
+    return success();
+  }
+};
+
+/// Helper for vector.gather/scatter lowering. Derives the common 1D base
+/// memref, N-D mask, and N-D index vector.
+static LogicalResult deriveGatherScatterMemRefAndMask(
+    Operation *op, Value origPtr, Value cvtPtr, Value origMask, Value cvtMask,
+    Type elemTy, ArrayRef<int64_t> shape, ConversionPatternRewriter &rewriter,
+    Value &baseMemref, Value &mask, Value &indexVec) {
+  Location loc = op->getLoc();
+
+  indexVec = cvtPtr;
+  auto ptrVecTy = dyn_cast<VectorType>(indexVec.getType());
+  if (!ptrVecTy || !isa<IndexType>(ptrVecTy.getElementType()))
+    return rewriter.notifyMatchFailure(
+        op, "expected vector<...xindex> for ranked pointer");
+
+  // Find the base memref by tracing the original pointer chain.
+  Value origBase = findOriginalBasePtr(origPtr);
+  if (!origBase || !isa<cuda_tile::TileType>(origBase.getType()))
+    return rewriter.notifyMatchFailure(op, "cannot find scalar base pointer");
+  auto baseTileTy = cast<cuda_tile::TileType>(origBase.getType());
+  if (!baseTileTy.getShape().empty())
+    return rewriter.notifyMatchFailure(op, "base is not scalar");
+
+  // Get the converted base value.
+  Value scalarBase;
+  if (auto blockArg = dyn_cast<BlockArgument>(origBase)) {
+    scalarBase = rewriter.getRemappedValue(blockArg);
+  } else {
+    scalarBase = rewriter.getRemappedValue(origBase);
+  }
+  if (!scalarBase)
+    return rewriter.notifyMatchFailure(op, "cannot find converted base memref");
+
+  // Cast to memref<?xelemTy> for gather/scatter.
+  auto flatMemTy = MemRefType::get({ShapedType::kDynamic}, elemTy);
+  if (!isa<MemRefType>(scalarBase.getType()) &&
+      !isa<UnrankedMemRefType>(scalarBase.getType()))
+    return rewriter.notifyMatchFailure(op, "base is not a memref");
+  baseMemref = memref::CastOp::create(rewriter, loc, flatMemTy, scalarBase);
+
+  // Mask.
+  auto maskTy = VectorType::get(shape, rewriter.getI1Type());
+  if (origMask) {
+    mask = cvtMask;
+  } else {
+    Value trueVal = arith::ConstantIntOp::create(rewriter, loc, 1, 1);
+    mask = vector::BroadcastOp::create(rewriter, loc, maskTy, trueVal);
+  }
+
+  return success();
+}
+
+/// Convert ranked cuda_tile.load_ptr_tko to vector.gather.
+///
+/// The pointer tile (vector<...xindex>) holds per-element offsets from the
+/// buffer base. We trace the original IR to find the scalar base pointer
+/// (converted to memref<*xT>), cast it to memref<?xT>, and emit a 1-D
+/// vector.gather, reshaping back to the tile shape.
+struct ConvertLoadPtrTkoRanked
+    : public OpConversionPattern<cuda_tile::LoadPtrTkoOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::LoadPtrTkoOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto tileTy = cast<cuda_tile::TileType>(op.getResult().getType());
+    if (tileTy.getShape().empty())
+      return rewriter.notifyMatchFailure(op, "scalar load handled elsewhere");
+
+    if (failed(checkCommonTkoGuards(op, rewriter)))
+      return failure();
+
+    Location loc = op.getLoc();
+    auto shape = tileTy.getShape();
+    Type elemTy = tileTy.getElementType();
+
+    Value baseMemref, mask, indexVec;
+    if (failed(deriveGatherScatterMemRefAndMask(
+            op, op.getSource(), adaptor.getSource(), op.getMask(),
+            adaptor.getMask(), elemTy, shape, rewriter, baseMemref, mask,
+            indexVec)))
+      return failure();
+
+    // Passthrough.
+    auto resultVecTy = VectorType::get(shape, elemTy);
+    Value passThru;
+    if (op.getPaddingValue()) {
+      passThru = adaptor.getPaddingValue();
+    } else {
+      auto zeroAttr = rewriter.getZeroAttr(resultVecTy);
+      passThru =
+          arith::ConstantOp::create(rewriter, loc, resultVecTy, zeroAttr);
+    }
+
+    // Emit vector.gather.
+    Value c0 = arith::ConstantIndexOp::create(rewriter, loc, 0);
+    Value gathered =
+        vector::GatherOp::create(rewriter, loc, resultVecTy, baseMemref,
+                                 ValueRange{c0}, indexVec, mask, passThru);
+
+    rewriter.replaceOp(op, {gathered, Value()});
+    return success();
+  }
+};
+
+/// Convert ranked cuda_tile.store_ptr_tko to vector.scatter.
+struct ConvertStorePtrTkoRanked
+    : public OpConversionPattern<cuda_tile::StorePtrTkoOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::StorePtrTkoOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto valTileTy = cast<cuda_tile::TileType>(op.getValue().getType());
+    if (valTileTy.getShape().empty())
+      return rewriter.notifyMatchFailure(op, "scalar store handled elsewhere");
+
+    if (failed(checkCommonTkoGuards(op, rewriter)))
+      return failure();
+
+    Location loc = op.getLoc();
+    auto shape = valTileTy.getShape();
+    Type elemTy = valTileTy.getElementType();
+
+    Value baseMemref, mask, indexVec;
+    if (failed(deriveGatherScatterMemRefAndMask(
+            op, op.getDestination(), adaptor.getDestination(), op.getMask(),
+            adaptor.getMask(), elemTy, shape, rewriter, baseMemref, mask,
+            indexVec)))
+      return failure();
+
+    Value valVec = adaptor.getValue();
+
+    // Emit vector.scatter.
+    Value c0 = arith::ConstantIndexOp::create(rewriter, loc, 0);
+    vector::ScatterOp::create(rewriter, loc, /*resultType=*/Type(), baseMemref,
+                              ValueRange{c0}, indexVec, mask, valVec);
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 using ConvertOrI = ConvertBinaryLhsRhsOp<cuda_tile::OrIOp, arith::OrIOp>;
 
 /// Convert cuda_tile.permute to vector.transpose.
@@ -2620,7 +2837,17 @@ struct ConvertReshape : public OpConversionPattern<cuda_tile::ReshapeOp> {
     if (srcVecTy && dstVecTy) {
       rewriter.replaceOpWithNewOp<vector::ShapeCastOp>(op, dstVecTy, source);
     } else if (!srcVecTy && dstVecTy) {
-      rewriter.replaceOpWithNewOp<vector::BroadcastOp>(op, dstVecTy, source);
+      if (isa<UnrankedMemRefType>(source.getType())) {
+        // Scalar pointer being reshaped to ranked pointer tile
+        // (e.g. tile<ptr<T>> → tile<1x1xptr<T>>). The ranked ptr type is now
+        // vector<...xindex>. We broadcast an index of 0 (since the base pointer
+        // is extracted later directly from the source by the load/store
+        // lowerings).
+        Value zero = arith::ConstantIndexOp::create(rewriter, op.getLoc(), 0);
+        rewriter.replaceOpWithNewOp<vector::BroadcastOp>(op, dstVecTy, zero);
+      } else {
+        rewriter.replaceOpWithNewOp<vector::BroadcastOp>(op, dstVecTy, source);
+      }
     } else if (srcVecTy && !dstVecTy) {
       SmallVector<int64_t> indices(srcVecTy.getRank(), 0);
       rewriter.replaceOpWithNewOp<vector::ExtractOp>(op, source, indices);
@@ -2918,8 +3145,13 @@ static void populateTileIRToGPUTypeConverter(TypeConverter &converter,
         return UnrankedMemRefType::get(ptrTy.getPointeeType(), {});
       return Type();
     }
-    if (auto ptrTy = dyn_cast<cuda_tile::PointerType>(elemTy))
-      return MemRefType::get(shape, ptrTy.getPointeeType());
+    if (auto ptrTy = dyn_cast<cuda_tile::PointerType>(elemTy)) {
+      // Ranked pointer tiles represent per-element offsets from a base
+      // buffer.  Lower to vector<...xindex> so that broadcast/reshape/offset
+      // become trivial vector arithmetic and loads/stores lower to
+      // vector.gather/scatter.
+      return VectorType::get(shape, IndexType::get(ctx));
+    }
     return VectorType::get(shape, elemTy);
   });
 
@@ -2959,14 +3191,15 @@ static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
       ConvertFma, ConvertFor, ConvertFToF, ConvertFToI, ConvertGetGlobal,
       ConvertGetIndexSpaceShape, ConvertGetNumTileBlocks, ConvertGetTensorShape,
       ConvertGetTileBlockId, ConvertGlobal, ConvertIf, ConvertIota, ConvertIToF,
-      ConvertLoadPtrTkoScalar, ConvertLoadViewTko, ConvertLog, ConvertLog2,
-      ConvertMakePartitionView, ConvertMakeTensorView, ConvertMaxF, ConvertMaxI,
-      ConvertMinF, ConvertMinI, ConvertMmaF, ConvertMmaI, ConvertModule,
-      ConvertMulF, ConvertMulhiI, ConvertMulI, ConvertOffsetScalarPtr,
-      ConvertNegF, ConvertNegI, ConvertOrI, ConvertPermute, ConvertPow,
-      ConvertPtrToPtrCastOrFail, ConvertReduce, ConvertRemF, ConvertRemI,
-      ConvertReshape, ConvertReturn, ConvertRsqrt, ConvertScan, ConvertSelect,
-      ConvertShLI, ConvertShRI, ConvertSin, ConvertSinH, ConvertSqrt,
+      ConvertLoadPtrTkoRanked, ConvertLoadPtrTkoScalar, ConvertLoadViewTko,
+      ConvertLog, ConvertLog2, ConvertMakePartitionView, ConvertMakeTensorView,
+      ConvertMaxF, ConvertMaxI, ConvertMinF, ConvertMinI, ConvertMmaF,
+      ConvertMmaI, ConvertModule, ConvertMulF, ConvertMulhiI, ConvertMulI,
+      ConvertOffsetRanked, ConvertOffsetScalarPtr, ConvertNegF, ConvertNegI,
+      ConvertOrI, ConvertPermute, ConvertPow, ConvertPtrToPtrCastOrFail,
+      ConvertReduce, ConvertRemF, ConvertRemI, ConvertReshape, ConvertReturn,
+      ConvertRsqrt, ConvertScan, ConvertSelect, ConvertShLI, ConvertShRI,
+      ConvertSin, ConvertSinH, ConvertSqrt, ConvertStorePtrTkoRanked,
       ConvertStorePtrTkoScalar, ConvertStoreViewTko, ConvertSubF, ConvertSubI,
       ConvertTan, ConvertTanH, ConvertTruncI, ConvertXOrI, ConvertYield>(
       converter, ctx);

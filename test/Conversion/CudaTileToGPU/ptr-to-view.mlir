@@ -456,5 +456,172 @@ module {
       }
       return
     }
+
+    // -----------------------------------------------------------------------
+    // 1-D load with addi(broadcast(start), iota) offset: PtrToView should
+    // lift this even though flattenOffset splits the addi at the top level.
+    // -----------------------------------------------------------------------
+    // CHECK-LABEL: entry @load_1d_bias
+    // CHECK-SAME: (%[[BASE_B:.*]]: tile<ptr<bf16>>, %[[N_B:.*]]: tile<i32>)
+    // CHECK-GPU-LABEL: gpu.func @load_1d_bias
+    // CHECK-GPU-SAME: (%[[GBASE:.*]]: memref<*xbf16>, %[[GN:.*]]: i32)
+    entry @load_1d_bias(%base: tile<ptr<bf16>>, %N: tile<i32>) {
+      %iota = iota : tile<32xi32>
+      %blockId_x, %blockId_y, %blockId_z = get_tile_block_id : tile<i32>
+      %c32 = constant <i32: 32> : tile<i32>
+      %start = muli %blockId_x, %c32 : tile<i32>
+      %start_1d = reshape %start : tile<i32> -> tile<1xi32>
+      %start_bc = broadcast %start_1d : tile<1xi32> -> tile<32xi32>
+      %index = addi %start_bc, %iota : tile<32xi32>
+      %N_1d = reshape %N : tile<i32> -> tile<1xi32>
+      %N_bc = broadcast %N_1d : tile<1xi32> -> tile<32xi32>
+      %mask = cmpi less_than %index, %N_bc, signed : tile<32xi32> -> tile<32xi1>
+      %base_1d = reshape %base : tile<ptr<bf16>> -> tile<1xptr<bf16>>
+      %base_bc = broadcast %base_1d : tile<1xptr<bf16>> -> tile<32xptr<bf16>>
+      %ptr = offset %base_bc, %index : tile<32xptr<bf16>>, tile<32xi32> -> tile<32xptr<bf16>>
+      %cst_pad = constant <bf16: 0.000000e+00> : tile<32xbf16>
+      // CHECK: %[[TV_B:.*]] = make_tensor_view %[[BASE_B]], shape = [%[[N_B]]], strides = [1] : tile<i32> -> tensor_view<?xbf16, strides=[1]>
+      // CHECK: %[[PV_B:.*]] = make_partition_view %[[TV_B]] : partition_view<tile=(32), padding_value = zero, tensor_view<?xbf16, strides=[1]>>
+      // CHECK: %[[BLKID:.*]], %[[BLKY:.*]], %[[BLKZ:.*]] = get_tile_block_id : tile<i32>
+      // CHECK: %[[LD_B:.*]], %[[TOK_B:.*]] = load_view_tko weak %[[PV_B]][%[[BLKID]]] : partition_view<tile=(32), padding_value = zero, tensor_view<?xbf16, strides=[1]>>, tile<i32> -> tile<32xbf16>, token
+      // The original pointer-arithmetic ops must be fully gone after lifting.
+      // CHECK-NOT: load_ptr_tko
+      // CHECK-NOT: offset
+      // CHECK-GPU: %[[GSIZE:.*]] = arith.index_cast %[[GN]] : i32 to index
+      // CHECK-GPU: %[[GVIEW:.*]] = memref.reinterpret_cast %[[GBASE]] to offset: [0], sizes: [%[[GSIZE]]], strides: [1] : memref<*xbf16> to memref<?xbf16, strided<[1]>>
+      // CHECK-GPU: %[[GPAD:.*]] = arith.constant 0.000000e+00 : bf16
+      // CHECK-GPU: %{{.*}} = vector.transfer_read %[[GVIEW]][%{{.*}}], %[[GPAD]] : memref<?xbf16, strided<[1]>>, vector<32xbf16>
+      %v, %t = load_ptr_tko weak %ptr, %mask, %cst_pad : tile<32xptr<bf16>>, tile<32xi1>, tile<32xbf16> -> tile<32xbf16>, token
+      return
+    }
+
+    // -----------------------------------------------------------------------
+    // 2-D non-affine pointer arithmetic (conv2d-style): PtrToView cannot lift
+    // this, so it falls through to the gather/scatter lowering.
+    // -----------------------------------------------------------------------
+    // CHECK-LABEL: entry @gather_2d_conv
+    // CHECK-NOT: make_tensor_view
+    // CHECK-GPU-LABEL: gpu.func @gather_2d_conv
+    // CHECK-GPU-SAME: (%[[SBASE:.*]]: memref<*xbf16>,
+    entry @gather_2d_conv(%base: tile<ptr<bf16>>, %stride0: tile<i32>, %stride1: tile<i32>, %N: tile<i32>, %M: tile<i32>) {
+      %iota = iota : tile<32xi32>
+      // Compute 2D index via divmod (non-affine — can't be lifted to a view)
+      %blockId_x, %blockId_y, %blockId_z = get_tile_block_id : tile<i32>
+      %c32 = constant <i32: 32> : tile<i32>
+      %start = muli %blockId_x, %c32 : tile<i32>
+      %start_1d = reshape %start : tile<i32> -> tile<1xi32>
+      %start_bc = broadcast %start_1d : tile<1xi32> -> tile<32xi32>
+      %linear = addi %start_bc, %iota : tile<32xi32>
+      // row = linear / M, col = linear % M
+      %M_1d = reshape %M : tile<i32> -> tile<1xi32>
+      %M_bc = broadcast %M_1d : tile<1xi32> -> tile<32xi32>
+      %row = divi %linear, %M_bc signed : tile<32xi32>
+      %col = remi %linear, %M_bc signed : tile<32xi32>
+      // Build 2D offset: row[i]*stride0 + col[j]*stride1
+      %row_2d = reshape %row : tile<32xi32> -> tile<32x1xi32>
+      %row_bc = broadcast %row_2d : tile<32x1xi32> -> tile<32x32xi32>
+      %stride0_rs = reshape %stride0 : tile<i32> -> tile<1x1xi32>
+      %stride0_bc = broadcast %stride0_rs : tile<1x1xi32> -> tile<32x32xi32>
+      %off0 = muli %row_bc, %stride0_bc : tile<32x32xi32>
+      %col_2d = reshape %col : tile<32xi32> -> tile<1x32xi32>
+      %col_bc = broadcast %col_2d : tile<1x32xi32> -> tile<32x32xi32>
+      %stride1_rs = reshape %stride1 : tile<i32> -> tile<1x1xi32>
+      %stride1_bc = broadcast %stride1_rs : tile<1x1xi32> -> tile<32x32xi32>
+      %off1 = muli %col_bc, %stride1_bc : tile<32x32xi32>
+      %total_off = addi %off0, %off1 : tile<32x32xi32>
+      // Build pointer tile
+      %base_rs = reshape %base : tile<ptr<bf16>> -> tile<1x1xptr<bf16>>
+      %base_bc = broadcast %base_rs : tile<1x1xptr<bf16>> -> tile<32x32xptr<bf16>>
+      %ptr = offset %base_bc, %total_off : tile<32x32xptr<bf16>>, tile<32x32xi32> -> tile<32x32xptr<bf16>>
+      // Mask
+      %N_1d = reshape %N : tile<i32> -> tile<1xi32>
+      %N_bc = broadcast %N_1d : tile<1xi32> -> tile<32xi32>
+      %mask_row = cmpi less_than %row, %N_bc, signed : tile<32xi32> -> tile<32xi1>
+      %mask_col = cmpi less_than %col, %M_bc, signed : tile<32xi32> -> tile<32xi1>
+      %mr_2d = reshape %mask_row : tile<32xi1> -> tile<32x1xi1>
+      %mr_bc = broadcast %mr_2d : tile<32x1xi1> -> tile<32x32xi1>
+      %mc_2d = reshape %mask_col : tile<32xi1> -> tile<1x32xi1>
+      %mc_bc = broadcast %mc_2d : tile<1x32xi1> -> tile<32x32xi1>
+      %mr_ext = exti %mr_bc signed : tile<32x32xi1> -> tile<32x32xi16>
+      %mc_ext = exti %mc_bc signed : tile<32x32xi1> -> tile<32x32xi16>
+      %mask_and = andi %mr_ext, %mc_ext : tile<32x32xi16>
+      %mask = trunci %mask_and : tile<32x32xi16> -> tile<32x32xi1>
+      // Load (gather)
+      %pad = constant <bf16: 0.000000e+00> : tile<32x32xbf16>
+      // The pointer tile is kept as an explicit offset op (no view lifting).
+      // CHECK: %[[OFF:.*]] = offset %{{.*}}, %{{.*}} : tile<32x32xptr<bf16>>, tile<32x32xi32> -> tile<32x32xptr<bf16>>
+      // CHECK: %[[GV:.*]], %[[GTOK:.*]] = load_ptr_tko weak %[[OFF]], %[[GMASK:.*]], %{{.*}} : tile<32x32xptr<bf16>>, tile<32x32xi1>, tile<32x32xbf16> -> tile<32x32xbf16>, token
+      // CHECK-GPU-DAG: %[[GBASE:.*]] = memref.cast %[[SBASE]] : memref<*xbf16> to memref<?xbf16>
+      // CHECK-GPU-DAG: arith.constant 0 : index
+      // CHECK-GPU: %[[GATHERED:.*]] = vector.gather %[[GBASE]][%{{.*}}] [%{{.*}}], %{{.*}}, %{{.*}} : memref<?xbf16>, vector<32x32xindex>, vector<32x32xi1>, vector<32x32xbf16> into vector<32x32xbf16>
+      %v, %t = load_ptr_tko weak %ptr, %mask, %pad : tile<32x32xptr<bf16>>, tile<32x32xi1>, tile<32x32xbf16> -> tile<32x32xbf16>, token
+      // Store (scatter)
+      // CHECK: store_ptr_tko weak %[[OFF]], %[[GV]], %[[GMASK]] : tile<32x32xptr<bf16>>, tile<32x32xbf16>, tile<32x32xi1> -> token
+      // CHECK-GPU: vector.scatter %{{.*}}[%{{.*}}] [%{{.*}}], %{{.*}}, %[[GATHERED]] : memref<?xbf16>, vector<32x32xindex>, vector<32x32xi1>, vector<32x32xbf16>
+      %57 = store_ptr_tko weak %ptr, %v, %mask : tile<32x32xptr<bf16>>, tile<32x32xbf16>, tile<32x32xi1> -> token
+      return
+    }
+
+    // -----------------------------------------------------------------------
+    // Argmax-style reduction loop. The running-max iter_arg (#0) is never used
+    // outside the loop, but it is internally live: it feeds the comparison that
+    // drives the kept argmax-index iter_arg (#1). The dead-iter-arg cleanup in
+    // ptr-to-view must NOT drop iter_arg #0 (doing so used to erase the shared
+    // comparison and produce a null select operand). Both iter_args and both
+    // selects must survive, and the load (non-liftable) becomes a gather.
+    // -----------------------------------------------------------------------
+    // CHECK-LABEL: entry @argmax_loop
+    // CHECK: %[[FOR:.*]]:2 = for %{{.*}} in {{.*}} -> (tile<32xf32>, tile<32xi32>)
+    // CHECK:   load_ptr_tko
+    // CHECK:   %[[CMP:.*]] = cmpf greater_than ordered
+    // CHECK:   %[[NMAX:.*]] = select %[[CMP]]
+    // CHECK:   %[[NIDX:.*]] = select %[[CMP]]
+    // CHECK:   continue %[[NMAX]], %[[NIDX]]
+    // CHECK-GPU-LABEL: gpu.func @argmax_loop
+    // CHECK-GPU: %[[GFOR:.*]]:2 = scf.for %{{.*}} iter_args(%[[M:.*]] = %{{.*}}, %[[I:.*]] = %{{.*}}) -> (vector<32xf32>, vector<32xi32>)
+    // CHECK-GPU:   vector.gather
+    // CHECK-GPU:   %[[GCMP:.*]] = arith.cmpf ogt
+    // CHECK-GPU:   %[[GMAX:.*]] = arith.select %[[GCMP]]
+    // CHECK-GPU:   %[[GIDX:.*]] = arith.select %[[GCMP]]
+    // CHECK-GPU:   scf.yield %[[GMAX]], %[[GIDX]]
+    entry @argmax_loop(%base: tile<ptr<f32>>, %out: tile<ptr<i32>>, %N: tile<i32>, %stride: tile<i32>) {
+      %c0 = constant <i32: 0> : tile<i32>
+      %c1 = constant <i32: 1> : tile<i32>
+      %c4 = constant <i32: 4> : tile<i32>
+      %c32 = constant <i32: 32> : tile<i32>
+      %neg_inf = constant <f32: 0xFF800000> : tile<32xf32>
+      %zero_idx = constant <i32: 0> : tile<32xi32>
+      %iota = iota : tile<32xi32>
+      %blockId_x, %blockId_y, %blockId_z = get_tile_block_id : tile<i32>
+      %start = muli %blockId_x, %c32 : tile<i32>
+      %start_1d = reshape %start : tile<i32> -> tile<1xi32>
+      %start_bc = broadcast %start_1d : tile<1xi32> -> tile<32xi32>
+      %index = addi %start_bc, %iota : tile<32xi32>
+      %N_1d = reshape %N : tile<i32> -> tile<1xi32>
+      %N_bc = broadcast %N_1d : tile<1xi32> -> tile<32xi32>
+      %mask = cmpi less_than %index, %N_bc, signed : tile<32xi32> -> tile<32xi1>
+      %base_1d = reshape %base : tile<ptr<f32>> -> tile<1xptr<f32>>
+      %base_bc = broadcast %base_1d : tile<1xptr<f32>> -> tile<32xptr<f32>>
+      %for:2 = for %i in (%c0 to %c4, step %c1) : tile<i32>
+          iter_values(%curMax = %neg_inf, %curIdx = %zero_idx) -> (tile<32xf32>, tile<32xi32>) {
+        %off_s = muli %i, %stride : tile<i32>
+        %off_1d = reshape %off_s : tile<i32> -> tile<1xi32>
+        %off_bc = broadcast %off_1d : tile<1xi32> -> tile<32xi32>
+        %ptr = offset %base_bc, %off_bc : tile<32xptr<f32>>, tile<32xi32> -> tile<32xptr<f32>>
+        %v, %t = load_ptr_tko weak %ptr, %mask, %neg_inf : tile<32xptr<f32>>, tile<32xi1>, tile<32xf32> -> tile<32xf32>, token
+        %gt = cmpf greater_than ordered %v, %curMax : tile<32xf32> -> tile<32xi1>
+        %newMax = select %gt, %v, %curMax : tile<32xi1>, tile<32xf32>
+        %i_1d = reshape %i : tile<i32> -> tile<1xi32>
+        %i_bc = broadcast %i_1d : tile<1xi32> -> tile<32xi32>
+        %newIdx = select %gt, %i_bc, %curIdx : tile<32xi1>, tile<32xi32>
+        continue %newMax, %newIdx : tile<32xf32>, tile<32xi32>
+      }
+      // Only the argmax index (result #1) is consumed; the running max (#0) is dead.
+      %out_1d = reshape %out : tile<ptr<i32>> -> tile<1xptr<i32>>
+      %out_bc = broadcast %out_1d : tile<1xptr<i32>> -> tile<32xptr<i32>>
+      %sptr = offset %out_bc, %index : tile<32xptr<i32>>, tile<32xi32> -> tile<32xptr<i32>>
+      %st = store_ptr_tko weak %sptr, %for#1, %mask : tile<32xptr<i32>>, tile<32xi32>, tile<32xi1> -> token
+      return
+    }
   }
 }

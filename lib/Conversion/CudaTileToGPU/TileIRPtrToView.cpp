@@ -82,6 +82,8 @@
 #include "mlir/Transforms/RegionUtils.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
@@ -481,6 +483,33 @@ static void analyzeMask(Value mask, unsigned rank,
   }
 }
 
+/// Collect addends from an addi tree, but only split an addi node when
+/// neither side individually decomposes as a full per-dimension pattern.
+/// This prevents splitting `addi(broadcast(start), iota)` which
+/// decomposeAddend needs to see whole.
+static void flattenOffset(Value val, ArrayRef<int64_t> tileShape,
+                          SmallVectorImpl<Value> &addends) {
+  val = lookThroughAssume(val);
+  if (!val)
+    return;
+  // If the whole expression decomposes, keep it as one addend.
+  {
+    DimInfo info;
+    int dim = -1;
+    if (succeeded(decomposeAddend(val, tileShape, dim, info))) {
+      addends.push_back(val);
+      return;
+    }
+  }
+  // Otherwise, try splitting at the top-level addi.
+  if (auto add = val.getDefiningOp<AddIOp>()) {
+    flattenOffset(add.getLhs(), tileShape, addends);
+    flattenOffset(add.getRhs(), tileShape, addends);
+  } else {
+    addends.push_back(val);
+  }
+}
+
 /// Walk `ptr` (a tile<ptr<T>>) backwards through `offset` ops and through
 /// transparent reshape/broadcast ops on the ptr side, collecting one DimInfo
 /// per encountered offset addend.  On success `out.base` is the scalar base
@@ -510,17 +539,49 @@ static LogicalResult analyzePtr(Value ptr, ArrayRef<int64_t> tileShape,
       continue;
     }
     if (auto off = cur.getDefiningOp<OffsetOp>()) {
-      DimInfo info;
-      int dim = -1;
-      if (succeeded(decomposeAddend(off.getOffset(), tileShape, dim, info))) {
-        if (dim < 0 || dim >= (int)tileShape.size())
-          return failure();
-        if (covered[dim])
-          return failure();
-        // Preserve the recovered tile size from analysis.
-        out.dims[dim].start = info.start;
-        out.dims[dim].stride = info.stride;
-        covered[dim] = true;
+      SmallVector<Value> addends;
+      flattenOffset(off.getOffset(), tileShape, addends);
+
+      bool handledAll = true;
+      for (Value a : addends) {
+        DimInfo info;
+        int dim = -1;
+        if (succeeded(decomposeAddend(a, tileShape, dim, info))) {
+          if (dim < 0 || dim >= (int)tileShape.size()) {
+            handledAll = false;
+            break;
+          }
+          if (covered[dim]) {
+            // Duplicate dim: strides must match to combine them safely.
+            // (Strict equality on compiler-created SSA values from
+            // decomposeAddend).
+            if (out.dims[dim].stride != info.stride) {
+              handledAll = false;
+              break;
+            }
+            // Merge starts if possible.
+            if (info.start && !out.dims[dim].start)
+              out.dims[dim].start = info.start;
+            else if (info.start && out.dims[dim].start) {
+              handledAll = false;
+              break;
+            }
+            continue;
+          }
+          out.dims[dim].start = info.start;
+          out.dims[dim].stride = info.stride;
+          covered[dim] = true;
+        } else if (isScalarTile(a.getType())) {
+          // Scalar shift — cannot absorb without creating ops.
+          handledAll = false;
+          break;
+        } else {
+          handledAll = false;
+          break;
+        }
+      }
+
+      if (handledAll) {
         cur = off.getPtr();
         continue;
       }
@@ -997,15 +1058,70 @@ struct TileIRPtrToViewPass
       unsigned numIter = forOp.getNumResults();
       if (numIter == 0)
         continue;
-      SmallVector<unsigned> keepIter;
-      for (unsigned i = 0; i < numIter; ++i) {
-        if (!forOp.getResult(i).use_empty())
-          keepIter.push_back(i);
+
+      unsigned numInduction = forOp.getNumInductionVars();
+      Block *oldBody = forOp.getBody();
+      auto oldCont = cast<ContinueOp>(oldBody->getTerminator());
+
+      // Liveness of an iter_arg is not just "is the loop result used": an
+      // iter_arg whose result is externally unused may still be live inside the
+      // loop if a *kept* continue operand transitively depends on its block
+      // argument (e.g. an argmax loop where the running-max iter_arg feeds the
+      // comparison that drives the kept argmax-index iter_arg).  Compute the
+      // kept set as a fixpoint over the continue operands' backward slices.
+      SmallVector<bool> keep(numIter, false);
+      for (unsigned i = 0; i < numIter; ++i)
+        keep[i] = !forOp.getResult(i).use_empty();
+
+      auto iterArgIndexOf = [&](Value v) -> int {
+        auto ba = dyn_cast<BlockArgument>(v);
+        if (!ba || ba.getOwner() != oldBody)
+          return -1;
+        unsigned n = ba.getArgNumber();
+        if (n < numInduction)
+          return -1;
+        return (int)(n - numInduction);
+      };
+
+      bool grew = true;
+      while (grew) {
+        grew = false;
+        for (unsigned i = 0; i < numIter; ++i) {
+          if (!keep[i])
+            continue;
+          // Walk the backward slice of continue operand i (descending into any
+          // nested regions) and keep every iter_arg it references.
+          SmallVector<Value> work{oldCont.getOperand(i)};
+          DenseSet<Value> seen;
+          while (!work.empty()) {
+            Value v = work.pop_back_val();
+            if (!v || !seen.insert(v).second)
+              continue;
+            if (int j = iterArgIndexOf(v); j >= 0) {
+              if (!keep[j]) {
+                keep[j] = true;
+                grew = true;
+              }
+              continue;
+            }
+            Operation *def = v.getDefiningOp();
+            if (!def || def->getParentRegion() != oldBody->getParent())
+              continue;
+            def->walk([&](Operation *inner) {
+              for (Value operand : inner->getOperands())
+                work.push_back(operand);
+            });
+          }
+        }
       }
+
+      SmallVector<unsigned> keepIter;
+      for (unsigned i = 0; i < numIter; ++i)
+        if (keep[i])
+          keepIter.push_back(i);
       if (keepIter.size() == numIter)
         continue;
 
-      unsigned numInduction = forOp.getNumInductionVars();
       OpBuilder builder(forOp);
       SmallVector<Value> newInits;
       for (unsigned i : keepIter)
@@ -1016,7 +1132,6 @@ struct TileIRPtrToViewPass
                         forOp.getUpperBound(), forOp.getStep(), newInits);
 
       // Map old block args → new block args.
-      Block *oldBody = forOp.getBody();
       Block *newBody = newFor.getBody();
       oldBody->getArgument(0).replaceAllUsesWith(newBody->getArgument(0));
       for (unsigned newIdx = 0; newIdx < keepIter.size(); ++newIdx) {
@@ -1024,26 +1139,29 @@ struct TileIRPtrToViewPass
         oldBody->getArgument(numInduction + oldIdx)
             .replaceAllUsesWith(newBody->getArgument(numInduction + newIdx));
       }
-      // Dropped iter_args: erase all their uses (which are dead ops feeding
-      // only the continue).
-      SmallVector<unsigned> dropIter;
-      for (unsigned i = 0; i < numIter; ++i) {
-        if (forOp.getResult(i).use_empty())
-          dropIter.push_back(i);
-      }
-      for (unsigned i : dropIter) {
-        Value deadArg = oldBody->getArgument(numInduction + i);
-        // Collect and erase users of the dead arg (they only feed continue).
-        SmallVector<Operation *> toErase;
-        for (OpOperand &use : deadArg.getUses()) {
-          Operation *user = use.getOwner();
-          if (!isa<ContinueOp>(user))
-            toErase.push_back(user);
+
+      // Erase the ops that (transitively) use a dropped iter_arg's block
+      // argument.  By construction of `keep`, none of these feed a kept
+      // continue operand, so removing them is safe.  We compute the forward
+      // closure and erase uses-before-defs.
+      llvm::SetVector<Operation *> deadOps;
+      SmallVector<Value> frontier;
+      for (unsigned i = 0; i < numIter; ++i)
+        if (!keep[i])
+          frontier.push_back(oldBody->getArgument(numInduction + i));
+      while (!frontier.empty()) {
+        Value v = frontier.pop_back_val();
+        for (Operation *user : v.getUsers()) {
+          if (isa<ContinueOp>(user))
+            continue;
+          if (deadOps.insert(user))
+            for (Value r : user->getResults())
+              frontier.push_back(r);
         }
-        for (Operation *op : toErase)
-          op->dropAllUses();
-        for (Operation *op : toErase)
-          op->erase();
+      }
+      for (Operation *op : llvm::reverse(deadOps.getArrayRef())) {
+        op->dropAllUses();
+        op->erase();
       }
 
       // Splice old body ops into new body (replacing its auto-generated
