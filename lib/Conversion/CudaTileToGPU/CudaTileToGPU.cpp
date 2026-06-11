@@ -12,6 +12,8 @@
 // cuda_tile::AndIOp
 // cuda_tile::AssumeOp
 // cuda_tile::Atan2Op
+// cuda_tile::AtomicRMWTkoOp (scalar/rank-0 only; higher-rank requires
+// --tileir-ptr-to-view)
 // cuda_tile::BitcastOp
 // cuda_tile::BroadcastOp
 // cuda_tile::CatOp
@@ -89,7 +91,6 @@
 // cuda_tile ops without a registered conversion pattern in this pass:
 // cuda_tile::AssertOp
 // cuda_tile::AtomicCASTkoOp
-// cuda_tile::AtomicRMWTkoOp
 // cuda_tile::BreakOp
 // cuda_tile::IntToPtrOp
 // cuda_tile::JoinTokensOp
@@ -2666,6 +2667,110 @@ struct ConvertStorePtrTkoRanked
   }
 };
 
+/// Map a cuda_tile.atomic_rmw mode to the equivalent arith atomic_rmw kind.
+///
+/// MAX/MIN are the signed integer variants; UMAX/UMIN are the unsigned ones.
+/// XCHG (unconditional swap) maps to `assign`. Returns nullopt for modes with
+/// no clean arith equivalent.
+static std::optional<arith::AtomicRMWKind>
+mapAtomicRMWMode(cuda_tile::AtomicRMWMode mode) {
+  switch (mode) {
+  case cuda_tile::AtomicRMWMode::AND:
+    return arith::AtomicRMWKind::andi;
+  case cuda_tile::AtomicRMWMode::OR:
+    return arith::AtomicRMWKind::ori;
+  case cuda_tile::AtomicRMWMode::XOR:
+    return arith::AtomicRMWKind::xori;
+  case cuda_tile::AtomicRMWMode::ADD:
+    return arith::AtomicRMWKind::addi;
+  case cuda_tile::AtomicRMWMode::ADDF:
+    return arith::AtomicRMWKind::addf;
+  case cuda_tile::AtomicRMWMode::MAX:
+    return arith::AtomicRMWKind::maxs;
+  case cuda_tile::AtomicRMWMode::MIN:
+    return arith::AtomicRMWKind::mins;
+  case cuda_tile::AtomicRMWMode::UMAX:
+    return arith::AtomicRMWKind::maxu;
+  case cuda_tile::AtomicRMWMode::UMIN:
+    return arith::AtomicRMWKind::minu;
+  case cuda_tile::AtomicRMWMode::XCHG:
+    return arith::AtomicRMWKind::assign;
+  }
+  return std::nullopt;
+}
+
+/// Convert scalar (rank-0) cuda_tile.atomic_rmw_tko on a `tile<ptr<T>>` to a
+/// `memref.reinterpret_cast` + `memref.atomic_rmw`. Mirrors
+/// ConvertLoadPtrTkoScalar: the source `tile<ptr<T>>` is converted to
+/// `memref<*xT>`; a rank-0 reinterpret_cast (offset 0) recovers the scalar
+/// memref the atomic operates on.
+///
+/// Both ops return the value read at the location before the update, so the
+/// result maps directly. The `memory_ordering_semantics` and `memory_scope`
+/// attributes have no representation on memref.atomic_rmw (which lowers to an
+/// acq_rel LLVM atomicrmw with no scope); they are preserved on the result as
+/// the discardable attributes `tir-dropped-memory-ordering` and
+/// `tir-dropped-memory-scope`.
+///
+/// Higher-rank atomics are not lowered in this pass.
+struct ConvertAtomicRMWTko
+    : public OpConversionPattern<cuda_tile::AtomicRMWTkoOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::AtomicRMWTkoOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto tileTy = cast<cuda_tile::TileType>(op.getResult().getType());
+    if (!tileTy.getShape().empty())
+      return rewriter.notifyMatchFailure(
+          op, "only scalar (rank-0) atomic_rmw_tko is supported here");
+    if (auto mask = op.getMask())
+      if (!mask.getType().getShape().empty() ||
+          !mask.getDefiningOp<cuda_tile::ConstantOp>() ||
+          !mask.getDefiningOp<cuda_tile::ConstantOp>()
+               .getValue()
+               .getValues<llvm::APInt>()[0]
+               .getBoolValue())
+        return rewriter.notifyMatchFailure(
+            op, "masked scalar atomic_rmw_tko is not supported");
+    if (!op.getResultToken().use_empty())
+      return rewriter.notifyMatchFailure(
+          op, "result_token has live uses; this lowering drops the token");
+
+    std::optional<arith::AtomicRMWKind> kind = mapAtomicRMWMode(op.getMode());
+    if (!kind)
+      return rewriter.notifyMatchFailure(op, "unsupported atomic_rmw mode");
+
+    auto srcUnranked =
+        dyn_cast<UnrankedMemRefType>(adaptor.getPointers().getType());
+    if (!srcUnranked)
+      return rewriter.notifyMatchFailure(
+          op, "expected unranked memref pointer source");
+
+    Location loc = op.getLoc();
+    auto rank0Ty = MemRefType::get({}, srcUnranked.getElementType(),
+                                   MemRefLayoutAttrInterface{},
+                                   srcUnranked.getMemorySpace());
+    auto rc = memref::ReinterpretCastOp::create(
+        rewriter, loc, rank0Ty, adaptor.getPointers(),
+        /*offset=*/rewriter.getIndexAttr(0),
+        /*sizes=*/SmallVector<OpFoldResult>{},
+        /*strides=*/SmallVector<OpFoldResult>{});
+    auto rmw = memref::AtomicRMWOp::create(rewriter, loc, *kind,
+                                           adaptor.getArg(), rc.getResult(),
+                                           /*indices=*/ValueRange{});
+    rmw->setAttr(
+        "tir-dropped-memory-ordering",
+        rewriter.getStringAttr(cuda_tile::stringifyMemoryOrderingSemantics(
+            op.getMemoryOrderingSemantics())));
+    rmw->setAttr("tir-dropped-memory-scope",
+                 rewriter.getStringAttr(
+                     cuda_tile::stringifyMemoryScope(op.getMemoryScope())));
+    rewriter.replaceOp(op, {rmw.getResult(), Value()});
+    return success();
+  }
+};
+
 using ConvertOrI = ConvertBinaryLhsRhsOp<cuda_tile::OrIOp, arith::OrIOp>;
 
 /// Convert cuda_tile.permute to vector.transpose.
@@ -3187,19 +3292,20 @@ static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
       ConvertAssume, ConvertAtan2, ConvertBitcast, ConvertBroadcast, ConvertCat,
       ConvertCeil, ConvertCmpF, ConvertCmpI, ConvertConstant, ConvertContinue,
       ConvertCos, ConvertCosH, ConvertDivF, ConvertDivI, ConvertEntry,
-      ConvertExp, ConvertExp2, ConvertExtI, ConvertExtract, ConvertFloor,
-      ConvertFma, ConvertFor, ConvertFToF, ConvertFToI, ConvertGetGlobal,
-      ConvertGetIndexSpaceShape, ConvertGetNumTileBlocks, ConvertGetTensorShape,
-      ConvertGetTileBlockId, ConvertGlobal, ConvertIf, ConvertIota, ConvertIToF,
-      ConvertLoadPtrTkoRanked, ConvertLoadPtrTkoScalar, ConvertLoadViewTko,
-      ConvertLog, ConvertLog2, ConvertMakePartitionView, ConvertMakeTensorView,
-      ConvertMaxF, ConvertMaxI, ConvertMinF, ConvertMinI, ConvertMmaF,
-      ConvertMmaI, ConvertModule, ConvertMulF, ConvertMulhiI, ConvertMulI,
-      ConvertOffsetRanked, ConvertOffsetScalarPtr, ConvertNegF, ConvertNegI,
-      ConvertOrI, ConvertPermute, ConvertPow, ConvertPtrToPtrCastOrFail,
-      ConvertReduce, ConvertRemF, ConvertRemI, ConvertReshape, ConvertReturn,
-      ConvertRsqrt, ConvertScan, ConvertSelect, ConvertShLI, ConvertShRI,
-      ConvertSin, ConvertSinH, ConvertSqrt, ConvertStorePtrTkoRanked,
+      ConvertAtomicRMWTko, ConvertExp, ConvertExp2, ConvertExtI, ConvertExtract,
+      ConvertFloor, ConvertFma, ConvertFor, ConvertFToF, ConvertFToI,
+      ConvertGetGlobal, ConvertGetIndexSpaceShape, ConvertGetNumTileBlocks,
+      ConvertGetTensorShape, ConvertGetTileBlockId, ConvertGlobal, ConvertIf,
+      ConvertIota, ConvertIToF, ConvertLoadPtrTkoRanked,
+      ConvertLoadPtrTkoScalar, ConvertLoadViewTko, ConvertLog, ConvertLog2,
+      ConvertMakePartitionView, ConvertMakeTensorView, ConvertMaxF, ConvertMaxI,
+      ConvertMinF, ConvertMinI, ConvertMmaF, ConvertMmaI, ConvertModule,
+      ConvertMulF, ConvertMulhiI, ConvertMulI, ConvertOffsetRanked,
+      ConvertOffsetScalarPtr, ConvertNegF, ConvertNegI, ConvertOrI,
+      ConvertPermute, ConvertPow, ConvertPtrToPtrCastOrFail, ConvertReduce,
+      ConvertRemF, ConvertRemI, ConvertReshape, ConvertReturn, ConvertRsqrt,
+      ConvertScan, ConvertSelect, ConvertShLI, ConvertShRI, ConvertSin,
+      ConvertSinH, ConvertSqrt, ConvertStorePtrTkoRanked,
       ConvertStorePtrTkoScalar, ConvertStoreViewTko, ConvertSubF, ConvertSubI,
       ConvertTan, ConvertTanH, ConvertTruncI, ConvertXOrI, ConvertYield>(
       converter, ctx);

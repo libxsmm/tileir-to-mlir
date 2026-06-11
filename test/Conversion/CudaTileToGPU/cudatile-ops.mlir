@@ -678,4 +678,17 @@ cuda_tile.module @ops_module {
     return
   }
 
+  // --- atomic_rmw_tko (scalar): lowered to memref.atomic_rmw ---
+  // Adapted from Ops.td mlirExamples to rank-0, matching scalar ptr lowering.
+  // CHECK-LABEL: gpu.func @test_atomic_rmw_tko_scalar
+  // CHECK-SAME: %[[ARMW_UPTR:[a-zA-Z0-9_]+]]: memref<*xf32>
+  entry @test_atomic_rmw_tko_scalar(%ptr: !cuda_tile.tile<!cuda_tile.ptr<f32>>) {
+    %vals = constant <f32: 7.000000e+00> : tile<f32>
+    // CHECK: %[[ARMW_V:.*]] = arith.constant 7.000000e+00 : f32
+    // CHECK: %[[ARMW_R0:.*]] = memref.reinterpret_cast %[[ARMW_UPTR]] to offset: [0], sizes: [], strides: [] : memref<*xf32> to memref<f32>
+    // CHECK: %[[ARMW_OLD0:.*]] = memref.atomic_rmw addf %[[ARMW_V]], %[[ARMW_R0]][] {{.*dropped-memory-ordering.*relaxed.*dropped-memory-scope.*device.*}} : (f32, memref<f32>) -> f32
+    %0, %res_token0 = atomic_rmw_tko relaxed device %ptr, addf, %vals : tile<ptr<f32>>, tile<f32> -> tile<f32>, token
+    return
+  }
+
 }

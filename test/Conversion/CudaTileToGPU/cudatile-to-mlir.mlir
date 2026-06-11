@@ -1315,4 +1315,16 @@ cuda_tile.module @m {
     return
   }
 
+  // --- scalar atomic_rmw_tko mode xchg: maps to memref.atomic_rmw assign ---
+  // CHECK-LABEL: gpu.func @test_atomic_rmw_scalar_xchg
+  // CHECK-SAME: %[[AX_UPTR:[a-zA-Z0-9_]+]]: memref<*xi32>
+  entry @test_atomic_rmw_scalar_xchg(%p: !cuda_tile.tile<!cuda_tile.ptr<i32>>) {
+    %v = constant <i32: 7> : tile<i32>
+    // CHECK: %[[AX_V:.*]] = arith.constant 7 : i32
+    // CHECK: %[[AX_R0:.*]] = memref.reinterpret_cast %[[AX_UPTR]] to offset: [0], sizes: [], strides: [] : memref<*xi32> to memref<i32>
+    // CHECK: %[[AX_OLD:.*]] = memref.atomic_rmw assign %[[AX_V]], %[[AX_R0]][] {{.*dropped-memory-ordering.*acq_rel.*dropped-memory-scope.*sys.*}} : (i32, memref<i32>) -> i32
+    %old, %tok = atomic_rmw_tko acq_rel sys %p, xchg, %v : tile<ptr<i32>>, tile<i32> -> tile<i32>, token
+    return
+  }
+
 }
