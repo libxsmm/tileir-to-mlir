@@ -1360,4 +1360,27 @@ cuda_tile.module @m {
     return
   }
 
+  // --- pack/unpack edge cases ---
+  // CHECK-LABEL: gpu.func @test_pack_unpack_edges
+  entry @test_pack_unpack_edges() {
+    // Sub-byte source: 8 x i1 (8 bits) packs into a single byte.
+    // CHECK: %[[PK_I1:.*]] = arith.constant dense<true> : vector<8xi1>
+    %i1s = constant <i1: 1> : tile<8xi1>
+    // CHECK: vector.bitcast %[[PK_I1]] : vector<8xi1> to vector<1xi8>
+    %p0 = pack %i1s : tile<8xi1> -> tile<1xi8>
+
+    // Wide -> bytes: 4 x f32 (128 bits) packs into 16 bytes.
+    // CHECK: %[[PK_F32:.*]] = arith.constant dense<[1.000000e+00, 2.000000e+00, 3.000000e+00, 4.000000e+00]> : vector<4xf32>
+    %f32s = constant <f32: [1.0, 2.0, 3.0, 4.0]> : tile<4xf32>
+    // CHECK: vector.bitcast %[[PK_F32]] : vector<4xf32> to vector<16xi8>
+    %p1 = pack %f32s : tile<4xf32> -> tile<16xi8>
+
+    // Bytes -> wider: 8 x i8 unpacks into 4 x i16.
+    // CHECK: %[[UP_I8:.*]] = arith.constant dense<0> : vector<8xi8>
+    %i8s = constant <i8: 0> : tile<8xi8>
+    // CHECK: vector.bitcast %[[UP_I8]] : vector<8xi8> to vector<4xi16>
+    %u0 = unpack %i8s : tile<8xi8> -> tile<4xi16>
+    return
+  }
+
 }

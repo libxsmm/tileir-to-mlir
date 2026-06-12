@@ -9,6 +9,7 @@
 // cuda_tile::AbsIOp
 // cuda_tile::AddFOp
 // cuda_tile::AddIOp
+// cuda_tile::AllocOp
 // cuda_tile::AndIOp
 // cuda_tile::AssumeOp
 // cuda_tile::Atan2Op
@@ -63,6 +64,7 @@
 // cuda_tile::NegFOp
 // cuda_tile::NegIOp
 // cuda_tile::OrIOp
+// cuda_tile::PackOp
 // cuda_tile::PermuteOp
 // cuda_tile::PowOp
 // cuda_tile::PtrToPtrOp
@@ -85,20 +87,33 @@
 // cuda_tile::TanOp
 // cuda_tile::TanHOp
 // cuda_tile::TruncIOp
+// cuda_tile::UnpackOp
 // cuda_tile::XOrIOp
 // cuda_tile::YieldOp
 //
 // cuda_tile ops without a registered conversion pattern in this pass:
 // cuda_tile::AssertOp
 // cuda_tile::AtomicCASTkoOp
+// cuda_tile::AtomicRedViewTkoOp
 // cuda_tile::BreakOp
 // cuda_tile::IntToPtrOp
 // cuda_tile::JoinTokensOp
 // cuda_tile::LoopOp
+// cuda_tile::MakeGatherScatterViewOp
+// cuda_tile::MakeStridedViewOp
 // cuda_tile::MakeTokenOp
+// cuda_tile::MmafScaledOp
 // cuda_tile::OffsetOp
 // cuda_tile::PrintTkoOp
 // cuda_tile::PtrToIntOp
+
+// Notes:
+// MmafScaledOp: ff no direct lowering (like to Xe) exists, a fallback would be
+//   1. vector.broadcast + vector.shape_cast the scale tile to the operand's K
+//   extent (infer V = K / scaleK, bail if not exact),
+//   2. arith.scaling_extf %operand, %broadcastScale : <…lowp…>, <…f8E8M0FNU…>
+//   to <…f32…>, then feed the two f32 results plus acc into the existing
+//   buildMmaContractionSpec + vector.contract path used by ConvertMmaF.
 
 #include "mlir/Conversion/CudaTileToGPU/CudaTileToGPU.h"
 
@@ -419,6 +434,31 @@ struct ConvertUnarySourceOp : public OpConversionPattern<SrcOp> {
                   typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     rewriter.template replaceOpWithNewOp<DstOp>(op, adaptor.getSource());
+    return success();
+  }
+};
+
+/// Convert a rank-1 whole-tile bit reinterpretation (pack / unpack) to
+/// vector.bitcast.
+template <typename SrcOp>
+struct ConvertVectorBitcastOp : public OpConversionPattern<SrcOp> {
+  using OpConversionPattern<SrcOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(SrcOp op,
+                  typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto resultTy =
+        getConvertedResultTypeOrFail(op, this->getTypeConverter(), rewriter,
+                                     "cannot convert pack/unpack result type");
+    if (failed(resultTy))
+      return failure();
+    auto vecTy = dyn_cast<VectorType>(resultTy.value());
+    if (!vecTy)
+      return rewriter.notifyMatchFailure(
+          op, "pack/unpack result did not convert to a vector type");
+    rewriter.template replaceOpWithNewOp<vector::BitCastOp>(
+        op, vecTy, adaptor.getSource());
     return success();
   }
 };
@@ -2958,6 +2998,10 @@ struct ConvertAtomicRMWTko
 
 using ConvertOrI = ConvertBinaryLhsRhsOp<cuda_tile::OrIOp, arith::OrIOp>;
 
+/// Convert cuda_tile.pack to vector.bitcast (rank-1 whole-tile bit
+/// reinterpret).
+using ConvertPack = ConvertVectorBitcastOp<cuda_tile::PackOp>;
+
 /// Convert cuda_tile.permute to vector.transpose.
 ///
 /// Both ops reorder the dimensions of an N-D tensor/vector according to a
@@ -3353,6 +3397,10 @@ struct ConvertTruncI : public OpConversionPattern<cuda_tile::TruncIOp> {
   }
 };
 
+/// Convert cuda_tile.unpack to vector.bitcast (rank-1 whole-tile bit
+/// reinterpret).
+using ConvertUnpack = ConvertVectorBitcastOp<cuda_tile::UnpackOp>;
+
 using ConvertXOrI = ConvertBinaryLhsRhsOp<cuda_tile::XOrIOp, arith::XOrIOp>;
 
 using ConvertYield = ConvertToScfYield<cuda_tile::YieldOp>;
@@ -3442,13 +3490,13 @@ static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
       ConvertMaxF, ConvertMaxI, ConvertMinF, ConvertMinI, ConvertMmaF,
       ConvertMmaI, ConvertModule, ConvertMulF, ConvertMulhiI, ConvertMulI,
       ConvertOffsetRanked, ConvertOffsetScalarPtr, ConvertNegF, ConvertNegI,
-      ConvertOrI, ConvertPermute, ConvertPow, ConvertPtrToPtrCastOrFail,
-      ConvertReduce, ConvertRemF, ConvertRemI, ConvertReshape, ConvertReturn,
-      ConvertRsqrt, ConvertScan, ConvertSelect, ConvertShLI, ConvertShRI,
-      ConvertSin, ConvertSinH, ConvertSqrt, ConvertStorePtrTkoRanked,
-      ConvertStorePtrTkoScalar, ConvertStoreViewTko, ConvertSubF, ConvertSubI,
-      ConvertTan, ConvertTanH, ConvertTruncI, ConvertXOrI, ConvertYield>(
-      converter, ctx);
+      ConvertOrI, ConvertPack, ConvertPermute, ConvertPow,
+      ConvertPtrToPtrCastOrFail, ConvertReduce, ConvertRemF, ConvertRemI,
+      ConvertReshape, ConvertReturn, ConvertRsqrt, ConvertScan, ConvertSelect,
+      ConvertShLI, ConvertShRI, ConvertSin, ConvertSinH, ConvertSqrt,
+      ConvertStorePtrTkoRanked, ConvertStorePtrTkoScalar, ConvertStoreViewTko,
+      ConvertSubF, ConvertSubI, ConvertTan, ConvertTanH, ConvertTruncI,
+      ConvertUnpack, ConvertXOrI, ConvertYield>(converter, ctx);
 }
 
 //===----------------------------------------------------------------------===//

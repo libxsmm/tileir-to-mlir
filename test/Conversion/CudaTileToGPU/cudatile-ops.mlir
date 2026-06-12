@@ -703,4 +703,36 @@ cuda_tile.module @ops_module {
     return
   }
 
+  // --- pack (from mlirExamples) ---
+  // Reinterpret an entire rank-1 numeric tile as a byte tile (bits unchanged).
+  // CHECK-LABEL: gpu.func @test_pack
+  entry @test_pack() {
+    // CHECK: %[[PACK_F16:.*]] = arith.constant dense<0.000000e+00> : vector<64xf16>
+    %arg0 = constant <f16: 0.0> : tile<64xf16>
+    // CHECK: vector.bitcast %[[PACK_F16]] : vector<64xf16> to vector<128xi8>
+    %0 = pack %arg0 : tile<64xf16> -> tile<128xi8>
+
+    // CHECK: %[[PACK_F4:.*]] = arith.constant dense<0.000000e+00> : vector<64xf4E2M1FN>
+    %arg1 = constant <f4E2M1FN: 0.0> : tile<64xf4E2M1FN>
+    // CHECK: vector.bitcast %[[PACK_F4]] : vector<64xf4E2M1FN> to vector<32xi8>
+    %1 = pack %arg1 : tile<64xf4E2M1FN> -> tile<32xi8>
+    return
+  }
+
+  // --- unpack (from mlirExamples) ---
+  // Reinterpret an entire rank-1 byte tile as a numeric tile (bits unchanged).
+  // CHECK-LABEL: gpu.func @test_unpack
+  entry @test_unpack() {
+    // CHECK: %[[UNPACK_IN0:.*]] = arith.constant dense<0> : vector<64xi8>
+    %arg0 = constant <i8: 0> : tile<64xi8>
+    // CHECK: vector.bitcast %[[UNPACK_IN0]] : vector<64xi8> to vector<32xf16>
+    %0 = unpack %arg0 : tile<64xi8> -> tile<32xf16>
+
+    // CHECK: %[[UNPACK_IN1:.*]] = arith.constant dense<0> : vector<64xi8>
+    %arg1 = constant <i8: 0> : tile<64xi8>
+    // CHECK: vector.bitcast %[[UNPACK_IN1]] : vector<64xi8> to vector<128xf4E2M1FN>
+    %1 = unpack %arg1 : tile<64xi8> -> tile<128xf4E2M1FN>
+    return
+  }
+
 }
