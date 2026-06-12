@@ -184,9 +184,9 @@ cuda_tile.module @ops_module {
     %p1 = make_partition_view %1 : partition_view<tile=(2x4), tensor_view<2x4xf32, strides=[4,1]>>
     %c0 = constant <i32: 0> : tile<i32>
     // CHECK: %[[MAXF_T0:.*]] = vector.transfer_read %[[MAXF_MR0]]{{.*}} : memref<2x4xf32>, vector<2x4xf32>
-    %2, %token0 = load_view_tko weak %p0[%c0, %c0] : partition_view<tile=(2x4), tensor_view<2x4xf32, strides=[4,1]>>, tile<i32> -> tile<2x4xf32>, token
+    %2, %token0 = load_view_tko weak %p0[%c0, %c0] : partition_view<tile=(2x4), tensor_view<2x4xf32, strides=[4,1]>>, tile<i32> -> tile<2x4xf32>, !cuda_tile.token
     // CHECK: %[[MAXF_T1:.*]] = vector.transfer_read %[[MAXF_MR1]]{{.*}} : memref<2x4xf32>, vector<2x4xf32>
-    %3, %token1 = load_view_tko weak %p1[%c0, %c0] : partition_view<tile=(2x4), tensor_view<2x4xf32, strides=[4,1]>>, tile<i32> -> tile<2x4xf32>, token
+    %3, %token1 = load_view_tko weak %p1[%c0, %c0] : partition_view<tile=(2x4), tensor_view<2x4xf32, strides=[4,1]>>, tile<i32> -> tile<2x4xf32>, !cuda_tile.token
     // CHECK: %[[MAXF_R:.*]] = arith.maxnumf %[[MAXF_T0]], %[[MAXF_T1]] : vector<2x4xf32>
     %5 = maxf %2, %3 : tile<2x4xf32>
     return
@@ -202,9 +202,9 @@ cuda_tile.module @ops_module {
     %p1 = make_partition_view %1 : partition_view<tile=(2x4), tensor_view<2x4xi32, strides=[4,1]>>
     %c0 = constant <i32: 0> : tile<i32>
     // CHECK: %[[MAXI_T0:.*]] = vector.transfer_read %{{.*}} : memref<2x4xi32>, vector<2x4xi32>
-    %2, %token0 = load_view_tko weak %p0[%c0, %c0] : partition_view<tile=(2x4), tensor_view<2x4xi32, strides=[4,1]>>, tile<i32> -> tile<2x4xi32>, token
+    %2, %token0 = load_view_tko weak %p0[%c0, %c0] : partition_view<tile=(2x4), tensor_view<2x4xi32, strides=[4,1]>>, tile<i32> -> tile<2x4xi32>, !cuda_tile.token
     // CHECK: %[[MAXI_T1:.*]] = vector.transfer_read %{{.*}} : memref<2x4xi32>, vector<2x4xi32>
-    %3, %token1 = load_view_tko weak %p1[%c0, %c0] : partition_view<tile=(2x4), tensor_view<2x4xi32, strides=[4,1]>>, tile<i32> -> tile<2x4xi32>, token
+    %3, %token1 = load_view_tko weak %p1[%c0, %c0] : partition_view<tile=(2x4), tensor_view<2x4xi32, strides=[4,1]>>, tile<i32> -> tile<2x4xi32>, !cuda_tile.token
     // CHECK: %[[MAXI_U:.*]] = arith.maxui %[[MAXI_T0]], %[[MAXI_T1]] : vector<2x4xi32>
     %4 = maxi %2, %3 unsigned : tile<2x4xi32>
     // CHECK: %[[MAXI_S:.*]] = arith.maxsi %[[MAXI_T0]], %[[MAXI_T1]] : vector<2x4xi32>
@@ -224,9 +224,9 @@ cuda_tile.module @ops_module {
     %p1 = make_partition_view %1 : partition_view<tile=(2x4), tensor_view<2x4xf32, strides=[4,1]>>
     %c0 = constant <i32: 0> : tile<i32>
     // CHECK: %[[MINF_T0:.*]] = vector.transfer_read %[[MINF_MR0]]{{.*}} : memref<2x4xf32>, vector<2x4xf32>
-    %2, %token0 = load_view_tko weak %p0[%c0, %c0] : partition_view<tile=(2x4), tensor_view<2x4xf32, strides=[4,1]>>, tile<i32> -> tile<2x4xf32>, token
+    %2, %token0 = load_view_tko weak %p0[%c0, %c0] : partition_view<tile=(2x4), tensor_view<2x4xf32, strides=[4,1]>>, tile<i32> -> tile<2x4xf32>, !cuda_tile.token
     // CHECK: %[[MINF_T1:.*]] = vector.transfer_read %[[MINF_MR1]]{{.*}} : memref<2x4xf32>, vector<2x4xf32>
-    %3, %token1 = load_view_tko weak %p1[%c0, %c0] : partition_view<tile=(2x4), tensor_view<2x4xf32, strides=[4,1]>>, tile<i32> -> tile<2x4xf32>, token
+    %3, %token1 = load_view_tko weak %p1[%c0, %c0] : partition_view<tile=(2x4), tensor_view<2x4xf32, strides=[4,1]>>, tile<i32> -> tile<2x4xf32>, !cuda_tile.token
     // CHECK: %[[MINF_R:.*]] = arith.minnumf %[[MINF_T0]], %[[MINF_T1]] : vector<2x4xf32>
     %5 = minf %2, %3 : tile<2x4xf32>
     return
@@ -242,9 +242,9 @@ cuda_tile.module @ops_module {
     %p1 = make_partition_view %1 : partition_view<tile=(2x4), tensor_view<2x4xi32, strides=[4,1]>>
     %c0 = constant <i32: 0> : tile<i32>
     // CHECK: %[[MINI_T0:.*]] = vector.transfer_read %{{.*}} : memref<2x4xi32>, vector<2x4xi32>
-    %2, %token0 = load_view_tko weak %p0[%c0, %c0] : partition_view<tile=(2x4), tensor_view<2x4xi32, strides=[4,1]>>, tile<i32> -> tile<2x4xi32>, token
+    %2, %token0 = load_view_tko weak %p0[%c0, %c0] : partition_view<tile=(2x4), tensor_view<2x4xi32, strides=[4,1]>>, tile<i32> -> tile<2x4xi32>, !cuda_tile.token
     // CHECK: %[[MINI_T1:.*]] = vector.transfer_read %{{.*}} : memref<2x4xi32>, vector<2x4xi32>
-    %3, %token1 = load_view_tko weak %p1[%c0, %c0] : partition_view<tile=(2x4), tensor_view<2x4xi32, strides=[4,1]>>, tile<i32> -> tile<2x4xi32>, token
+    %3, %token1 = load_view_tko weak %p1[%c0, %c0] : partition_view<tile=(2x4), tensor_view<2x4xi32, strides=[4,1]>>, tile<i32> -> tile<2x4xi32>, !cuda_tile.token
     // CHECK: %[[MINI_U:.*]] = arith.minui %[[MINI_T0]], %[[MINI_T1]] : vector<2x4xi32>
     %4 = mini %2, %3 unsigned : tile<2x4xi32>
     // CHECK: %[[MINI_S:.*]] = arith.minsi %[[MINI_T0]], %[[MINI_T1]] : vector<2x4xi32>
@@ -687,7 +687,7 @@ cuda_tile.module @ops_module {
     // CHECK: %[[ARMW_V:.*]] = arith.constant 7.000000e+00 : f32
     // CHECK: %[[ARMW_R0:.*]] = memref.reinterpret_cast %[[ARMW_UPTR]] to offset: [0], sizes: [], strides: [] : memref<*xf32> to memref<f32>
     // CHECK: %[[ARMW_OLD0:.*]] = memref.atomic_rmw addf %[[ARMW_V]], %[[ARMW_R0]][] {{.*dropped-memory-ordering.*relaxed.*dropped-memory-scope.*device.*}} : (f32, memref<f32>) -> f32
-    %0, %res_token0 = atomic_rmw_tko relaxed device %ptr, addf, %vals : tile<ptr<f32>>, tile<f32> -> tile<f32>, token
+    %0, %res_token0 = atomic_rmw_tko relaxed device %ptr, addf, %vals : tile<ptr<f32>>, tile<f32> -> tile<f32>, !cuda_tile.token
     return
   }
 

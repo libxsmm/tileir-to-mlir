@@ -8,11 +8,10 @@ Conversion pass and tooling for lowering CudaTile IR to MLIR GPU/vector/scf/arit
 - A C++17 compiler
 - Ninja (recommended)
 - An LLVM/MLIR build with CMake package config files (`MLIRConfig.cmake`)
+  - The LLVM/MLIR version a80153ea4f7dfcd6e0dcf2b415f9ace3cd54015a has been verified to be compatible.
 - A `cuda-tile` build produced with that same LLVM/MLIR version
-
-The LLVM/MLIR version must match the one used by your `cuda-tile`.
-See `cuda-tile`'s `README.md` and its `cmake/IncludeLLVM.cmake` to find the
-LLVM version it expects.
+  - You might need to apply a minor patch to `cuda-tile` source to compile it with this version:
+    Unqualified uses of the type `TokenType` creates a conflict. Qualify with `cuda_tile::TokenType`.
 
 ## Configure
 

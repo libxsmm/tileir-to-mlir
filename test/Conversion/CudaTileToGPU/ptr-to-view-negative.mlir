@@ -17,7 +17,7 @@ module {
       %ptr = offset %base_bc, %index : tile<1024xptr<f32>>, tile<1024xi32> -> tile<1024xptr<f32>>
       // CHECK: %[[NM:.*]], %[[NMT:.*]] = load_ptr_tko weak %[[NMP:.*]] : tile<1024xptr<f32>> -> tile<1024xf32>, token
       // expected-remark @below {{tileir-ptr-to-view: load has no mask; skipping}}
-      %tile, %token = load_ptr_tko weak %ptr : tile<1024xptr<f32>> -> tile<1024xf32>, token
+      %tile, %token = load_ptr_tko weak %ptr : tile<1024xptr<f32>> -> tile<1024xf32>, !cuda_tile.token
       return
     }
 
@@ -39,7 +39,7 @@ module {
       %ptr = offset %base_bc, %index : tile<1024xptr<f32>>, tile<1024xi32> -> tile<1024xptr<f32>>
       // CHECK: %[[BP:.*]], %[[BPT:.*]] = load_ptr_tko weak %[[BPP:.*]], %[[BPM:.*]], %{{.*}} : tile<1024xptr<f32>>, tile<1024xi1>, tile<1024xf32> -> tile<1024xf32>, token
       // expected-remark @below {{tileir-ptr-to-view: padding value not recognised}}
-      %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<1024xptr<f32>>, tile<1024xi1>, tile<1024xf32> -> tile<1024xf32>, token
+      %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<1024xptr<f32>>, tile<1024xi1>, tile<1024xf32> -> tile<1024xf32>, !cuda_tile.token
       return
     }
 
@@ -61,7 +61,7 @@ module {
       %ptr = offset %base_bc, %cst_5 : tile<1024xptr<f32>>, tile<1024xi32> -> tile<1024xptr<f32>>
       // CHECK: %[[NC:.*]], %[[NCT:.*]] = load_ptr_tko weak %[[NCP:.*]], %[[NCM:.*]] : tile<1024xptr<f32>>, tile<1024xi1> -> tile<1024xf32>, token
       // expected-remark @below {{tileir-ptr-to-view: pointer-arithmetic pattern not recognised; skipping}}
-      %tile, %token = load_ptr_tko weak %ptr, %mask : tile<1024xptr<f32>>, tile<1024xi1> -> tile<1024xf32>, token
+      %tile, %token = load_ptr_tko weak %ptr, %mask : tile<1024xptr<f32>>, tile<1024xi1> -> tile<1024xf32>, !cuda_tile.token
       return
     }
 
@@ -80,7 +80,7 @@ module {
       %ptr = offset %base_bc, %index : tile<1024xptr<f32>>, tile<1024xi32> -> tile<1024xptr<f32>>
       // CHECK: %[[SNM:.*]] = store_ptr_tko weak %[[SNMP:.*]], %{{.*}} : tile<1024xptr<f32>>, tile<1024xf32> -> token
       // expected-remark @below {{tileir-ptr-to-view: store has no mask; skipping}}
-      %token = store_ptr_tko weak %ptr, %value : tile<1024xptr<f32>>, tile<1024xf32> -> token
+      %token = store_ptr_tko weak %ptr, %value : tile<1024xptr<f32>>, tile<1024xf32> -> !cuda_tile.token
       return
     }
   }

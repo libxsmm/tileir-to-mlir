@@ -44,7 +44,7 @@ cuda_tile.module @for_divi_rescale_module {
       // post-conversion cleanup folds `muli(divui(iv, 32), 32) -> iv`).
       // Because dim_map=[1, 0], the K (loop) dimension is the first index.
       // CHECK: vector.transfer_read %{{.*}}[%[[IV]], %{{.*}}]
-      %A_frag, %t1 = load_view_tko weak %A_block[%bidx, %k] : partition_view<tile=(128x32), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>, tile<i32> -> tile<128x32xf16>, token
+      %A_frag, %t1 = load_view_tko weak %A_block[%bidx, %k] : partition_view<tile=(128x32), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>, tile<i32> -> tile<128x32xf16>, !cuda_tile.token
       continue %A_frag : tile<128x32xf16>
     }
     return
@@ -86,7 +86,7 @@ cuda_tile.module @for_wrapped_iv_index_rescale_module {
       %scaled_k = muli %k, %c32 : tile<i32>
       %wrapped_k = divi %scaled_k, %c32 signed : tile<i32>
       // CHECK: vector.transfer_read %{{.*}}[%[[WRAPPED_IV]], %{{.*}}]
-      %A_frag, %t1 = load_view_tko weak %A_block[%bidx, %wrapped_k] : partition_view<tile=(128x32), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>, tile<i32> -> tile<128x32xf16>, token
+      %A_frag, %t1 = load_view_tko weak %A_block[%bidx, %wrapped_k] : partition_view<tile=(128x32), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>, tile<i32> -> tile<128x32xf16>, !cuda_tile.token
       continue %A_frag : tile<128x32xf16>
     }
     return

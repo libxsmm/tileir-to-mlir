@@ -235,6 +235,47 @@ validatePartitionViewInfo(Operation *op, const PartitionViewInfo &info,
   return success();
 }
 
+/// Map a cuda_tile rounding mode to the equivalent arith rounding mode, if a
+/// direct 1:1 equivalent exists; otherwise std::nullopt.
+static std::optional<arith::RoundingMode>
+mapRoundingModeToArith(cuda_tile::RoundingMode rounding) {
+  using CtRM = cuda_tile::RoundingMode;
+  switch (rounding) {
+  case CtRM::NEAREST_EVEN:
+    return arith::RoundingMode::to_nearest_even;
+  case CtRM::ZERO:
+    return arith::RoundingMode::toward_zero;
+  case CtRM::NEGATIVE_INF:
+    return arith::RoundingMode::downward;
+  case CtRM::POSITIVE_INF:
+    return arith::RoundingMode::upward;
+  case CtRM::APPROX:
+  case CtRM::FULL:
+  case CtRM::NEAREST_INT_TO_ZERO:
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+/// Attach the discardable `tir-dropped-flush-to-zero` unit attribute to `newOp`
+/// when `flushToZero` is set. flush_to_zero has no arith/math equivalent, so it
+/// is preserved as an annotation.
+static void preserveDroppedFlushToZero(OpBuilder &builder, bool flushToZero,
+                                       Operation *newOp) {
+  if (flushToZero)
+    newOp->setAttr("tir-dropped-flush-to-zero", builder.getUnitAttr());
+}
+
+/// Attach the discardable `tir-dropped-rounding` string attribute to `newOp`,
+/// recording a source rounding mode that the target op cannot represent.
+static void preserveDroppedRounding(OpBuilder &builder,
+                                    cuda_tile::RoundingMode rounding,
+                                    Operation *newOp) {
+  newOp->setAttr(
+      "tir-dropped-rounding",
+      builder.getStringAttr(cuda_tile::stringifyRoundingMode(rounding)));
+}
+
 /// Map cuda_tile integer-overflow flags to arith integer-overflow flags.
 static arith::IntegerOverflowFlags
 mapIntegerOverflowFlags(cuda_tile::IntegerOverflow overflow) {
@@ -382,11 +423,55 @@ struct ConvertUnarySourceOp : public OpConversionPattern<SrcOp> {
   }
 };
 
+/// Convert a unary source-based op to a math op that takes no FastMath flags,
+/// preserving `flush_to_zero` as `tir-dropped-flush-to-zero` when set.
+template <typename SrcOp, typename DstOp>
+struct ConvertUnaryFlushToZeroOp : public OpConversionPattern<SrcOp> {
+  using OpConversionPattern<SrcOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(SrcOp op,
+                  typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto newOp =
+        rewriter.template replaceOpWithNewOp<DstOp>(op, adaptor.getSource());
+    preserveDroppedFlushToZero(rewriter, op.getFlushToZero(), newOp);
+    return success();
+  }
+};
+
+/// Convert a unary source-based op to a math op, mapping `rounding<approx>` to
+/// the `afn` (allow approximate functions) FastMath flag. The source rounding
+/// mode is always preserved as `tir-dropped-rounding`; when `PreserveFtz` is
+/// set, `flush_to_zero` is preserved as `tir-dropped-flush-to-zero`.
+template <typename SrcOp, typename DstOp, bool PreserveFtz>
+struct ConvertUnaryApproxMathOp : public OpConversionPattern<SrcOp> {
+  using OpConversionPattern<SrcOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(SrcOp op,
+                  typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto rounding = op.getRoundingMode();
+    auto fmf = (rounding == cuda_tile::RoundingMode::APPROX)
+                   ? arith::FastMathFlags::afn
+                   : arith::FastMathFlags::none;
+    auto newOp = rewriter.template replaceOpWithNewOp<DstOp>(
+        op, adaptor.getSource(),
+        arith::FastMathFlagsAttr::get(rewriter.getContext(), fmf));
+    preserveDroppedRounding(rewriter, rounding, newOp);
+    if constexpr (PreserveFtz)
+      preserveDroppedFlushToZero(rewriter, op.getFlushToZero(), newOp);
+    return success();
+  }
+};
+
 /// Convert float binary ops to arith float ops.
 ///
-/// The rounding_mode and flush_to_zero flags are not representable in arith
-/// FastMath flags; they are preserved on the result op as the discardable
-/// attributes `tir-dropped-rounding` and `tir-dropped-flush-to-zero`.
+/// The cuda_tile rounding mode is mapped onto the arith op's rounding-mode
+/// attribute when a direct equivalent exists; the pattern bails when it does
+/// not. `flush_to_zero` has no arith equivalent and is preserved on the result
+/// op as the discardable attribute `tir-dropped-flush-to-zero`.
 template <typename SrcOp, typename DstOp>
 struct ConvertBinaryFloatOp : public OpConversionPattern<SrcOp> {
   using OpConversionPattern<SrcOp>::OpConversionPattern;
@@ -395,15 +480,18 @@ struct ConvertBinaryFloatOp : public OpConversionPattern<SrcOp> {
   matchAndRewrite(SrcOp op,
                   typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto rounding = op.getRoundingMode();
+    auto arithRounding = mapRoundingModeToArith(op.getRoundingMode());
+    if (!arithRounding)
+      return rewriter.notifyMatchFailure(
+          op, "rounding mode has no arith equivalent");
     bool ftz = op.getFlushToZero();
+    auto roundingAttr =
+        arith::RoundingModeAttr::get(rewriter.getContext(), *arithRounding);
+    auto fmAttr = arith::FastMathFlagsAttr::get(rewriter.getContext(),
+                                                arith::FastMathFlags::none);
     auto newOp = rewriter.template replaceOpWithNewOp<DstOp>(
-        op, adaptor.getLhs(), adaptor.getRhs());
-    newOp->setAttr(
-        "tir-dropped-rounding",
-        rewriter.getStringAttr(cuda_tile::stringifyRoundingMode(rounding)));
-    if (ftz)
-      newOp->setAttr("tir-dropped-flush-to-zero", rewriter.getUnitAttr());
+        op, adaptor.getLhs(), adaptor.getRhs(), fmAttr, roundingAttr);
+    preserveDroppedFlushToZero(rewriter, ftz, newOp);
     return success();
   }
 };
@@ -568,8 +656,7 @@ struct ConvertMinMaxFOp : public OpConversionPattern<SrcOp> {
                     .getOperation();
       }
     }
-    if (ftz)
-      newOp->setAttr("tir-dropped-flush-to-zero", rewriter.getUnitAttr());
+    preserveDroppedFlushToZero(rewriter, ftz, newOp);
     return success();
   }
 };
@@ -1157,10 +1244,12 @@ using ConvertCosH = ConvertUnarySourceOp<cuda_tile::CosHOp, math::CoshOp>;
 
 /// Convert cuda_tile.divf to arith.divf.
 ///
-/// `rounding<approx>` maps to the `arcp` (allow reciprocal) FastMath flag.
-/// All other rounding modes and `flush_to_zero` are not representable in arith
-/// FastMath flags and are preserved on the result as `tir-dropped-rounding`
-/// and `tir-dropped-flush-to-zero`.
+/// The cuda_tile rounding mode is mapped onto arith.divf's rounding-mode
+/// attribute when a direct equivalent exists. `rounding<approx>` has no
+/// rounding-mode equivalent but maps to the `arcp` (allow reciprocal) FastMath
+/// flag. Any other unmapped rounding mode causes the pattern to bail.
+/// `flush_to_zero` has no arith equivalent and is preserved on the result as
+/// `tir-dropped-flush-to-zero`.
 struct ConvertDivF : public OpConversionPattern<cuda_tile::DivFOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -1169,17 +1258,25 @@ struct ConvertDivF : public OpConversionPattern<cuda_tile::DivFOp> {
                   ConversionPatternRewriter &rewriter) const override {
     auto rounding = op.getRoundingMode();
     bool ftz = op.getFlushToZero();
-    auto fmf = (rounding == cuda_tile::RoundingMode::APPROX)
-                   ? arith::FastMathFlags::arcp
-                   : arith::FastMathFlags::none;
+
+    arith::RoundingModeAttr roundingAttr;
+    arith::FastMathFlags fmf = arith::FastMathFlags::none;
+    if (rounding == cuda_tile::RoundingMode::APPROX) {
+      // approx has no rounding-mode equivalent; map to the arcp FastMath flag.
+      fmf = arith::FastMathFlags::arcp;
+    } else if (auto arithRounding = mapRoundingModeToArith(rounding)) {
+      roundingAttr =
+          arith::RoundingModeAttr::get(rewriter.getContext(), *arithRounding);
+    } else {
+      return rewriter.notifyMatchFailure(
+          op, "rounding mode has no arith equivalent");
+    }
+
     auto newOp = rewriter.replaceOpWithNewOp<arith::DivFOp>(
         op, adaptor.getLhs(), adaptor.getRhs(),
-        arith::FastMathFlagsAttr::get(rewriter.getContext(), fmf));
-    newOp->setAttr(
-        "tir-dropped-rounding",
-        rewriter.getStringAttr(cuda_tile::stringifyRoundingMode(rounding)));
-    if (ftz)
-      newOp->setAttr("tir-dropped-flush-to-zero", rewriter.getUnitAttr());
+        arith::FastMathFlagsAttr::get(rewriter.getContext(), fmf),
+        roundingAttr);
+    preserveDroppedFlushToZero(rewriter, ftz, newOp);
     return success();
   }
 };
@@ -1269,20 +1366,7 @@ using ConvertExp = ConvertUnarySourceOp<cuda_tile::ExpOp, math::ExpOp>;
 ///
 /// `flush_to_zero` is not representable in math FastMath flags and is preserved
 /// on the result as `tir-dropped-flush-to-zero` when set.
-struct ConvertExp2 : public OpConversionPattern<cuda_tile::Exp2Op> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(cuda_tile::Exp2Op op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    bool ftz = op.getFlushToZero();
-    auto newOp =
-        rewriter.replaceOpWithNewOp<math::Exp2Op>(op, adaptor.getSource());
-    if (ftz)
-      newOp->setAttr("tir-dropped-flush-to-zero", rewriter.getUnitAttr());
-    return success();
-  }
-};
+using ConvertExp2 = ConvertUnaryFlushToZeroOp<cuda_tile::Exp2Op, math::Exp2Op>;
 
 /// Convert cuda_tile.exti to arith.extsi / arith.extui.
 ///
@@ -1424,11 +1508,8 @@ struct ConvertFma : public OpConversionPattern<cuda_tile::FmaOp> {
     bool ftz = op.getFlushToZero();
     auto newOp = rewriter.replaceOpWithNewOp<math::FmaOp>(
         op, adaptor.getLhs(), adaptor.getRhs(), adaptor.getAcc());
-    newOp->setAttr(
-        "tir-dropped-rounding",
-        rewriter.getStringAttr(cuda_tile::stringifyRoundingMode(rounding)));
-    if (ftz)
-      newOp->setAttr("tir-dropped-flush-to-zero", rewriter.getUnitAttr());
+    preserveDroppedRounding(rewriter, rounding, newOp);
+    preserveDroppedFlushToZero(rewriter, ftz, newOp);
     return success();
   }
 };
@@ -1622,9 +1703,13 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
 
 /// Convert cuda_tile.ftof to arith.extf / arith.truncf.
 ///
-///   - Only rounding<nearest_even> is representable.
 ///   - Source and destination element widths must differ.
-///   - Narrowing uses arith.truncf; widening uses arith.extf.
+///   - Widening uses arith.extf, which has no rounding-mode attribute (float
+///     widening is exact); the source rounding mode is preserved on the result
+///     as the discardable attribute `tir-dropped-rounding`.
+///   - Narrowing uses arith.truncf, which carries a rounding-mode attribute, so
+///     the source rounding mode is mapped onto it; the pattern bails when the
+///     cuda_tile rounding mode has no direct arith equivalent.
 ///
 /// Works for both scalar float and vector<float> types.
 struct ConvertFToF : public OpConversionPattern<cuda_tile::FToFOp> {
@@ -1633,10 +1718,6 @@ struct ConvertFToF : public OpConversionPattern<cuda_tile::FToFOp> {
   LogicalResult
   matchAndRewrite(cuda_tile::FToFOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (op.getRoundingMode() != cuda_tile::RoundingMode::NEAREST_EVEN)
-      return rewriter.notifyMatchFailure(
-          op, "ftof only supports rounding<nearest_even>");
-
     auto resultTy = getConvertedResultTypeOrFail(
         op, getTypeConverter(), rewriter, "cannot convert ftof result type");
     if (failed(resultTy))
@@ -1658,13 +1739,25 @@ struct ConvertFToF : public OpConversionPattern<cuda_tile::FToFOp> {
                                          "ftof expects float or vector<float>");
 
     if (srcWidth < dstWidth) {
-      rewriter.replaceOpWithNewOp<arith::ExtFOp>(op, resultTy.value(),
-                                                 adaptor.getFrom());
+      // arith.extf has no rounding-mode attribute; preserve the source rounding
+      // mode as a discardable annotation.
+      auto extOp = rewriter.replaceOpWithNewOp<arith::ExtFOp>(
+          op, resultTy.value(), adaptor.getFrom());
+      preserveDroppedRounding(rewriter, op.getRoundingMode(), extOp);
       return success();
     }
     if (srcWidth > dstWidth) {
-      rewriter.replaceOpWithNewOp<arith::TruncFOp>(op, resultTy.value(),
-                                                   adaptor.getFrom());
+      // arith.truncf carries a rounding-mode attribute; map it directly and
+      // bail when there is no equivalent.
+      auto arithRounding = mapRoundingModeToArith(op.getRoundingMode());
+      if (!arithRounding)
+        return rewriter.notifyMatchFailure(
+            op, "ftof rounding mode has no arith.truncf equivalent");
+      auto roundingAttr =
+          arith::RoundingModeAttr::get(rewriter.getContext(), *arithRounding);
+      rewriter.replaceOpWithNewOp<arith::TruncFOp>(
+          op, resultTy.value(), adaptor.getFrom(), roundingAttr,
+          /*fastmath=*/arith::FastMathFlagsAttr{});
       return success();
     }
 
@@ -3022,20 +3115,8 @@ struct ConvertReturn : public OpConversionPattern<cuda_tile::ReturnOp> {
 ///
 /// `flush_to_zero` is not representable in math FastMath flags and is
 /// preserved on the result as `tir-dropped-flush-to-zero` when set.
-struct ConvertRsqrt : public OpConversionPattern<cuda_tile::RsqrtOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(cuda_tile::RsqrtOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    bool ftz = op.getFlushToZero();
-    auto newOp =
-        rewriter.replaceOpWithNewOp<math::RsqrtOp>(op, adaptor.getSource());
-    if (ftz)
-      newOp->setAttr("tir-dropped-flush-to-zero", rewriter.getUnitAttr());
-    return success();
-  }
-};
+using ConvertRsqrt =
+    ConvertUnaryFlushToZeroOp<cuda_tile::RsqrtOp, math::RsqrtOp>;
 
 /// Convert cuda_tile.scan to vector.scan.
 ///
@@ -3124,28 +3205,8 @@ using ConvertSinH = ConvertUnarySourceOp<cuda_tile::SinHOp, math::SinhOp>;
 /// flag. All other rounding modes and `flush_to_zero` are not representable in
 /// math FastMath flags and are preserved on the result as
 /// `tir-dropped-rounding` and `tir-dropped-flush-to-zero`.
-struct ConvertSqrt : public OpConversionPattern<cuda_tile::SqrtOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(cuda_tile::SqrtOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto rounding = op.getRoundingMode();
-    bool ftz = op.getFlushToZero();
-    auto fmf = (rounding == cuda_tile::RoundingMode::APPROX)
-                   ? arith::FastMathFlags::afn
-                   : arith::FastMathFlags::none;
-    auto newOp = rewriter.replaceOpWithNewOp<math::SqrtOp>(
-        op, adaptor.getSource(),
-        arith::FastMathFlagsAttr::get(rewriter.getContext(), fmf));
-    newOp->setAttr(
-        "tir-dropped-rounding",
-        rewriter.getStringAttr(cuda_tile::stringifyRoundingMode(rounding)));
-    if (ftz)
-      newOp->setAttr("tir-dropped-flush-to-zero", rewriter.getUnitAttr());
-    return success();
-  }
-};
+using ConvertSqrt = ConvertUnaryApproxMathOp<cuda_tile::SqrtOp, math::SqrtOp,
+                                             /*PreserveFtz=*/true>;
 
 /// Convert cuda_tile.store_view_tko to vector.transfer_write.
 ///
@@ -3214,25 +3275,8 @@ using ConvertTan = ConvertUnarySourceOp<cuda_tile::TanOp, math::TanOp>;
 /// rounding<approx> maps to the `afn` (allow approximate functions) FastMath
 /// flag on math.tanh. The `full` rounding mode has no equivalent in FastMath
 /// flags; both modes lower to math.tanh.
-struct ConvertTanH : public OpConversionPattern<cuda_tile::TanHOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(cuda_tile::TanHOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto rounding = op.getRoundingMode();
-    auto fmf = (rounding == cuda_tile::RoundingMode::APPROX)
-                   ? arith::FastMathFlags::afn
-                   : arith::FastMathFlags::none;
-    auto newOp = rewriter.replaceOpWithNewOp<math::TanhOp>(
-        op, adaptor.getSource(),
-        arith::FastMathFlagsAttr::get(rewriter.getContext(), fmf));
-    newOp->setAttr(
-        "tir-dropped-rounding",
-        rewriter.getStringAttr(cuda_tile::stringifyRoundingMode(rounding)));
-    return success();
-  }
-};
+using ConvertTanH = ConvertUnaryApproxMathOp<cuda_tile::TanHOp, math::TanhOp,
+                                             /*PreserveFtz=*/false>;
 
 /// Convert cuda_tile.trunci to arith.trunci while preserving overflow flags.
 ///

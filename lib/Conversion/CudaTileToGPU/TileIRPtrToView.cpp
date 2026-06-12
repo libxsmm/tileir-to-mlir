@@ -809,8 +809,7 @@ static Value buildZeroI32(OpBuilder &b, Location loc) {
   auto i32 = b.getI32Type();
   auto tileTy = TileType::get(b.getContext(), {}, i32);
   auto attr = DenseElementsAttr::get(tileTy, APInt(32, 0));
-  return ConstantOp::create(b, loc, tileTy,
-                            cast<DenseIntOrFPElementsAttr>(attr));
+  return ConstantOp::create(b, loc, tileTy, cast<DenseTypedElementsAttr>(attr));
 }
 
 /// Materialise the views and per-dim indices required to express `access` as
@@ -881,7 +880,7 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
               auto tileTy = TileType::get(b.getContext(), {}, i32);
               auto cst = DenseElementsAttr::get(tileTy, APInt(32, di.tileSize));
               Value tileSizeCst = ConstantOp::create(
-                  b, loc, tileTy, cast<DenseIntOrFPElementsAttr>(cst));
+                  b, loc, tileTy, cast<DenseTypedElementsAttr>(cst));
               baseIdx = DivIOp::create(b, loc, di.start, tileSizeCst,
                                        Signedness::Unsigned)
                             .getResult();
