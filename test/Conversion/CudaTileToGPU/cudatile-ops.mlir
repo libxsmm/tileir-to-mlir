@@ -62,6 +62,18 @@ cuda_tile.module @ops_module {
     return
   }
 
+  // --- alloca ---
+  // Derived from cuda_tile.alloca mlirExample in Ops.td. The `global` variant
+  // from the example has no equivalent in the unranked memref pointer model and
+  // is exercised separately as a negative test in cudatile-alloca-negative.mlir.
+  // CHECK-LABEL: gpu.func @test_alloca
+  entry @test_alloca() {
+    // CHECK: %[[A:.*]] = memref.alloca() {alignment = 128 : i64} : memref<64xf32>
+    // CHECK: %[[P:.*]] = memref.cast %[[A]] : memref<64xf32> to memref<*xf32>
+    %0 = alloca num_elem = 64, alignment = 128 : tile<ptr<f32>>
+    return
+  }
+
   // --- atan2 ---
   // CHECK-LABEL: gpu.func @test_atan2
   entry @test_atan2() {

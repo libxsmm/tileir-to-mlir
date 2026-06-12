@@ -27,6 +27,26 @@ cuda_tile.module @m {
     return
   }
 
+  // --- alloca edge cases ---
+  // Covers a single-element allocation at the element's natural alignment, a
+  // wide allocation with large alignment, a non-f32 element type, and a
+  // zero-length allocation.
+  // CHECK-LABEL: gpu.func @test_alloca_edges
+  entry @test_alloca_edges() {
+    // CHECK: %[[A1:.*]] = memref.alloca() {alignment = 2 : i64} : memref<1xf16>
+    // CHECK: %[[P1:.*]] = memref.cast %[[A1]] : memref<1xf16> to memref<*xf16>
+    %single = alloca num_elem = 1, alignment = 2 : tile<ptr<f16>>
+
+    // CHECK: %[[A2:.*]] = memref.alloca() {alignment = 256 : i64} : memref<1024xi32>
+    // CHECK: %[[P2:.*]] = memref.cast %[[A2]] : memref<1024xi32> to memref<*xi32>
+    %wide = alloca num_elem = 1024, alignment = 256 : tile<ptr<i32>>
+
+    // CHECK: %[[A3:.*]] = memref.alloca() {alignment = 8 : i64} : memref<0xf64>
+    // CHECK: %[[P3:.*]] = memref.cast %[[A3]] : memref<0xf64> to memref<*xf64>
+    %empty = alloca num_elem = 0, alignment = 8 : tile<ptr<f64>>
+    return
+  }
+
   // --- ptr_to_ptr ---
   // CHECK-LABEL: gpu.func @test_ptr_to_ptr_example
   // CHECK-SAME: %[[PTP_IN:[a-zA-Z0-9_]+]]: memref<*xf32>

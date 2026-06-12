@@ -941,6 +941,55 @@ using ConvertAddI =
 
 using ConvertAndI = ConvertBinaryLhsRhsOp<cuda_tile::AndIOp, arith::AndIOp>;
 
+/// Convert cuda_tile.alloca to memref.alloca (+ memref.cast).
+///
+/// The op allocates `num_elem` elements of the pointee type with automatic
+/// (block-scoped) lifetime and yields a scalar pointer. The pass models a
+/// scalar `tile<ptr<T>>` as an unranked `memref<*xT>`, so we allocate a ranked
+/// `memref<num_elem x T>` on the stack and cast it to the unranked result type.
+///
+/// Attribute mapping:
+///   - `num_elem`  -> the (single) static dimension of the ranked memref.
+///   - `alignment` -> memref.alloca's `alignment` (a non-zero power of two,
+///                    guaranteed by the source verifier and required as such by
+///                    memref.alloca).
+///   - `global`    -> marks the address as shareable across tile threads. The
+///                    unranked memref pointer model carries no memory space
+///                    able to express that sharing, so the conversion bails
+///                    when it is set.
+struct ConvertAlloca : public OpConversionPattern<cuda_tile::AllocaOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::AllocaOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getGlobal())
+      return rewriter.notifyMatchFailure(
+          op, "global (cross-thread shareable) alloca has no equivalent in the "
+              "unranked memref pointer model");
+
+    auto resultTy = getConvertedResultTypeOrFail(
+        op, getTypeConverter(), rewriter, "cannot convert alloca result type");
+    if (failed(resultTy))
+      return failure();
+    auto unrankedTy = dyn_cast<UnrankedMemRefType>(resultTy.value());
+    if (!unrankedTy)
+      return rewriter.notifyMatchFailure(
+          op, "alloca result did not convert to an unranked memref");
+
+    // The source verifier guarantees alignment is a non-zero power of two,
+    // which is exactly what memref.alloca requires.
+    auto rankedTy = MemRefType::get(
+        {static_cast<int64_t>(op.getNumElem())}, unrankedTy.getElementType(),
+        MemRefLayoutAttrInterface{}, unrankedTy.getMemorySpace());
+    Value alloca =
+        memref::AllocaOp::create(rewriter, op.getLoc(), rankedTy,
+                                 rewriter.getI64IntegerAttr(op.getAlignment()));
+    rewriter.replaceOpWithNewOp<memref::CastOp>(op, unrankedTy, alloca);
+    return success();
+  }
+};
+
 /// Convert cuda_tile.assume to a pass-through (just forward the source value).
 struct ConvertAssume : public OpConversionPattern<cuda_tile::AssumeOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -3379,24 +3428,24 @@ static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
                                                   RewritePatternSet &patterns) {
   MLIRContext *ctx = patterns.getContext();
   patterns.add<
-      ConvertAbsF, ConvertAbsI, ConvertAddF, ConvertAddI, ConvertAndI,
-      ConvertAssume, ConvertAtan2, ConvertBitcast, ConvertBroadcast, ConvertCat,
-      ConvertCeil, ConvertCmpF, ConvertCmpI, ConvertConstant, ConvertContinue,
-      ConvertCos, ConvertCosH, ConvertDivF, ConvertDivI, ConvertEntry,
-      ConvertAtomicRMWTko, ConvertExp, ConvertExp2, ConvertExtI, ConvertExtract,
-      ConvertFloor, ConvertFma, ConvertFor, ConvertFToF, ConvertFToI,
-      ConvertGetGlobal, ConvertGetIndexSpaceShape, ConvertGetNumTileBlocks,
-      ConvertGetTensorShape, ConvertGetTileBlockId, ConvertGlobal, ConvertIf,
-      ConvertIota, ConvertIToF, ConvertLoadPtrTkoRanked,
-      ConvertLoadPtrTkoScalar, ConvertLoadViewTko, ConvertLog, ConvertLog2,
-      ConvertMakePartitionView, ConvertMakeTensorView, ConvertMaxF, ConvertMaxI,
-      ConvertMinF, ConvertMinI, ConvertMmaF, ConvertMmaI, ConvertModule,
-      ConvertMulF, ConvertMulhiI, ConvertMulI, ConvertOffsetRanked,
-      ConvertOffsetScalarPtr, ConvertNegF, ConvertNegI, ConvertOrI,
-      ConvertPermute, ConvertPow, ConvertPtrToPtrCastOrFail, ConvertReduce,
-      ConvertRemF, ConvertRemI, ConvertReshape, ConvertReturn, ConvertRsqrt,
-      ConvertScan, ConvertSelect, ConvertShLI, ConvertShRI, ConvertSin,
-      ConvertSinH, ConvertSqrt, ConvertStorePtrTkoRanked,
+      ConvertAbsF, ConvertAbsI, ConvertAddF, ConvertAddI, ConvertAlloca,
+      ConvertAndI, ConvertAssume, ConvertAtan2, ConvertBitcast,
+      ConvertBroadcast, ConvertCat, ConvertCeil, ConvertCmpF, ConvertCmpI,
+      ConvertConstant, ConvertContinue, ConvertCos, ConvertCosH, ConvertDivF,
+      ConvertDivI, ConvertEntry, ConvertAtomicRMWTko, ConvertExp, ConvertExp2,
+      ConvertExtI, ConvertExtract, ConvertFloor, ConvertFma, ConvertFor,
+      ConvertFToF, ConvertFToI, ConvertGetGlobal, ConvertGetIndexSpaceShape,
+      ConvertGetNumTileBlocks, ConvertGetTensorShape, ConvertGetTileBlockId,
+      ConvertGlobal, ConvertIf, ConvertIota, ConvertIToF,
+      ConvertLoadPtrTkoRanked, ConvertLoadPtrTkoScalar, ConvertLoadViewTko,
+      ConvertLog, ConvertLog2, ConvertMakePartitionView, ConvertMakeTensorView,
+      ConvertMaxF, ConvertMaxI, ConvertMinF, ConvertMinI, ConvertMmaF,
+      ConvertMmaI, ConvertModule, ConvertMulF, ConvertMulhiI, ConvertMulI,
+      ConvertOffsetRanked, ConvertOffsetScalarPtr, ConvertNegF, ConvertNegI,
+      ConvertOrI, ConvertPermute, ConvertPow, ConvertPtrToPtrCastOrFail,
+      ConvertReduce, ConvertRemF, ConvertRemI, ConvertReshape, ConvertReturn,
+      ConvertRsqrt, ConvertScan, ConvertSelect, ConvertShLI, ConvertShRI,
+      ConvertSin, ConvertSinH, ConvertSqrt, ConvertStorePtrTkoRanked,
       ConvertStorePtrTkoScalar, ConvertStoreViewTko, ConvertSubF, ConvertSubI,
       ConvertTan, ConvertTanH, ConvertTruncI, ConvertXOrI, ConvertYield>(
       converter, ctx);
