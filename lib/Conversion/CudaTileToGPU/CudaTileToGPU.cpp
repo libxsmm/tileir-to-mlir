@@ -114,6 +114,32 @@
 //   2. arith.scaling_extf %operand, %broadcastScale : <…lowp…>, <…f8E8M0FNU…>
 //   to <…f32…>, then feed the two f32 results plus acc into the existing
 //   buildMmaContractionSpec + vector.contract path used by ConvertMmaF.
+//
+// make_gather_scatter_view
+// This cannot be expressed as a single vector.transfer_read/write. Along
+// sparse_dim, each of the N rows of the result tile comes from an independent
+// base index supplied by the 1-D index tile — i.e. a gather (load) / scatter
+// (store), not a contiguous slice. Type converter + make-pattern: same as
+// strided — map GatherScatterViewType → memref of tensor_view and forward the
+// memref. (Cheap.) A dedicated lowering for load_view_tko / store_view_tko when
+// the view is gather/scatter. The transfer-plan abstraction does not fit.
+// Realistic options: Loop over the sparse dimension: for each row r, compute
+// base = sparseIndex[r] * tensorStride[sparse_dim] plus the scalar offsets of
+// the other dims, do a vector.transfer_read/write of the remaining (dense)
+// sub-tile, and vector.insert/extract it into/out of the result tile. Masking
+// for OOB rows uses the existing padding-value logic.
+// vector.gather/vector.scatter with a computed index vector: build a
+// per-element index vector from the 1-D sparse index broadcast across the dense
+// dims plus an iota for the dense dims; this mirrors how the pointer-tile load
+// (ConvertLoadPtrTko...) is handled. More compact but the index-vector
+// construction is fiddly. get_index_space_shape: the sparse dim's extent is
+// driven by the gather-index count / tile shape rather than the tensor dim; the
+// dense dims use the partition formula. Needs its own branch. verifyIndices
+// shape: the converter must accept a 1-D index tile at sparse_dim (the current
+// code assumes scalar indices everywhere) and thread it through to the
+// gather/scatter. This is substantially more work than strided and warrants its
+// own pattern (e.g. ConvertGatherScatterLoad/Store) rather than being folded
+// into the shared transfer plan.
 
 #include "mlir/Conversion/CudaTileToGPU/CudaTileToGPU.h"
 
@@ -186,65 +212,113 @@ static MemRefType tensorViewToMemRefType(cuda_tile::TensorViewType tvTy) {
   return MemRefType::get(memrefShape, elemTy, layout);
 }
 
-/// Information extracted from a partition_view operand at a use site.
-struct PartitionViewInfo {
-  Value memref;                   // Converted memref backing the partition view
-  SmallVector<int64_t> tileShape; // Tile dimensions
-  SmallVector<int32_t> dimMap;    // Mapping from tile dims to tensor_view dims
-  unsigned tensorViewRank;        // Rank of the underlying tensor_view
-  // Optional padding value attribute from the partition_view type; null if the
-  // partition view does not specify one (i.e. OOB loads yield unspecified).
+/// Layout information extracted from a tile-view operand at a use site.
+///
+/// Covers both `partition_view` and `strided_view`, which share the same
+/// "rectangular tile laid out on a grid" access shape. The only structural
+/// difference is how far the tile base advances between adjacent index-space
+/// positions:
+///   - partition_view: the base advances by `tile_shape[i]` (tiles tile the
+///     tensor exactly, no overlap, no gaps).
+///   - strided_view:   the base advances by `traversal_strides[i]` (tiles may
+///     overlap when stride < tile, or leave gaps when stride > tile).
+/// This advance is captured in `viewStrides`; everything downstream (memref
+/// offset, index-space-shape, in-bounds analysis) is expressed in terms of it.
+struct ViewInfo {
+  Value memref;                   // Converted memref backing the view
+  SmallVector<int64_t> tileShape; // Tile dimensions (per tile dim)
+  SmallVector<int64_t>
+      viewStrides;             // Base advance per index step (per tile dim)
+  SmallVector<int32_t> dimMap; // Mapping from tile dims to tensor_view dims
+  unsigned tensorViewRank;     // Rank of the underlying tensor_view
+  // Optional padding value attribute from the view type; null if the view does
+  // not specify one (i.e. OOB loads yield unspecified values).
   cuda_tile::PaddingValueAttr paddingValue;
 };
 
-/// Extract partition-view layout info from `view`'s type and pair it with the
-/// already type-converted memref `convertedView`.
-static PartitionViewInfo getPartitionViewInfo(Value view, Value convertedView) {
-  auto pvType = cast<cuda_tile::PartitionViewType>(view.getType());
-  PartitionViewInfo info;
+/// Extract tile-view layout info from `view`'s type and pair it with the
+/// already type-converted memref `convertedView`. Returns failure (with a
+/// match-failure note) for view kinds that the transfer-based lowering cannot
+/// model (e.g. gather_scatter_view, whose sparse dimension requires gather /
+/// scatter rather than a contiguous transfer).
+static FailureOr<ViewInfo> getViewInfo(Operation *op, Value view,
+                                       Value convertedView,
+                                       ConversionPatternRewriter &rewriter) {
+  ViewInfo info;
   info.memref = convertedView;
-  for (auto v : pvType.getTileShape().asArrayRef())
-    info.tileShape.push_back(v);
-  info.dimMap.assign(pvType.getDimMap().begin(), pvType.getDimMap().end());
-  info.tensorViewRank = pvType.getTensorView().getShape().size();
-  info.paddingValue = pvType.getPaddingValue();
-  return info;
+
+  auto fillIdentityDimMapIfEmpty = [&]() {
+    if (info.dimMap.empty())
+      for (unsigned d = 0, e = info.tileShape.size(); d < e; ++d)
+        info.dimMap.push_back(static_cast<int32_t>(d));
+  };
+
+  if (auto pvType = dyn_cast<cuda_tile::PartitionViewType>(view.getType())) {
+    for (auto v : pvType.getTileShape().asArrayRef())
+      info.tileShape.push_back(v);
+    // partition_view tiles tile the tensor exactly: advance == tile extent.
+    info.viewStrides.assign(info.tileShape.begin(), info.tileShape.end());
+    info.dimMap.assign(pvType.getDimMap().begin(), pvType.getDimMap().end());
+    fillIdentityDimMapIfEmpty();
+    info.tensorViewRank = pvType.getTensorView().getShape().size();
+    info.paddingValue = pvType.getPaddingValue();
+    return info;
+  }
+
+  if (auto svType = dyn_cast<cuda_tile::StridedViewType>(view.getType())) {
+    for (auto v : svType.getTileShape().asArrayRef())
+      info.tileShape.push_back(v);
+    // strided_view advances the tile base by the traversal stride.
+    for (auto v : svType.getTraversalStrides().asArrayRef())
+      info.viewStrides.push_back(v);
+    info.dimMap.assign(svType.getDimMap().begin(), svType.getDimMap().end());
+    fillIdentityDimMapIfEmpty();
+    info.tensorViewRank = svType.getTensorView().getShape().size();
+    info.paddingValue = svType.getPaddingValue();
+    return info;
+  }
+
+  return rewriter.notifyMatchFailure(
+      op, "view kind is not supported by the transfer-based lowering");
 }
 
 /// Validate the semantic invariants that transfer and index-space queries rely
-/// on for a partition_view.
-static LogicalResult
-validatePartitionViewInfo(Operation *op, const PartitionViewInfo &info,
-                          ConversionPatternRewriter &rewriter) {
+/// on for a tile view.
+static LogicalResult validateViewInfo(Operation *op, const ViewInfo &info,
+                                      ConversionPatternRewriter &rewriter) {
   auto memrefTy = dyn_cast<MemRefType>(info.memref.getType());
   if (!memrefTy)
     return rewriter.notifyMatchFailure(
-        op, "partition_view source did not convert to a ranked memref");
+        op, "view source did not convert to a ranked memref");
 
   if (memrefTy.getRank() != static_cast<int64_t>(info.tensorViewRank))
     return rewriter.notifyMatchFailure(
-        op,
-        "converted partition_view memref rank does not match tensor_view rank");
+        op, "converted view memref rank does not match tensor_view rank");
 
   if (info.dimMap.size() != info.tileShape.size())
     return rewriter.notifyMatchFailure(
-        op, "partition_view dim_map rank does not match tile_shape rank");
+        op, "view dim_map rank does not match tile_shape rank");
+
+  if (info.viewStrides.size() != info.tileShape.size())
+    return rewriter.notifyMatchFailure(
+        op, "view stride rank does not match tile_shape rank");
 
   llvm::SmallBitVector seenDims(info.tensorViewRank);
   for (auto [tileDim, tensorDim] : llvm::enumerate(info.dimMap)) {
     if (tensorDim < 0 ||
         static_cast<unsigned>(tensorDim) >= info.tensorViewRank)
       return rewriter.notifyMatchFailure(
-          op,
-          "partition_view dim_map references an out-of-range tensor dimension");
+          op, "view dim_map references an out-of-range tensor dimension");
     if (seenDims.test(tensorDim))
       return rewriter.notifyMatchFailure(
-          op,
-          "partition_view dim_map must be a permutation without duplicates");
+          op, "view dim_map must be a permutation without duplicates");
     seenDims.set(tensorDim);
     if (info.tileShape[tileDim] <= 0)
       return rewriter.notifyMatchFailure(
-          op, "partition_view tile dimensions must be strictly positive");
+          op, "view tile dimensions must be strictly positive");
+    if (info.viewStrides[tileDim] <= 0)
+      return rewriter.notifyMatchFailure(
+          op, "view traversal strides must be strictly positive");
   }
 
   return success();
@@ -890,9 +964,9 @@ static void preserveDroppedOptHints(TkoOp op, Operation *newOp) {
 }
 
 /// Keeps the information needed by vector.transfer_read / transfer_write to
-/// access a memref through a partition_view.
+/// access a memref through a tile view (partition_view or strided_view).
 struct TransferViewAccessPlan {
-  PartitionViewInfo pvInfo;
+  ViewInfo viewInfo;
   SmallVector<Value> memrefIndices;
   AffineMap permutationMap;
   SmallVector<bool> inBounds;
@@ -900,31 +974,47 @@ struct TransferViewAccessPlan {
 
 /// Build a TransferViewAccessPlan for a load_view_tko or store_view_tko.
 ///
-/// Translate partition-view tile indices into the concrete memref indices,
-/// permutation map, and in-bounds flags required by vector.transfer_read/write.
-/// 1. Cast each tile-level index to `index` and scale by the tile extent.
+/// Translate tile-view indices into the concrete memref indices, permutation
+/// map, and in-bounds flags required by vector.transfer_read/write.
+/// 1. Cast each tile-level index to `index` and scale by the view's per-dim
+///    base advance (`viewStrides[i]`): tile_shape for partition_view,
+///    traversal_strides for strided_view.
 /// 2. Place the scaled index into the memref-dimension slot given by dim_map.
 /// 3. Build a permutation_map whose i-th result references memref dimension
 ///    dim_map[i], so vector dim i reads/writes that tensor dimension.
-/// 4. Set inBounds[i] = true only when the tensor extent is static and evenly
-///    divisible by the tile extent along that dimension.
+/// 4. Set inBounds[i] = true only when the tensor extent is static and the
+///    last in-bounds tile base plus the tile extent still fits within it (i.e.
+///    no tile, including the trailing one, ever runs past the tensor extent).
+///    For partition_view this reduces to "extent divisible by tile extent";
+///    for strided_view it also rejects overlapping/gapped layouts whose edge
+///    tiles spill out of bounds, deferring those lanes to the masked path.
 static FailureOr<TransferViewAccessPlan>
 buildTransferViewAccessPlan(ConversionPatternRewriter &rewriter, Operation *op,
                             Value view, Value convertedView, VectorType vecTy,
                             ValueRange convertedIndices) {
-  auto pvInfo = getPartitionViewInfo(view, convertedView);
-  if (failed(validatePartitionViewInfo(op, pvInfo, rewriter)))
+  auto viewInfoOr = getViewInfo(op, view, convertedView, rewriter);
+  if (failed(viewInfoOr))
+    return failure();
+  ViewInfo viewInfo = std::move(*viewInfoOr);
+  if (failed(validateViewInfo(op, viewInfo, rewriter)))
     return failure();
 
-  unsigned tileRank = pvInfo.tileShape.size();
-  unsigned tensorRank = pvInfo.tensorViewRank;
+  unsigned tileRank = viewInfo.tileShape.size();
+  unsigned tensorRank = viewInfo.tensorViewRank;
 
+  // The TileView interface is the authoritative source for how many tile-space
+  // indices the view expects; cross-check the extracted layout against it so a
+  // mismatch is reported against the view contract rather than silently relied
+  // upon downstream.
+  if (cast<cuda_tile::TileView>(view.getType()).getViewIndexRank() != tileRank)
+    return rewriter.notifyMatchFailure(
+        op, "view index rank does not match tile_shape rank");
   if ((unsigned)vecTy.getRank() != tileRank)
     return rewriter.notifyMatchFailure(
-        op, "converted tile rank does not match partition tile_shape rank");
+        op, "converted tile rank does not match view tile_shape rank");
   if (convertedIndices.size() != tileRank)
     return rewriter.notifyMatchFailure(
-        op, "partition_view index rank does not match tile_shape rank");
+        op, "view index rank does not match tile_shape rank");
 
   Location loc = op->getLoc();
   auto *ctx = rewriter.getContext();
@@ -933,37 +1023,46 @@ buildTransferViewAccessPlan(ConversionPatternRewriter &rewriter, Operation *op,
   Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
   SmallVector<Value> memrefIndices(tensorRank, zero);
   for (unsigned i = 0; i < tileRank; ++i) {
-    unsigned tensorDim = pvInfo.dimMap[i];
-    int64_t tileSize = pvInfo.tileShape[i];
+    unsigned tensorDim = viewInfo.dimMap[i];
+    int64_t stride = viewInfo.viewStrides[i];
     Value tileIndex = castValueToType(rewriter, loc, convertedIndices[i],
                                       rewriter.getIndexType());
     if (!tileIndex)
       return rewriter.notifyMatchFailure(
           op, "view index could not be converted to index");
-    Value tileSizeVal = arith::ConstantIndexOp::create(rewriter, loc, tileSize);
+    Value strideVal = arith::ConstantIndexOp::create(rewriter, loc, stride);
     auto nswFlag = arith::IntegerOverflowFlagsAttr::get(
         rewriter.getContext(), arith::IntegerOverflowFlags::nsw);
     Value elemOffset =
-        arith::MulIOp::create(rewriter, loc, tileIndex, tileSizeVal, nswFlag);
+        arith::MulIOp::create(rewriter, loc, tileIndex, strideVal, nswFlag);
     memrefIndices[tensorDim] = elemOffset;
   }
 
   SmallVector<AffineExpr> permExprs;
   permExprs.reserve(tileRank);
-  for (int32_t td : pvInfo.dimMap)
+  for (int32_t td : viewInfo.dimMap)
     permExprs.push_back(getAffineDimExpr(td, ctx));
   auto permutationMap = AffineMap::get(tensorRank, 0, permExprs, ctx);
 
-  auto memrefTy = cast<MemRefType>(pvInfo.memref.getType());
+  auto memrefTy = cast<MemRefType>(viewInfo.memref.getType());
   auto memrefShape = memrefTy.getShape();
   SmallVector<bool> inBounds(tileRank, false);
   for (unsigned i = 0; i < tileRank; ++i) {
-    int64_t ms = memrefShape[pvInfo.dimMap[i]];
-    int64_t ts = pvInfo.tileShape[i];
-    inBounds[i] = (ms != ShapedType::kDynamic && ts > 0 && (ms % ts) == 0);
+    int64_t ext = memrefShape[viewInfo.dimMap[i]];
+    int64_t stride = viewInfo.viewStrides[i];
+    int64_t tile = viewInfo.tileShape[i];
+    if (ext == ShapedType::kDynamic || stride <= 0 || tile <= 0) {
+      inBounds[i] = false;
+      continue;
+    }
+    // Number of in-bounds tile bases along this dimension (partial edge tiles
+    // are included), then check whether the trailing tile fits entirely.
+    int64_t numTiles = (ext + stride - 1) / stride;
+    int64_t lastBase = numTiles > 0 ? (numTiles - 1) * stride : 0;
+    inBounds[i] = (lastBase + tile <= ext);
   }
 
-  return TransferViewAccessPlan{std::move(pvInfo), std::move(memrefIndices),
+  return TransferViewAccessPlan{std::move(viewInfo), std::move(memrefIndices),
                                 permutationMap, std::move(inBounds)};
 }
 
@@ -1922,9 +2021,11 @@ struct ConvertGetGlobal : public OpConversionPattern<cuda_tile::GetGlobalOp> {
 
 /// Convert cuda_tile.get_index_space_shape.
 ///
-/// For
-/// partition_view<tile=(T0xT1x...), tensor_view<?x?x...>, dim_map=[d0,d1,...]>
-/// index_space_shape[i] = ceildiv(tensor_shape[dimMap[i]], tileShape[i]).
+/// For a tile view with tile dims mapped to tensor dims via dim_map,
+///   index_space_shape[i] = ceildiv(tensor_shape[dimMap[i]], viewStrides[i]),
+/// where viewStrides[i] is the per-dim base advance: tile_shape[i] for
+/// partition_view, traversal_strides[i] for strided_view. Partial edge tiles
+/// are included in the count, which the ceildiv naturally accounts for.
 struct ConvertGetIndexSpaceShape
     : public OpConversionPattern<cuda_tile::GetIndexSpaceShapeOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -1932,24 +2033,27 @@ struct ConvertGetIndexSpaceShape
   LogicalResult
   matchAndRewrite(cuda_tile::GetIndexSpaceShapeOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto pvInfo = getPartitionViewInfo(op.getSrc(), adaptor.getSrc());
-    if (failed(validatePartitionViewInfo(op, pvInfo, rewriter)))
+    auto viewInfoOr = getViewInfo(op, op.getSrc(), adaptor.getSrc(), rewriter);
+    if (failed(viewInfoOr))
+      return failure();
+    ViewInfo viewInfo = std::move(*viewInfoOr);
+    if (failed(validateViewInfo(op, viewInfo, rewriter)))
       return failure();
 
     Location loc = op.getLoc();
-    unsigned rank = pvInfo.tileShape.size();
+    unsigned rank = viewInfo.tileShape.size();
 
     // For each tile dimension i:
     // - The corresponding tensor_view dimension is dimMap[i]
-    // - index_space_dim_i = ceildiv(memref.dim(dimMap[i]), tileShape[i])
+    // - index_space_dim_i = ceildiv(memref.dim(dimMap[i]), viewStrides[i])
     // When the memref dimension is statically known, fold to a constant.
-    auto memrefTy = cast<MemRefType>(pvInfo.memref.getType());
+    auto memrefTy = cast<MemRefType>(viewInfo.memref.getType());
     auto memrefShape = memrefTy.getShape();
 
     SmallVector<Value> results;
     for (unsigned i = 0; i < rank; ++i) {
-      int64_t tileSize = pvInfo.tileShape[i];
-      unsigned tensorDim = pvInfo.dimMap[i];
+      int64_t stride = viewInfo.viewStrides[i];
+      unsigned tensorDim = viewInfo.dimMap[i];
       Type resultTy =
           getTypeConverter()->convertType(op->getResult(i).getType());
       if (!resultTy)
@@ -1960,18 +2064,17 @@ struct ConvertGetIndexSpaceShape
       Value castedResult;
       if (dimSize != ShapedType::kDynamic) {
         // Static dimension: compute ceildiv at compile time.
-        int64_t numTiles = (dimSize + tileSize - 1) / tileSize;
+        int64_t numTiles = (dimSize + stride - 1) / stride;
         Value cst = arith::ConstantIndexOp::create(rewriter, loc, numTiles);
         castedResult = castValueToType(rewriter, loc, cst, resultTy);
       } else {
         // Dynamic dimension: emit memref.dim + ceildivui.
         Value dimVal = memref::DimOp::create(
-            rewriter, loc, pvInfo.memref,
+            rewriter, loc, viewInfo.memref,
             arith::ConstantIndexOp::create(rewriter, loc, tensorDim));
-        Value tileSizeVal =
-            arith::ConstantIndexOp::create(rewriter, loc, tileSize);
+        Value strideVal = arith::ConstantIndexOp::create(rewriter, loc, stride);
         Value divResult =
-            arith::CeilDivUIOp::create(rewriter, loc, dimVal, tileSizeVal);
+            arith::CeilDivUIOp::create(rewriter, loc, dimVal, strideVal);
         castedResult = castValueToType(rewriter, loc, divResult, resultTy);
       }
 
@@ -2229,12 +2332,12 @@ struct ConvertLoadViewTko
       return failure();
 
     Value padding;
-    if (!plan->pvInfo.paddingValue) {
+    if (!plan->viewInfo.paddingValue) {
       padding = ub::PoisonOp::create(rewriter, loc, vecTy->getElementType());
     } else if (auto fty = dyn_cast<FloatType>(vecTy->getElementType())) {
       const llvm::fltSemantics &sem = fty.getFloatSemantics();
       APFloat val = APFloat::getZero(sem, /*Negative=*/false);
-      switch (plan->pvInfo.paddingValue.getValue()) {
+      switch (plan->viewInfo.paddingValue.getValue()) {
       case cuda_tile::PaddingValue::zero:
         val = APFloat::getZero(sem, /*Negative=*/false);
         break;
@@ -2257,7 +2360,7 @@ struct ConvertLoadViewTko
                                              vecTy->getElementType(), 0);
     }
     auto readOp = vector::TransferReadOp::create(
-        rewriter, loc, *vecTy, plan->pvInfo.memref, plan->memrefIndices,
+        rewriter, loc, *vecTy, plan->viewInfo.memref, plan->memrefIndices,
         AffineMapAttr::get(plan->permutationMap), padding,
         /*mask=*/Value(), rewriter.getBoolArrayAttr(plan->inBounds));
     preserveDroppedOptHints(op, readOp);
@@ -2281,6 +2384,44 @@ struct ConvertMakePartitionView
 
   LogicalResult
   matchAndRewrite(cuda_tile::MakePartitionViewOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOp(op, adaptor.getTensorView());
+    return success();
+  }
+};
+
+/// Convert cuda_tile.make_strided_view
+///
+/// Like partition_view, a strided_view is backed by the same ranked memref as
+/// its underlying tensor_view; tile_shape / traversal_strides / dim_map /
+/// padding_value are read off the result type at each consumer use site. So
+/// this pattern just forwards the already-converted tensor_view memref.
+struct ConvertMakeStridedView
+    : public OpConversionPattern<cuda_tile::MakeStridedViewOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::MakeStridedViewOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOp(op, adaptor.getTensorView());
+    return success();
+  }
+};
+
+/// Convert cuda_tile.make_gather_scatter_view
+///
+/// A gather_scatter_view is backed by the same ranked memref as its underlying
+/// tensor_view, so the view value itself forwards the converted memref. Note
+/// that consuming a gather_scatter_view through load_view_tko / store_view_tko
+/// requires gather/scatter semantics along the sparse dimension, which the
+/// transfer-based consumer lowering does not yet implement; those consumers
+/// will report a match failure for this view kind.
+struct ConvertMakeGatherScatterView
+    : public OpConversionPattern<cuda_tile::MakeGatherScatterViewOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::MakeGatherScatterViewOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     rewriter.replaceOp(op, adaptor.getTensorView());
     return success();
@@ -3346,7 +3487,7 @@ struct ConvertStoreViewTko
 
     auto writeOp = vector::TransferWriteOp::create(
         rewriter, loc, /*resultTypes=*/TypeRange{}, adaptor.getTile(),
-        plan->pvInfo.memref, plan->memrefIndices,
+        plan->viewInfo.memref, plan->memrefIndices,
         AffineMapAttr::get(plan->permutationMap),
         /*mask=*/Value(), rewriter.getBoolArrayAttr(plan->inBounds));
     preserveDroppedOptHints(op, writeOp);
@@ -3458,6 +3599,15 @@ static void populateTileIRToGPUTypeConverter(TypeConverter &converter,
   converter.addConversion([](cuda_tile::PartitionViewType pvTy) -> Type {
     return tensorViewToMemRefType(pvTy.getTensorView());
   });
+  // strided_view / gather_scatter_view likewise alias the underlying
+  // tensor_view buffer; tile_shape / traversal_strides / dim_map / sparse_dim /
+  // padding_value are read off the view type at each consumer use site.
+  converter.addConversion([](cuda_tile::StridedViewType svTy) -> Type {
+    return tensorViewToMemRefType(svTy.getTensorView());
+  });
+  converter.addConversion([](cuda_tile::GatherScatterViewType gsTy) -> Type {
+    return tensorViewToMemRefType(gsTy.getTensorView());
+  });
   converter.addConversion(
       [](cuda_tile::TokenType tokTy) -> Type { return tokTy; });
 
@@ -3486,7 +3636,8 @@ static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
       ConvertGetNumTileBlocks, ConvertGetTensorShape, ConvertGetTileBlockId,
       ConvertGlobal, ConvertIf, ConvertIota, ConvertIToF,
       ConvertLoadPtrTkoRanked, ConvertLoadPtrTkoScalar, ConvertLoadViewTko,
-      ConvertLog, ConvertLog2, ConvertMakePartitionView, ConvertMakeTensorView,
+      ConvertLog, ConvertLog2, ConvertMakeGatherScatterView,
+      ConvertMakePartitionView, ConvertMakeStridedView, ConvertMakeTensorView,
       ConvertMaxF, ConvertMaxI, ConvertMinF, ConvertMinI, ConvertMmaF,
       ConvertMmaI, ConvertModule, ConvertMulF, ConvertMulhiI, ConvertMulI,
       ConvertOffsetRanked, ConvertOffsetScalarPtr, ConvertNegF, ConvertNegI,

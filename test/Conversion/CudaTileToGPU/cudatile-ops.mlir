@@ -735,4 +735,28 @@ cuda_tile.module @ops_module {
     return
   }
 
+  // --- make_strided_view (from mlirExamples) ---
+  // Creates a strided view with 32-bit-indexed tiles of size (1024x1x32) and a
+  // traversal of strides [512,1,10] over a tensor_view; once over a fully static
+  // tensor_view and once over a tensor_view with a dynamically-sized dimension.
+  // The view aliases its tensor_view, so each lowers to a memref.reinterpret_cast.
+  // CHECK-LABEL: gpu.func @test_make_strided_view
+  // CHECK-SAME: %[[MSV_UPTR:[a-zA-Z0-9_]+]]: memref<*xf32>
+  entry @test_make_strided_view(%ptr: !cuda_tile.tile<!cuda_tile.ptr<f32>>) {
+    %tensor_view0 = make_tensor_view %ptr, shape=[8192, 8192, 64], strides=[524288,64,1]
+      : tensor_view<8192x8192x64xf32, strides=[524288,64,1]>
+    // CHECK: memref.reinterpret_cast %[[MSV_UPTR]] to offset: [0], sizes: [8192, 8192, 64], strides: [524288, 64, 1] : memref<*xf32> to memref<8192x8192x64xf32>
+    %sv0 = make_strided_view %tensor_view0 :
+      strided_view<tile=(1024x1x32), traversal_strides=[512,1,10], tensor_view<8192x8192x64xf32, strides=[524288,64,1]>>
+
+    %s0 = constant <i32: 8192> : tile<i32>
+    %str0 = constant <i32: 524288> : tile<i32>
+    %tensor_view1 = make_tensor_view %ptr, shape=[%s0, 8192, 64], strides=[%str0, 64, 1]
+      : tile<i32> -> tensor_view<?x8192x64xf32, strides=[?,64,1]>
+    // CHECK: memref.reinterpret_cast %[[MSV_UPTR]] to offset: [0], sizes: [%{{.*}}, 8192, 64], strides: [%{{.*}}, 64, 1] : memref<*xf32> to memref<?x8192x64xf32, strided<[?, 64, 1]>>
+    %sv1 = make_strided_view %tensor_view1 :
+      strided_view<tile=(1024x1x32), traversal_strides=[512,1,10], tensor_view<?x8192x64xf32, strides=[?,64,1]>>
+    return
+  }
+
 }

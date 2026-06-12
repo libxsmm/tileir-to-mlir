@@ -1383,4 +1383,160 @@ cuda_tile.module @m {
     return
   }
 
+  // --- strided_view: get_index_space_shape, all-static dims ---
+  // Index space along dim i is ceildiv(tensor_dim[dim_map[i]], traversal_strides[i]):
+  //   ceildiv(8192,512)=16, ceildiv(8192,1)=8192, ceildiv(64,10)=7.
+  // CHECK-LABEL: gpu.func @test_strided_index_space_static
+  // CHECK-SAME: %[[SIS_UPTR:[a-zA-Z0-9_]+]]: memref<*xf32>
+  entry @test_strided_index_space_static(%p: !cuda_tile.tile<!cuda_tile.ptr<f32>>) {
+    %tv = make_tensor_view %p, shape=[8192, 8192, 64], strides=[524288,64,1] : tensor_view<8192x8192x64xf32, strides=[524288,64,1]>
+    %sv = make_strided_view %tv : strided_view<tile=(1024x1x32), traversal_strides=[512,1,10], tensor_view<8192x8192x64xf32, strides=[524288,64,1]>>
+    // The view aliases the tensor_view, so its memref carries the full tensor shape.
+    // CHECK: memref.reinterpret_cast %[[SIS_UPTR]] to offset: [0], sizes: [8192, 8192, 64], strides: [524288, 64, 1] : memref<*xf32> to memref<8192x8192x64xf32>
+    // The three results are the folded index-space extents, in tile-dim order:
+    //   dim0 ceildiv(8192,512)=16, dim1 ceildiv(8192,1)=8192, dim2 ceildiv(64,10)=7.
+    // CHECK: %[[SIS_C16:.*]] = arith.constant 16 : index
+    // CHECK: arith.index_cast %[[SIS_C16]] : index to i32
+    // CHECK: %[[SIS_C8192:.*]] = arith.constant 8192 : index
+    // CHECK: arith.index_cast %[[SIS_C8192]] : index to i32
+    // CHECK: %[[SIS_C7:.*]] = arith.constant 7 : index
+    // CHECK: arith.index_cast %[[SIS_C7]] : index to i32
+    %d:3 = get_index_space_shape %sv : strided_view<tile=(1024x1x32), traversal_strides=[512,1,10], tensor_view<8192x8192x64xf32, strides=[524288,64,1]>> -> tile<i32>
+    return
+  }
+
+  // --- strided_view: get_index_space_shape with a dynamic tensor dim ---
+  // Dynamic dim 0 -> memref.dim then ceildivui by the traversal stride (512).
+  // CHECK-LABEL: gpu.func @test_strided_index_space_dynamic
+  // CHECK-SAME: %[[SISD_UPTR:[a-zA-Z0-9_]+]]: memref<*xf32>
+  entry @test_strided_index_space_dynamic(%p: !cuda_tile.tile<!cuda_tile.ptr<f32>>, %m: !cuda_tile.tile<i32>, %s: !cuda_tile.tile<i32>) {
+    %tv = make_tensor_view %p, shape=[%m, 8192, 64], strides=[%s, 64, 1] : tile<i32> -> tensor_view<?x8192x64xf32, strides=[?,64,1]>
+    %sv = make_strided_view %tv : strided_view<tile=(1024x1x32), traversal_strides=[512,1,10], tensor_view<?x8192x64xf32, strides=[?,64,1]>>
+    // CHECK: %[[SISD_PTR:.*]] = memref.reinterpret_cast %[[SISD_UPTR]] to offset: [0], sizes: [%{{.*}}, 8192, 64], strides: [%{{.*}}, 64, 1] : memref<*xf32> to memref<?x8192x64xf32, strided<[?, 64, 1]>>
+    // dim0 is dynamic: ceildivui(dim0, traversal_strides[0]=512).
+    // CHECK: %[[SISD_C0:.*]] = arith.constant 0 : index
+    // CHECK: %[[SISD_D0:.*]] = memref.dim %[[SISD_PTR]], %[[SISD_C0]] : memref<?x8192x64xf32, strided<[?, 64, 1]>>
+    // CHECK: %[[SISD_C512:.*]] = arith.constant 512 : index
+    // CHECK: %[[SISD_Q0:.*]] = arith.ceildivui %[[SISD_D0]], %[[SISD_C512]] : index
+    // CHECK: arith.index_cast %[[SISD_Q0]] : index to i32
+    // dim1 static: ceildiv(8192,1)=8192; dim2 static: ceildiv(64,10)=7.
+    // CHECK: %[[SISD_C8192:.*]] = arith.constant 8192 : index
+    // CHECK: arith.index_cast %[[SISD_C8192]] : index to i32
+    // CHECK: %[[SISD_C7:.*]] = arith.constant 7 : index
+    // CHECK: arith.index_cast %[[SISD_C7]] : index to i32
+    %d:3 = get_index_space_shape %sv : strided_view<tile=(1024x1x32), traversal_strides=[512,1,10], tensor_view<?x8192x64xf32, strides=[?,64,1]>> -> tile<i32>
+    return
+  }
+
+  // --- strided_view load: 1D overlapping tiles (stride 1 < tile 2) -> not in bounds ---
+  // Tile base advances by traversal_strides[i], not tile_shape[i]; here offset = index*1.
+  // (ceildiv(8,1)-1)*1 + 2 = 9 > 8, so the last tile is out of bounds: no in_bounds attr.
+  // CHECK-LABEL: gpu.func @test_strided_load_overlap
+  // CHECK-SAME: %[[SLO_UPTR:[a-zA-Z0-9_]+]]: memref<*xf32>
+  entry @test_strided_load_overlap(%p: !cuda_tile.tile<!cuda_tile.ptr<f32>>) {
+    %c0 = constant <i32: 0> : tile<i32>
+    %tv = make_tensor_view %p, shape=[8], strides=[1] : tensor_view<8xf32, strides=[1]>
+    %sv = make_strided_view %tv : strided_view<tile=(2), traversal_strides=[1], tensor_view<8xf32, strides=[1]>>
+    // CHECK: %[[SLO_IDXIN:.*]] = arith.constant 0 : i32
+    // CHECK: %[[SLO_PTR:.*]] = memref.reinterpret_cast %[[SLO_UPTR]] to offset: [0], sizes: [8], strides: [1] : memref<*xf32> to memref<8xf32>
+    // offset = index * traversal_strides[0] (= 1 here), not tile_shape.
+    // CHECK: %[[SLO_IDX:.*]] = arith.index_cast %[[SLO_IDXIN]] : i32 to index
+    // CHECK: %[[SLO_C1:.*]] = arith.constant 1 : index
+    // CHECK: %[[SLO_OFF:.*]] = arith.muli %[[SLO_IDX]], %[[SLO_C1]] overflow<nsw> : index
+    // CHECK: %[[SLO_PAD:.*]] = ub.poison : f32
+    // Overlapping tiles (stride 1 < tile 2): the trailing tile spills out, so NO in_bounds.
+    // CHECK: vector.transfer_read %[[SLO_PTR]][%[[SLO_OFF]]], %[[SLO_PAD]] : memref<8xf32>, vector<2xf32>
+    // CHECK-NOT: in_bounds
+    %t, %tok = load_view_tko weak %sv[%c0] : strided_view<tile=(2), traversal_strides=[1], tensor_view<8xf32, strides=[1]>>, tile<i32> -> tile<2xf32>, !cuda_tile.token
+    return
+  }
+
+  // --- strided_view load: 1D exact tiling (stride 2 == tile 2) -> in bounds ---
+  // (ceildiv(16,2)-1)*2 + 2 = 16 <= 16, so all tiles fit: in_bounds = [true].
+  // CHECK-LABEL: gpu.func @test_strided_load_exact
+  // CHECK-SAME: %[[SLE_UPTR:[a-zA-Z0-9_]+]]: memref<*xf32>
+  entry @test_strided_load_exact(%p: !cuda_tile.tile<!cuda_tile.ptr<f32>>) {
+    %c1 = constant <i32: 1> : tile<i32>
+    %tv = make_tensor_view %p, shape=[16], strides=[1] : tensor_view<16xf32, strides=[1]>
+    %sv = make_strided_view %tv : strided_view<tile=(2), traversal_strides=[2], tensor_view<16xf32, strides=[1]>>
+    // CHECK: %[[SLE_IDXIN:.*]] = arith.constant 1 : i32
+    // CHECK: %[[SLE_PTR:.*]] = memref.reinterpret_cast %[[SLE_UPTR]] to offset: [0], sizes: [16], strides: [1] : memref<*xf32> to memref<16xf32>
+    // offset = index * traversal_strides[0] (= 2 here).
+    // CHECK: %[[SLE_IDX:.*]] = arith.index_cast %[[SLE_IDXIN]] : i32 to index
+    // CHECK: %[[SLE_C2:.*]] = arith.constant 2 : index
+    // CHECK: %[[SLE_OFF:.*]] = arith.muli %[[SLE_IDX]], %[[SLE_C2]] overflow<nsw> : index
+    // Exact tiling (stride 2 == tile 2): every tile fits, so in_bounds = [true].
+    // CHECK: vector.transfer_read %[[SLE_PTR]][%[[SLE_OFF]]], %{{.*}} {in_bounds = [true]} : memref<16xf32>, vector<2xf32>
+    %t, %tok = load_view_tko weak %sv[%c1] : strided_view<tile=(2), traversal_strides=[2], tensor_view<16xf32, strides=[1]>>, tile<i32> -> tile<2xf32>, !cuda_tile.token
+    return
+  }
+
+  // --- strided_view load: 2D swizzled dim_map + nan padding, mixed in_bounds ---
+  // dim_map=[1,0]: tile dim0 -> tensor dim1 (size 16, stride 4), tile dim1 -> tensor dim0 (size 64, stride 3).
+  //   dim0: (ceildiv(16,4)-1)*4 + 4 = 16 <= 16 -> true; dim1: (ceildiv(64,3)-1)*3 + 2 = 65 > 64 -> false.
+  // CHECK-LABEL: gpu.func @test_strided_load_swizzled
+  // CHECK-SAME: %[[SLS_UPTR:[a-zA-Z0-9_]+]]: memref<*xf32>
+  entry @test_strided_load_swizzled(%p: !cuda_tile.tile<!cuda_tile.ptr<f32>>) {
+    %c0 = constant <i32: 0> : tile<i32>
+    %c1 = constant <i32: 1> : tile<i32>
+    %tv = make_tensor_view %p, shape=[64, 16], strides=[16, 1] : tensor_view<64x16xf32, strides=[16,1]>
+    %sv = make_strided_view %tv : strided_view<tile=(4x2), traversal_strides=[4,3], padding_value = nan, tensor_view<64x16xf32, strides=[16,1]>, dim_map=[1, 0]>
+    // CHECK: %[[SLS_IDX0IN:.*]] = arith.constant 0 : i32
+    // CHECK: %[[SLS_IDX1IN:.*]] = arith.constant 1 : i32
+    // CHECK: %[[SLS_PTR:.*]] = memref.reinterpret_cast %[[SLS_UPTR]] to offset: [0], sizes: [64, 16], strides: [16, 1] : memref<*xf32> to memref<64x16xf32>
+    // tile dim0 (index %c0) maps to tensor dim1 with traversal stride 4.
+    // CHECK: %[[SLS_IDX0:.*]] = arith.index_cast %[[SLS_IDX0IN]] : i32 to index
+    // CHECK: %[[SLS_S4:.*]] = arith.constant 4 : index
+    // CHECK: %[[SLS_OFF0:.*]] = arith.muli %[[SLS_IDX0]], %[[SLS_S4]] overflow<nsw> : index
+    // tile dim1 (index %c1) maps to tensor dim0 with traversal stride 3.
+    // CHECK: %[[SLS_IDX1:.*]] = arith.index_cast %[[SLS_IDX1IN]] : i32 to index
+    // CHECK: %[[SLS_S3:.*]] = arith.constant 3 : index
+    // CHECK: %[[SLS_OFF1:.*]] = arith.muli %[[SLS_IDX1]], %[[SLS_S3]] overflow<nsw> : index
+    // CHECK: %[[SLS_PAD:.*]] = arith.constant 0x7FC00000 : f32
+    // Swizzle proof: memref indices are in tensor-dim order [dim0=OFF1, dim1=OFF0].
+    // in_bounds: dim0 (size16/stride4/tile4) fits -> true; dim1 (size64/stride3/tile2) spills -> false.
+    // CHECK: vector.transfer_read %[[SLS_PTR]][%[[SLS_OFF1]], %[[SLS_OFF0]]], %[[SLS_PAD]] {in_bounds = [true, false], permutation_map = #{{.*}}} : memref<64x16xf32>, vector<4x2xf32>
+    %t, %tok = load_view_tko weak %sv[%c0, %c1] : strided_view<tile=(4x2), traversal_strides=[4,3], padding_value = nan, tensor_view<64x16xf32, strides=[16,1]>, dim_map=[1, 0]>, tile<i32> -> tile<4x2xf32>, !cuda_tile.token
+    return
+  }
+
+  // --- strided_view store: 2D, both dims in bounds ---
+  // dim0: (ceildiv(64,4)-1)*4 + 4 = 64 <= 64 -> true; dim1: (ceildiv(16,2)-1)*2 + 2 = 16 <= 16 -> true.
+  // CHECK-LABEL: gpu.func @test_strided_store
+  // CHECK-SAME: %[[SST_UPTR:[a-zA-Z0-9_]+]]: memref<*xf32>
+  entry @test_strided_store(%p: !cuda_tile.tile<!cuda_tile.ptr<f32>>) {
+    %c0 = constant <i32: 0> : tile<i32>
+    %c1 = constant <i32: 1> : tile<i32>
+    %tile = constant <f32: 1.0> : tile<4x2xf32>
+    %tv = make_tensor_view %p, shape=[64, 16], strides=[16, 1] : tensor_view<64x16xf32, strides=[16,1]>
+    %sv = make_strided_view %tv : strided_view<tile=(4x2), traversal_strides=[4,2], tensor_view<64x16xf32, strides=[16,1]>>
+    // CHECK: %[[SST_IDX0IN:.*]] = arith.constant 0 : i32
+    // CHECK: %[[SST_IDX1IN:.*]] = arith.constant 1 : i32
+    // CHECK: %[[SST_BCAST:.*]] = arith.constant dense<1.000000e+00> : vector<4x2xf32>
+    // CHECK: %[[SST_PTR:.*]] = memref.reinterpret_cast %[[SST_UPTR]] to offset: [0], sizes: [64, 16], strides: [16, 1] : memref<*xf32> to memref<64x16xf32>
+    // identity dim_map: tile dim0 uses stride 4, tile dim1 uses stride 2.
+    // CHECK: %[[SST_IDX0:.*]] = arith.index_cast %[[SST_IDX0IN]] : i32 to index
+    // CHECK: %[[SST_S4:.*]] = arith.constant 4 : index
+    // CHECK: %[[SST_OFF0:.*]] = arith.muli %[[SST_IDX0]], %[[SST_S4]] overflow<nsw> : index
+    // CHECK: %[[SST_IDX1:.*]] = arith.index_cast %[[SST_IDX1IN]] : i32 to index
+    // CHECK: %[[SST_S2:.*]] = arith.constant 2 : index
+    // CHECK: %[[SST_OFF1:.*]] = arith.muli %[[SST_IDX1]], %[[SST_S2]] overflow<nsw> : index
+    // identity dim_map: memref index order is [OFF0, OFF1], both dims fit -> in_bounds = [true, true], no permutation_map.
+    // CHECK: vector.transfer_write %[[SST_BCAST]], %[[SST_PTR]][%[[SST_OFF0]], %[[SST_OFF1]]] {in_bounds = [true, true]} : vector<4x2xf32>, memref<64x16xf32>
+    // CHECK-NOT: permutation_map
+    %tok = store_view_tko weak %tile, %sv[%c0, %c1] : tile<4x2xf32>, strided_view<tile=(4x2), traversal_strides=[4,2], tensor_view<64x16xf32, strides=[16,1]>>, tile<i32> -> !cuda_tile.token
+    return
+  }
+
+  // --- make_gather_scatter_view: view aliases the tensor_view memref (no consumer support) ---
+  // CHECK-LABEL: gpu.func @test_make_gather_scatter_view
+  // CHECK-SAME: %[[GSV_UPTR:[a-zA-Z0-9_]+]]: memref<*xf32>
+  entry @test_make_gather_scatter_view(%p: !cuda_tile.tile<!cuda_tile.ptr<f32>>) {
+    %tv = make_tensor_view %p, shape=[8192, 8192], strides=[8192, 1] : tensor_view<8192x8192xf32, strides=[8192,1]>
+    // CHECK: %[[GSV_PTR:.*]] = memref.reinterpret_cast %[[GSV_UPTR]] to offset: [0], sizes: [8192, 8192], strides: [8192, 1] : memref<*xf32> to memref<8192x8192xf32>
+    // CHECK-NOT: make_gather_scatter_view
+    %gsv = make_gather_scatter_view %tv : gather_scatter_view<tile=(128x128), tensor_view<8192x8192xf32, strides=[8192,1]>, sparse_dim=0>
+    return
+  }
+
 }
