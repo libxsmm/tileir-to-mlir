@@ -752,6 +752,16 @@ static LogicalResult checkCommonTkoGuards(TkoOp op,
   return success();
 }
 
+/// Preserve an `optimization_hints` attribute that this lowering otherwise
+/// drops. The attribute's inner builtin `DictionaryAttr` is attached to the
+/// produced target op as the discardable attribute
+/// `tir-dropped-optimization-hints`.
+template <typename TkoOp>
+static void preserveDroppedOptHints(TkoOp op, Operation *newOp) {
+  if (auto hints = op.getOptimizationHintsAttr())
+    newOp->setAttr("tir-dropped-optimization-hints", hints.getValue());
+}
+
 /// Keeps the information needed by vector.transfer_read / transfer_write to
 /// access a memref through a partition_view.
 struct TransferViewAccessPlan {
@@ -1200,6 +1210,9 @@ struct ConvertDivI : public OpConversionPattern<cuda_tile::DivIOp> {
 /// entry argument type (e.g. `tile<ptr<T>>` -> `memref<*xT>`, `tile<i32>` ->
 /// `i32`). The entry body is then signature-converted in place and merged into
 /// the gpu.func body.
+///
+/// `optimization_hints`, when present, is preserved on the produced gpu.func
+/// as the discardable attribute `tir-dropped-optimization-hints`.
 struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -1232,6 +1245,7 @@ struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
                                FunctionType::get(ctx, gpuFuncArgTypes, {}));
     gpuFunc->setAttr(gpu::GPUDialect::getKernelFuncAttrName(),
                      rewriter.getUnitAttr());
+    preserveDroppedOptHints(entryOp, gpuFunc);
 
     // Convert the entry block's arg types; this replaces the block with a
     // new one having the converted signature and rewires uses via source
@@ -1430,6 +1444,10 @@ struct ConvertFma : public OpConversionPattern<cuda_tile::FmaOp> {
 ///     `divui(new_iv, tile_size)` so the tile-space index is recovered.
 ///   - Convert the region types and merge the original body into the new one,
 ///     replacing the induction-variable and iter-arg block arguments.
+///
+/// `unsignedCmp` (use unsigned comparison for loop termination) has no
+/// equivalent on scf.for and is otherwise dropped; it is preserved on the
+/// produced scf.for as the discardable attribute `tir-dropped-unsigned-cmp`.
 struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -1555,6 +1573,8 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
 
     auto newForOp = scf::ForOp::create(rewriter, loc, lb, ub, step,
                                        adaptor.getInitValues());
+    if (op.getUnsignedCmp())
+      newForOp->setAttr("tir-dropped-unsigned-cmp", rewriter.getUnitAttr());
 
     // Convert region types
     if (failed(
@@ -1999,6 +2019,10 @@ using ConvertIToF = ConvertFromToSignednessCastWithRoundingOp<
 ///   - Only `weak` memory_ordering_semantics is supported.
 ///   - `memory_scope` is not supported.
 ///   - `result_token` must have no live uses; this lowering drops the token.
+///
+/// `optimization_hints`, when present, is preserved on the produced
+/// vector.transfer_read as the discardable attribute
+/// `tir-dropped-optimization-hints`.
 struct ConvertLoadViewTko
     : public OpConversionPattern<cuda_tile::LoadViewTkoOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -2054,6 +2078,7 @@ struct ConvertLoadViewTko
         rewriter, loc, *vecTy, plan->pvInfo.memref, plan->memrefIndices,
         AffineMapAttr::get(plan->permutationMap), padding,
         /*mask=*/Value(), rewriter.getBoolArrayAttr(plan->inBounds));
+    preserveDroppedOptHints(op, readOp);
 
     rewriter.replaceOp(op, {readOp.getResult(), Value()});
     return success();
@@ -2380,6 +2405,9 @@ struct ConvertNegI : public OpConversionPattern<cuda_tile::NegIOp> {
 /// the scalar memref the load reads from.
 ///
 /// Higher-rank pointer loads must first be lifted by `--tileir-ptr-to-view`.
+///
+/// `optimization_hints`, when present, is preserved on the produced memref.load
+/// as the discardable attribute `tir-dropped-optimization-hints`.
 struct ConvertLoadPtrTkoScalar
     : public OpConversionPattern<cuda_tile::LoadPtrTkoOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -2412,15 +2440,19 @@ struct ConvertLoadPtrTkoScalar
         /*offset=*/rewriter.getIndexAttr(0),
         /*sizes=*/SmallVector<OpFoldResult>{},
         /*strides=*/SmallVector<OpFoldResult>{});
-    Value scalar =
+    auto loadOp =
         memref::LoadOp::create(rewriter, loc, rc.getResult(), ValueRange{});
-    rewriter.replaceOp(op, {scalar, Value()});
+    preserveDroppedOptHints(op, loadOp);
+    rewriter.replaceOp(op, {loadOp.getResult(), Value()});
     return success();
   }
 };
 
 /// Convert scalar (rank-0) cuda_tile.store_ptr_tko on a `tile<ptr<T>>` to a
 /// `memref.reinterpret_cast` + `memref.store`. Mirrors ConvertLoadPtrTkoScalar.
+///
+/// `optimization_hints`, when present, is preserved on the produced
+/// memref.store as the discardable attribute `tir-dropped-optimization-hints`.
 struct ConvertStorePtrTkoScalar
     : public OpConversionPattern<cuda_tile::StorePtrTkoOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -2453,8 +2485,9 @@ struct ConvertStorePtrTkoScalar
         /*offset=*/rewriter.getIndexAttr(0),
         /*sizes=*/SmallVector<OpFoldResult>{},
         /*strides=*/SmallVector<OpFoldResult>{});
-    memref::StoreOp::create(rewriter, loc, adaptor.getValue(), rc.getResult(),
-                            ValueRange{});
+    auto storeOp = memref::StoreOp::create(rewriter, loc, adaptor.getValue(),
+                                           rc.getResult(), ValueRange{});
+    preserveDroppedOptHints(op, storeOp);
     rewriter.eraseOp(op);
     return success();
   }
@@ -2583,6 +2616,9 @@ static LogicalResult deriveGatherScatterMemRefAndMask(
 /// buffer base. We trace the original IR to find the scalar base pointer
 /// (converted to memref<*xT>), cast it to memref<?xT>, and emit a 1-D
 /// vector.gather, reshaping back to the tile shape.
+///
+/// `optimization_hints`, when present, is preserved on the produced
+/// vector.gather as the discardable attribute `tir-dropped-optimization-hints`.
 struct ConvertLoadPtrTkoRanked
     : public OpConversionPattern<cuda_tile::LoadPtrTkoOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -2621,16 +2657,21 @@ struct ConvertLoadPtrTkoRanked
 
     // Emit vector.gather.
     Value c0 = arith::ConstantIndexOp::create(rewriter, loc, 0);
-    Value gathered =
+    auto gatherOp =
         vector::GatherOp::create(rewriter, loc, resultVecTy, baseMemref,
                                  ValueRange{c0}, indexVec, mask, passThru);
+    preserveDroppedOptHints(op, gatherOp);
 
-    rewriter.replaceOp(op, {gathered, Value()});
+    rewriter.replaceOp(op, {gatherOp.getResult(), Value()});
     return success();
   }
 };
 
 /// Convert ranked cuda_tile.store_ptr_tko to vector.scatter.
+///
+/// `optimization_hints`, when present, is preserved on the produced
+/// vector.scatter as the discardable attribute
+/// `tir-dropped-optimization-hints`.
 struct ConvertStorePtrTkoRanked
     : public OpConversionPattern<cuda_tile::StorePtrTkoOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -2660,8 +2701,10 @@ struct ConvertStorePtrTkoRanked
 
     // Emit vector.scatter.
     Value c0 = arith::ConstantIndexOp::create(rewriter, loc, 0);
-    vector::ScatterOp::create(rewriter, loc, /*resultType=*/Type(), baseMemref,
-                              ValueRange{c0}, indexVec, mask, valVec);
+    auto scatterOp = vector::ScatterOp::create(
+        rewriter, loc, /*resultType=*/Type(), baseMemref, ValueRange{c0},
+        indexVec, mask, valVec);
+    preserveDroppedOptHints(op, scatterOp);
     rewriter.eraseOp(op);
     return success();
   }
@@ -3120,6 +3163,10 @@ struct ConvertSqrt : public OpConversionPattern<cuda_tile::SqrtOp> {
 ///   - Only `weak` memory_ordering_semantics is supported.
 ///   - `memory_scope` is not supported.
 ///   - `result_token` must be unused (we drop the token).
+///
+/// `optimization_hints`, when present, is preserved on the produced
+/// vector.transfer_write as the discardable attribute
+/// `tir-dropped-optimization-hints`.
 struct ConvertStoreViewTko
     : public OpConversionPattern<cuda_tile::StoreViewTkoOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -3148,7 +3195,7 @@ struct ConvertStoreViewTko
         plan->pvInfo.memref, plan->memrefIndices,
         AffineMapAttr::get(plan->permutationMap),
         /*mask=*/Value(), rewriter.getBoolArrayAttr(plan->inBounds));
-    (void)writeOp;
+    preserveDroppedOptHints(op, writeOp);
 
     rewriter.eraseOp(op);
     return success();
