@@ -20,6 +20,7 @@ def ConvertTileIRToMLIRPass : Pass<"convert-cuda-tile-to-mlir", "ModuleOp"> {
   let dependentDialects = [
     "cuda_tile::CudaTileDialect",
     "arith::ArithDialect",
+    "func::FuncDialect",
     "math::MathDialect",
     "vector::VectorDialect",
     "scf::SCFDialect",
@@ -43,9 +44,9 @@ def TileIRPtrToViewPass : Pass<"tileir-ptr-to-view", "ModuleOp"> {
   let summary = "Rewrite Triton-style cuda_tile ptr-arithmetic into "
                 "make_tensor_view + make_partition_view + load/store_view_tko";
   let description = [{
-    Preprocessing pass that recognizes the canonical Triton-emitted
-    iota+reshape+broadcast+offset pointer-arithmetic chain feeding a
-    `cuda_tile.load_ptr_tko` / `cuda_tile.store_ptr_tko` and rewrites it into
+    Preprocessing pass that attempts to recognize canonical Triton-emitted
+    iota+reshape+broadcast+offset pointer-arithmetic chains feeding a
+    `cuda_tile.load_ptr_tko` / `cuda_tile.store_ptr_tko` and rewrites them into
     the higher-level `cuda_tile.make_tensor_view` + `cuda_tile.make_partition_view`
     + `cuda_tile.load_view_tko` / `cuda_tile.store_view_tko` form, which the
     `convert-cuda-tile-to-mlir` pass can lower.

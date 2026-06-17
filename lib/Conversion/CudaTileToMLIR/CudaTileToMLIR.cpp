@@ -1494,17 +1494,18 @@ struct ConvertDivI : public OpConversionPattern<cuda_tile::DivIOp> {
   }
 };
 
-/// Convert cuda_tile.entry to gpu.func.
+/// Convert cuda_tile.entry to gpu.func (gpu target) or func.func (cpu target).
 ///
-/// The gpu.func signature is derived by applying the type converter to each
+/// The function signature is derived by applying the type converter to each
 /// entry argument type (e.g. `tile<ptr<T>>` -> `memref<*xT>`, `tile<i32>` ->
-/// `i32`). The entry body is then signature-converted in place and merged into
-/// the gpu.func body.
+/// `i32`). The entry body is signature-converted in place and then moved into
+/// the new function body.
 ///
-/// `optimization_hints`, when present, is preserved on the produced gpu.func
-/// as the discardable attribute `tir-dropped-optimization-hints`.
+/// `optimization_hints`, when present, is preserved on the produced function as
+/// the discardable attribute `tir-dropped-optimization-hints`.
 struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
-  using OpConversionPattern::OpConversionPattern;
+  ConvertEntry(const TypeConverter &tc, MLIRContext *ctx, CudaTileTarget target)
+      : OpConversionPattern(tc, ctx), target(target) {}
 
   LogicalResult
   matchAndRewrite(cuda_tile::EntryOp entryOp, OpAdaptor adaptor,
@@ -1514,28 +1515,23 @@ struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
     Block *entryBlock = &entryOp.getBody().front();
     unsigned numArgs = entryBlock->getNumArguments();
 
-    // Compute gpu.func arg types and prepare a signature conversion for the
-    // entry block.
+    // Compute the function arg types and prepare a signature conversion for
+    // the entry block.
     const TypeConverter *tc = getTypeConverter();
     TypeConverter::SignatureConversion sigConv(numArgs);
-    SmallVector<Type> gpuFuncArgTypes;
-    gpuFuncArgTypes.reserve(numArgs);
+    SmallVector<Type> funcArgTypes;
+    funcArgTypes.reserve(numArgs);
     for (unsigned i = 0; i < numArgs; ++i) {
       Type origTy = entryBlock->getArgument(i).getType();
       Type converted = tc->convertType(origTy);
       if (!converted)
         return rewriter.notifyMatchFailure(entryOp,
                                            "cannot convert entry arg type");
-      gpuFuncArgTypes.push_back(converted);
+      funcArgTypes.push_back(converted);
       sigConv.addInputs(i, converted);
     }
 
-    auto gpuFunc =
-        gpu::GPUFuncOp::create(rewriter, loc, entryOp.getSymName(),
-                               FunctionType::get(ctx, gpuFuncArgTypes, {}));
-    gpuFunc->setAttr(gpu::GPUDialect::getKernelFuncAttrName(),
-                     rewriter.getUnitAttr());
-    preserveDroppedOptHints(entryOp, gpuFunc);
+    auto funcType = FunctionType::get(ctx, funcArgTypes, {});
 
     // Convert the entry block's arg types; this replaces the block with a
     // new one having the converted signature and rewires uses via source
@@ -1545,12 +1541,29 @@ struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
     if (failed(convertedBlock))
       return failure();
 
-    // Merge the (now type-converted) entry block into the gpu.func body.
-    Block *gpuBlock = &gpuFunc.getBody().front();
-    rewriter.mergeBlocks(*convertedBlock, gpuBlock, gpuBlock->getArguments());
+    if (target == CudaTileTarget::GPU) {
+      // GPU: lower to a gpu.func kernel and merge the converted body into its
+      // (auto-created) entry block.
+      auto gpuFunc =
+          gpu::GPUFuncOp::create(rewriter, loc, entryOp.getSymName(), funcType);
+      gpuFunc->setAttr(gpu::GPUDialect::getKernelFuncAttrName(),
+                       rewriter.getUnitAttr());
+      preserveDroppedOptHints(entryOp, gpuFunc);
+      Block *gpuBlock = &gpuFunc.getBody().front();
+      rewriter.mergeBlocks(*convertedBlock, gpuBlock, gpuBlock->getArguments());
+    } else {
+      // CPU: lower to a plain func.func and move the converted body region in.
+      auto func =
+          func::FuncOp::create(rewriter, loc, entryOp.getSymName(), funcType);
+      preserveDroppedOptHints(entryOp, func);
+      rewriter.inlineRegionBefore(entryOp.getBody(), func.getBody(),
+                                  func.getBody().end());
+    }
     rewriter.eraseOp(entryOp);
     return success();
   }
+
+  CudaTileTarget target;
 };
 
 using ConvertExp = ConvertUnarySourceOp<cuda_tile::ExpOp, math::ExpOp>;
@@ -2584,28 +2597,43 @@ struct ConvertMmaI : public OpConversionPattern<cuda_tile::MmaIOp> {
   }
 };
 
-/// Convert cuda_tile.module to gpu.module by moving its body contents.
+/// Convert cuda_tile.module by moving its body contents.
+///
+/// For the GPU target the body is moved into a new gpu.module of the same name.
+/// For the CPU target the cuda_tile.module is dissolved: its contents are
+/// inlined into the enclosing module (the builtin.module the pass runs on) and
+/// the cuda_tile.module wrapper is erased.
 struct ConvertModule : public OpConversionPattern<cuda_tile::ModuleOp> {
-  using OpConversionPattern::OpConversionPattern;
+  ConvertModule(const TypeConverter &tc, MLIRContext *ctx,
+                CudaTileTarget target)
+      : OpConversionPattern(tc, ctx), target(target) {}
 
   LogicalResult
   matchAndRewrite(cuda_tile::ModuleOp cudaMod, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto gpuMod = gpu::GPUModuleOp::create(rewriter, cudaMod.getLoc(),
-                                           cudaMod.getSymName());
-    Block *oldBody = &cudaMod.getBody().front();
-    Block *newBody = gpuMod.getBody();
+    if (target == CudaTileTarget::GPU) {
+      auto gpuMod = gpu::GPUModuleOp::create(rewriter, cudaMod.getLoc(),
+                                             cudaMod.getSymName());
+      Block *oldBody = &cudaMod.getBody().front();
+      Block *newBody = gpuMod.getBody();
 
-    // Move ops from cuda_tile.module body into gpu.module body, inserting
-    // before the gpu.module_end terminator if present.
-    if (newBody->mightHaveTerminator())
-      rewriter.inlineBlockBefore(oldBody, newBody->getTerminator());
-    else
-      rewriter.inlineBlockBefore(oldBody, newBody, newBody->end());
+      // Move ops from cuda_tile.module body into gpu.module body, inserting
+      // before the gpu.module_end terminator if present.
+      if (newBody->mightHaveTerminator())
+        rewriter.inlineBlockBefore(oldBody, newBody->getTerminator());
+      else
+        rewriter.inlineBlockBefore(oldBody, newBody, newBody->end());
+    } else {
+      // Dissolve the module into the enclosing module by inlining its body
+      // ops right before the cuda_tile.module op in its parent block.
+      rewriter.inlineBlockBefore(&cudaMod.getBody().front(), cudaMod);
+    }
 
     rewriter.eraseOp(cudaMod);
     return success();
   }
+
+  CudaTileTarget target;
 };
 
 using ConvertMulF = ConvertBinaryFloatOp<cuda_tile::MulFOp, arith::MulFOp>;
@@ -3338,16 +3366,24 @@ struct ConvertReshape : public OpConversionPattern<cuda_tile::ReshapeOp> {
   }
 };
 
-/// Convert cuda_tile.return to gpu.return.
+/// Convert cuda_tile.return to gpu.return (gpu target) or func.return (cpu
+/// target).
 struct ConvertReturn : public OpConversionPattern<cuda_tile::ReturnOp> {
-  using OpConversionPattern::OpConversionPattern;
+  ConvertReturn(const TypeConverter &tc, MLIRContext *ctx,
+                CudaTileTarget target)
+      : OpConversionPattern(tc, ctx), target(target) {}
 
   LogicalResult
   matchAndRewrite(cuda_tile::ReturnOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<gpu::ReturnOp>(op);
+    if (target == CudaTileTarget::GPU)
+      rewriter.replaceOpWithNewOp<gpu::ReturnOp>(op);
+    else
+      rewriter.replaceOpWithNewOp<func::ReturnOp>(op);
     return success();
   }
+
+  CudaTileTarget target;
 };
 
 /// Convert cuda_tile.rsqrt to math.rsqrt.
@@ -3628,31 +3664,34 @@ static void populateTileIRToMLIRTypeConverter(TypeConverter &converter,
 
 /// Register all cuda_tile -> gpu/vector conversion patterns.
 static void populateTileIRToMLIRConversionPatterns(TypeConverter &converter,
-                                                   RewritePatternSet &patterns) {
+                                                   RewritePatternSet &patterns,
+                                                   CudaTileTarget target) {
   MLIRContext *ctx = patterns.getContext();
+  // Target-dependent patterns (module / entry / return) select gpu vs func ops.
+  patterns.add<ConvertEntry, ConvertModule, ConvertReturn>(converter, ctx,
+                                                           target);
   patterns.add<
       ConvertAbsF, ConvertAbsI, ConvertAddF, ConvertAddI, ConvertAlloca,
       ConvertAndI, ConvertAssume, ConvertAtan2, ConvertBitcast,
       ConvertBroadcast, ConvertCat, ConvertCeil, ConvertCmpF, ConvertCmpI,
       ConvertConstant, ConvertContinue, ConvertCos, ConvertCosH, ConvertDivF,
-      ConvertDivI, ConvertEntry, ConvertAtomicRMWTko, ConvertExp, ConvertExp2,
-      ConvertExtI, ConvertExtract, ConvertFloor, ConvertFma, ConvertFor,
-      ConvertFToF, ConvertFToI, ConvertGetGlobal, ConvertGetIndexSpaceShape,
+      ConvertDivI, ConvertAtomicRMWTko, ConvertExp, ConvertExp2, ConvertExtI,
+      ConvertExtract, ConvertFloor, ConvertFma, ConvertFor, ConvertFToF,
+      ConvertFToI, ConvertGetGlobal, ConvertGetIndexSpaceShape,
       ConvertGetNumTileBlocks, ConvertGetTensorShape, ConvertGetTileBlockId,
       ConvertGlobal, ConvertIf, ConvertIota, ConvertIToF,
       ConvertLoadPtrTkoRanked, ConvertLoadPtrTkoScalar, ConvertLoadViewTko,
       ConvertLog, ConvertLog2, ConvertMakeGatherScatterView,
       ConvertMakePartitionView, ConvertMakeStridedView, ConvertMakeTensorView,
       ConvertMaxF, ConvertMaxI, ConvertMinF, ConvertMinI, ConvertMmaF,
-      ConvertMmaI, ConvertModule, ConvertMulF, ConvertMulhiI, ConvertMulI,
-      ConvertOffsetRanked, ConvertOffsetScalarPtr, ConvertNegF, ConvertNegI,
-      ConvertOrI, ConvertPack, ConvertPermute, ConvertPow,
-      ConvertPtrToPtrCastOrFail, ConvertReduce, ConvertRemF, ConvertRemI,
-      ConvertReshape, ConvertReturn, ConvertRsqrt, ConvertScan, ConvertSelect,
-      ConvertShLI, ConvertShRI, ConvertSin, ConvertSinH, ConvertSqrt,
-      ConvertStorePtrTkoRanked, ConvertStorePtrTkoScalar, ConvertStoreViewTko,
-      ConvertSubF, ConvertSubI, ConvertTan, ConvertTanH, ConvertTruncI,
-      ConvertUnpack, ConvertXOrI, ConvertYield>(converter, ctx);
+      ConvertMmaI, ConvertMulF, ConvertMulhiI, ConvertMulI, ConvertOffsetRanked,
+      ConvertOffsetScalarPtr, ConvertNegF, ConvertNegI, ConvertOrI, ConvertPack,
+      ConvertPermute, ConvertPow, ConvertPtrToPtrCastOrFail, ConvertReduce,
+      ConvertRemF, ConvertRemI, ConvertReshape, ConvertRsqrt, ConvertScan,
+      ConvertSelect, ConvertShLI, ConvertShRI, ConvertSin, ConvertSinH,
+      ConvertSqrt, ConvertStorePtrTkoRanked, ConvertStorePtrTkoScalar,
+      ConvertStoreViewTko, ConvertSubF, ConvertSubI, ConvertTan, ConvertTanH,
+      ConvertTruncI, ConvertUnpack, ConvertXOrI, ConvertYield>(converter, ctx);
 }
 
 //===----------------------------------------------------------------------===//
@@ -3672,15 +3711,15 @@ struct ConvertTileIRToMLIRPass
     populateTileIRToMLIRTypeConverter(typeConverter, ctx);
 
     RewritePatternSet patterns(ctx);
-    populateTileIRToMLIRConversionPatterns(typeConverter, patterns);
+    populateTileIRToMLIRConversionPatterns(typeConverter, patterns, target);
 
     ConversionTarget conversionTarget(*ctx);
 
-    // GPU/vector/arith/scf/memref/ub ops are legal.
-    conversionTarget.addLegalDialect<arith::ArithDialect, gpu::GPUDialect,
-                                     math::MathDialect, memref::MemRefDialect,
-                                     scf::SCFDialect, ub::UBDialect,
-                                     vector::VectorDialect>();
+    // GPU/vector/arith/scf/memref/ub/func ops are legal.
+    conversionTarget.addLegalDialect<arith::ArithDialect, func::FuncDialect,
+                                     gpu::GPUDialect, math::MathDialect,
+                                     memref::MemRefDialect, scf::SCFDialect,
+                                     ub::UBDialect, vector::VectorDialect>();
     conversionTarget.addLegalOp<UnrealizedConversionCastOp>();
 
     // CudaTile ops are illegal (target of conversion).
