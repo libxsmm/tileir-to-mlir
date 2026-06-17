@@ -164,6 +164,11 @@
 #include "cuda_tile/Dialect/CudaTile/IR/Ops.h"
 #include "cuda_tile/Dialect/CudaTile/IR/Types.h"
 
+namespace mlir {
+#define GEN_PASS_DEF_CONVERTTILEIRTOMLIRPASS
+#include "mlir/Conversion/CudaTileToMLIR/Passes.h.inc"
+} // namespace mlir
+
 using namespace mlir;
 
 namespace {
@@ -3656,25 +3661,8 @@ static void populateTileIRToMLIRConversionPatterns(TypeConverter &converter,
 
 /// Pass driver for lowering CudaTile IR to GPU/vector/scf/arith/memref.
 struct ConvertTileIRToMLIRPass
-    : public PassWrapper<ConvertTileIRToMLIRPass, OperationPass<ModuleOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ConvertTileIRToMLIRPass)
-
-  StringRef getArgument() const override { return "convert-cuda-tile-to-mlir"; }
-
-  StringRef getDescription() const override {
-    return "Convert CudaTile IR to GPU/vector/scf/arith ops";
-  }
-
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<cuda_tile::CudaTileDialect>();
-    registry.insert<arith::ArithDialect>();
-    registry.insert<math::MathDialect>();
-    registry.insert<vector::VectorDialect>();
-    registry.insert<scf::SCFDialect>();
-    registry.insert<memref::MemRefDialect>();
-    registry.insert<gpu::GPUDialect>();
-    registry.insert<ub::UBDialect>();
-  }
+    : public impl::ConvertTileIRToMLIRPassBase<ConvertTileIRToMLIRPass> {
+  using Base::Base;
 
   void runOnOperation() override {
     MLIRContext *ctx = &getContext();
@@ -3686,19 +3674,20 @@ struct ConvertTileIRToMLIRPass
     RewritePatternSet patterns(ctx);
     populateTileIRToMLIRConversionPatterns(typeConverter, patterns);
 
-    ConversionTarget target(*ctx);
+    ConversionTarget conversionTarget(*ctx);
 
     // GPU/vector/arith/scf/memref/ub ops are legal.
-    target.addLegalDialect<arith::ArithDialect, gpu::GPUDialect,
-                           math::MathDialect, memref::MemRefDialect,
-                           scf::SCFDialect, ub::UBDialect,
-                           vector::VectorDialect>();
-    target.addLegalOp<UnrealizedConversionCastOp>();
+    conversionTarget.addLegalDialect<arith::ArithDialect, gpu::GPUDialect,
+                                     math::MathDialect, memref::MemRefDialect,
+                                     scf::SCFDialect, ub::UBDialect,
+                                     vector::VectorDialect>();
+    conversionTarget.addLegalOp<UnrealizedConversionCastOp>();
 
     // CudaTile ops are illegal (target of conversion).
-    target.addIllegalDialect<cuda_tile::CudaTileDialect>();
+    conversionTarget.addIllegalDialect<cuda_tile::CudaTileDialect>();
 
-    if (failed(applyPartialConversion(module, target, std::move(patterns))))
+    if (failed(applyPartialConversion(module, conversionTarget,
+                                      std::move(patterns))))
       return signalPassFailure();
 
     // Fold muli(divui(x, c), c) -> x. These patterns are produced when
@@ -3748,14 +3737,12 @@ struct ConvertTileIRToMLIRPass
       }
     }
 
-    // Mark the module as a GPU container module.
-    module->setAttr(gpu::GPUDialect::getContainerModuleAttrName(),
-                    UnitAttr::get(ctx));
+    // Mark the module as a GPU container module when targeting the GPU. For the
+    // CPU target the GPU container-module marker is intentionally omitted.
+    if (target == CudaTileTarget::GPU)
+      module->setAttr(gpu::GPUDialect::getContainerModuleAttrName(),
+                      UnitAttr::get(ctx));
   }
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<ModuleOp>> mlir::createConvertTileIRToMLIRPass() {
-  return std::make_unique<ConvertTileIRToMLIRPass>();
-}

@@ -161,11 +161,13 @@ link_directories(${CUDA_TILE_LIB_DIR})
 #===----------------------------------------------------------------------===#
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
+include_directories(${CMAKE_CURRENT_BINARY_DIR}/include)
 
 #===----------------------------------------------------------------------===#
 # Subdirectories
 #===----------------------------------------------------------------------===#
 
+add_subdirectory(include/mlir/Conversion/CudaTileToMLIR)
 add_subdirectory(lib)
 add_subdirectory(tools)
 add_subdirectory(test)

@@ -17,9 +17,9 @@
 namespace mlir {
 class ModuleOp;
 
-/// Creates the pass that recognizes Triton-style ptr-arithmetic feeding
-/// `load_ptr_tko`/`store_ptr_tko` and rewrites it into view-based loads/stores.
-std::unique_ptr<OperationPass<ModuleOp>> createTileIRPtrToViewPass();
+/// Generated pass declarations (createTileIRPtrToViewPass factory).
+#define GEN_PASS_DECL_TILEIRPTRTOVIEWPASS
+#include "mlir/Conversion/CudaTileToMLIR/Passes.h.inc"
 
 } // namespace mlir
 

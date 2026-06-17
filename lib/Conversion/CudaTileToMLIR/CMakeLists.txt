@@ -3,6 +3,8 @@ add_library(CudaTileToMLIR STATIC
   TileIRPtrToView.cpp
 )
 
+add_dependencies(CudaTileToMLIR MLIRCudaTileToMLIRConversionPassIncGen)
+
 target_link_libraries(CudaTileToMLIR
   PRIVATE
   MLIRArithDialect

@@ -91,6 +91,11 @@
 using namespace mlir;
 using namespace mlir::cuda_tile;
 
+namespace mlir {
+#define GEN_PASS_DEF_TILEIRPTRTOVIEWPASS
+#include "mlir/Conversion/CudaTileToMLIR/Passes.h.inc"
+} // namespace mlir
+
 namespace {
 
 //===----------------------------------------------------------------------===//
@@ -1152,18 +1157,8 @@ static LogicalResult rewriteStore(StorePtrTkoOp op, AssumeForwarder &fwd) {
 //===----------------------------------------------------------------------===//
 
 struct TileIRPtrToViewPass
-    : public PassWrapper<TileIRPtrToViewPass, OperationPass<::mlir::ModuleOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TileIRPtrToViewPass)
-
-  StringRef getArgument() const final { return "tileir-ptr-to-view"; }
-  StringRef getDescription() const final {
-    return "Rewrite Triton-style cuda_tile ptr-arithmetic into "
-           "make_tensor_view + make_partition_view + load/store_view_tko";
-  }
-
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<cuda_tile::CudaTileDialect>();
-  }
+    : public ::mlir::impl::TileIRPtrToViewPassBase<TileIRPtrToViewPass> {
+  using Base::Base;
 
   void runOnOperation() override {
     ::mlir::ModuleOp mod = getOperation();
@@ -1351,8 +1346,3 @@ struct TileIRPtrToViewPass
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<::mlir::ModuleOp>>
-mlir::createTileIRPtrToViewPass() {
-  return std::make_unique<TileIRPtrToViewPass>();
-}

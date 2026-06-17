@@ -1,4 +1,4 @@
-//===- TileIRToMLIR.h - CudaTile IR to MLIR conversion ----------*- C++ -*-===//
+//===- CudaTileToMLIR.h - CudaTile IR to MLIR conversion --------*- C++ -*-===//
 //
 // Conversion pass from CudaTile IR to GPU/vector/scf/arith/memref ops.
 //
@@ -12,8 +12,14 @@
 namespace mlir {
 class ModuleOp;
 
-/// Creates the pass that converts CudaTile IR to GPU/vector IR.
-std::unique_ptr<OperationPass<ModuleOp>> createConvertTileIRToMLIRPass();
+/// Selects the lowering target for the CudaTile-to-MLIR conversion.
+enum class CudaTileTarget { GPU, CPU };
+
+/// Generated pass declarations (ConvertTileIRToMLIRPassOptions and the
+/// createConvertTileIRToMLIRPass factories). The CudaTileTarget enum above must
+/// be defined before this include, as it is referenced by the generated code.
+#define GEN_PASS_DECL_CONVERTTILEIRTOMLIRPASS
+#include "mlir/Conversion/CudaTileToMLIR/Passes.h.inc"
 
 } // namespace mlir
 
