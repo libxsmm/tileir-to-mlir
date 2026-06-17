@@ -701,13 +701,50 @@ struct ConvertToScfYield : public OpConversionPattern<SrcOp> {
   }
 };
 
+/// Layout of the six leading launch-coordinate arguments that the CPU target
+/// prepends to every lowered entry function (see ConvertEntry). They appear in
+/// the order: tile block id x/y/z, then grid dim x/y/z. The GPU target instead
+/// obtains these from gpu.block_id / gpu.grid_dim, so it adds no extra
+/// arguments.
+struct CpuLaunchArgLayout {
+  /// Total number of leading launch-coordinate arguments.
+  static constexpr unsigned kNumArgs = 6;
+  /// First argument index of the tile-block-id triple.
+  static constexpr unsigned kBlockIdBase = 0;
+  /// First argument index of the grid-dimension triple.
+  static constexpr unsigned kGridDimBase = 3;
+
+  /// Look up the CPU function-argument index carrying the value for the query
+  /// whose triple starts at `argBase` (kBlockIdBase or kGridDimBase) along
+  /// `dim`.
+  static unsigned argIndex(unsigned argBase, gpu::Dimension dim) {
+    switch (dim) {
+    case gpu::Dimension::x:
+      return argBase + 0;
+    case gpu::Dimension::y:
+      return argBase + 1;
+    case gpu::Dimension::z:
+      return argBase + 2;
+    }
+    llvm_unreachable("unhandled gpu dimension");
+  }
+};
+
 /// Convert a cuda_tile op that returns three i32 values (one per grid
-/// dimension) into three GPU dimension-query ops (x, y, z) with index_cast.
-/// Used for both get_tile_block_id -> gpu.block_id and
-/// get_num_tile_blocks -> gpu.grid_dim.
-template <typename SrcOp, typename GpuDimOp>
+/// dimension) into the launch coordinates for the active target.
+///
+///   - GPU: three GPU dimension-query ops (x, y, z), e.g.
+///     get_tile_block_id -> gpu.block_id and get_num_tile_blocks ->
+///     gpu.grid_dim.
+///   - CPU: the matching leading function arguments, whose indices are looked
+///     up via CpuLaunchArgLayout starting at `CpuArgBase`.
+///
+/// Each result is cast to the converted result type as needed.
+template <typename SrcOp, typename GpuDimOp, unsigned CpuArgBase>
 struct ConvertDimQueryOp : public OpConversionPattern<SrcOp> {
-  using OpConversionPattern<SrcOp>::OpConversionPattern;
+  ConvertDimQueryOp(const TypeConverter &tc, MLIRContext *ctx,
+                    CudaTileTarget target)
+      : OpConversionPattern<SrcOp>(tc, ctx), target(target) {}
 
   LogicalResult
   matchAndRewrite(SrcOp op, typename OpConversionPattern<SrcOp>::OpAdaptor,
@@ -717,21 +754,36 @@ struct ConvertDimQueryOp : public OpConversionPattern<SrcOp> {
         this->getTypeConverter()->convertType(op.getResult(0).getType());
     if (!resultTy)
       return rewriter.notifyMatchFailure(op, "cannot convert result type");
-    Value x = castValueToType(
-        rewriter, loc, GpuDimOp::create(rewriter, loc, gpu::Dimension::x),
-        resultTy);
-    Value y = castValueToType(
-        rewriter, loc, GpuDimOp::create(rewriter, loc, gpu::Dimension::y),
-        resultTy);
-    Value z = castValueToType(
-        rewriter, loc, GpuDimOp::create(rewriter, loc, gpu::Dimension::z),
-        resultTy);
-    if (!x || !y || !z)
-      return rewriter.notifyMatchFailure(
-          op, "cannot cast dim query results to target type");
-    rewriter.replaceOp(op, {x, y, z});
+
+    // On CPU the launch coordinates are passed as leading function arguments;
+    // resolve the enclosing function once.
+    func::FuncOp func;
+    if (target == CudaTileTarget::CPU) {
+      func = op->template getParentOfType<func::FuncOp>();
+      if (!func || func.getNumArguments() < CpuLaunchArgLayout::kNumArgs)
+        return rewriter.notifyMatchFailure(
+            op,
+            "expected enclosing func.func with launch-coordinate arguments");
+    }
+
+    SmallVector<Value, 3> results;
+    for (gpu::Dimension dim :
+         {gpu::Dimension::x, gpu::Dimension::y, gpu::Dimension::z}) {
+      Value raw = target == CudaTileTarget::GPU
+                      ? Value(GpuDimOp::create(rewriter, loc, dim))
+                      : Value(func.getArgument(
+                            CpuLaunchArgLayout::argIndex(CpuArgBase, dim)));
+      Value casted = castValueToType(rewriter, loc, raw, resultTy);
+      if (!casted)
+        return rewriter.notifyMatchFailure(
+            op, "cannot cast dim query result to target type");
+      results.push_back(casted);
+    }
+    rewriter.replaceOp(op, results);
     return success();
   }
+
+  CudaTileTarget target;
 };
 
 /// Convert cuda_tile.maxf/minf based on propagate_nan.
@@ -1501,6 +1553,12 @@ struct ConvertDivI : public OpConversionPattern<cuda_tile::DivIOp> {
 /// `i32`). The entry body is signature-converted in place and then moved into
 /// the new function body.
 ///
+/// For the CPU target the function additionally receives six leading `i32`
+/// arguments carrying the launch coordinates that the GPU target obtains from
+/// dimension-query ops: the three tile block ids (x, y, z) followed by the
+/// three grid dimensions (x, y, z). These precede the converted entry
+/// arguments.
+///
 /// `optimization_hints`, when present, is preserved on the produced function as
 /// the discardable attribute `tir-dropped-optimization-hints`.
 struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
@@ -1520,7 +1578,17 @@ struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
     const TypeConverter *tc = getTypeConverter();
     TypeConverter::SignatureConversion sigConv(numArgs);
     SmallVector<Type> funcArgTypes;
-    funcArgTypes.reserve(numArgs);
+
+    // CPU launch coordinates are passed in as six leading i32 arguments since
+    // gpu dimension-query ops are unavailable on that target.
+    if (target == CudaTileTarget::CPU) {
+      SmallVector<Type> launchArgTypes(CpuLaunchArgLayout::kNumArgs,
+                                       IntegerType::get(ctx, 32));
+      funcArgTypes.append(launchArgTypes.begin(), launchArgTypes.end());
+      sigConv.addInputs(launchArgTypes);
+    }
+
+    funcArgTypes.reserve(funcArgTypes.size() + numArgs);
     for (unsigned i = 0; i < numArgs; ++i) {
       Type origTy = entryBlock->getArgument(i).getType();
       Type converted = tc->convertType(origTy);
@@ -2108,7 +2176,8 @@ struct ConvertGetIndexSpaceShape
 };
 
 using ConvertGetNumTileBlocks =
-    ConvertDimQueryOp<cuda_tile::GetNumTileBlocksOp, gpu::GridDimOp>;
+    ConvertDimQueryOp<cuda_tile::GetNumTileBlocksOp, gpu::GridDimOp,
+                      CpuLaunchArgLayout::kGridDimBase>;
 
 /// Convert cuda_tile.get_tensor_shape.
 ///
@@ -2170,7 +2239,8 @@ struct ConvertGetTensorShape
 };
 
 using ConvertGetTileBlockId =
-    ConvertDimQueryOp<cuda_tile::GetTileBlockIdOp, gpu::BlockIdOp>;
+    ConvertDimQueryOp<cuda_tile::GetTileBlockIdOp, gpu::BlockIdOp,
+                      CpuLaunchArgLayout::kBlockIdBase>;
 
 /// Convert cuda_tile.global to memref.global.
 ///
@@ -3667,9 +3737,11 @@ static void populateTileIRToMLIRConversionPatterns(TypeConverter &converter,
                                                    RewritePatternSet &patterns,
                                                    CudaTileTarget target) {
   MLIRContext *ctx = patterns.getContext();
-  // Target-dependent patterns (module / entry / return) select gpu vs func ops.
-  patterns.add<ConvertEntry, ConvertModule, ConvertReturn>(converter, ctx,
-                                                           target);
+  // Target-dependent patterns select gpu vs func ops (module / entry / return)
+  // and gpu dim-query ops vs leading function arguments (block id / grid dim).
+  patterns.add<ConvertEntry, ConvertModule, ConvertReturn,
+               ConvertGetNumTileBlocks, ConvertGetTileBlockId>(converter, ctx,
+                                                               target);
   patterns.add<
       ConvertAbsF, ConvertAbsI, ConvertAddF, ConvertAddI, ConvertAlloca,
       ConvertAndI, ConvertAssume, ConvertAtan2, ConvertBitcast,
@@ -3678,8 +3750,7 @@ static void populateTileIRToMLIRConversionPatterns(TypeConverter &converter,
       ConvertDivI, ConvertAtomicRMWTko, ConvertExp, ConvertExp2, ConvertExtI,
       ConvertExtract, ConvertFloor, ConvertFma, ConvertFor, ConvertFToF,
       ConvertFToI, ConvertGetGlobal, ConvertGetIndexSpaceShape,
-      ConvertGetNumTileBlocks, ConvertGetTensorShape, ConvertGetTileBlockId,
-      ConvertGlobal, ConvertIf, ConvertIota, ConvertIToF,
+      ConvertGetTensorShape, ConvertGlobal, ConvertIf, ConvertIota, ConvertIToF,
       ConvertLoadPtrTkoRanked, ConvertLoadPtrTkoScalar, ConvertLoadViewTko,
       ConvertLog, ConvertLog2, ConvertMakeGatherScatterView,
       ConvertMakePartitionView, ConvertMakeStridedView, ConvertMakeTensorView,
@@ -3716,8 +3787,11 @@ struct ConvertTileIRToMLIRPass
     ConversionTarget conversionTarget(*ctx);
 
     // GPU/vector/arith/scf/memref/ub/func ops are legal.
-    conversionTarget.addLegalDialect<arith::ArithDialect, func::FuncDialect,
-                                     gpu::GPUDialect, math::MathDialect,
+    if (target == CudaTileTarget::GPU)
+      conversionTarget.addLegalDialect<gpu::GPUDialect>();
+    else
+      conversionTarget.addLegalDialect<func::FuncDialect>();
+    conversionTarget.addLegalDialect<arith::ArithDialect, math::MathDialect,
                                      memref::MemRefDialect, scf::SCFDialect,
                                      ub::UBDialect, vector::VectorDialect>();
     conversionTarget.addLegalOp<UnrealizedConversionCastOp>();
