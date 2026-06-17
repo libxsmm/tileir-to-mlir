@@ -66,7 +66,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Conversion/CudaTileToGPU/TileIRPtrToView.h"
+#include "mlir/Conversion/CudaTileToMLIR/TileIRPtrToView.h"
 
 #include "cuda_tile/Dialect/CudaTile/IR/Dialect.h"
 #include "cuda_tile/Dialect/CudaTile/IR/Ops.h"
@@ -1067,7 +1067,7 @@ static LogicalResult rewriteLoad(LoadPtrTkoOp op, AssumeForwarder &fwd) {
 
   // The pass requires a mask so that we can recover the per-dim global sizes.
   // Rank-0 (scalar) loads carry no per-dim information and are lowered
-  // directly by --convert-cuda-tile-to-gpu, so we silently skip them here
+  // directly by --convert-cuda-tile-to-mlir, so we silently skip them here
   // rather than emitting a misleading remark.
   if (!op.getMask()) {
     if (!tileShape.empty())
@@ -1113,7 +1113,7 @@ static LogicalResult rewriteStore(StorePtrTkoOp op, AssumeForwarder &fwd) {
   ArrayRef<int64_t> tileShape = valueTy.getShape();
 
   // Same rationale as in rewriteLoad: scalar (rank-0) stores are handled by
-  // the direct --convert-cuda-tile-to-gpu pattern; only emit the remark for
+  // the direct --convert-cuda-tile-to-mlir pattern; only emit the remark for
   // higher-rank stores that genuinely need a mask.
   if (!op.getMask()) {
     if (!tileShape.empty())

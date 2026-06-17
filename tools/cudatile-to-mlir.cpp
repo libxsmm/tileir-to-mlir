@@ -1,12 +1,12 @@
-//===- cudatile-to-gpu.cpp - Driver for CudaTileToGPU pass ---------------===//
+//===- cudatile-to-mlir.cpp - Driver for CudaTileToMLIR pass -------------===//
 //
-// Simple mlir-opt-style driver that registers the CudaTileToGPU conversion
+// Simple mlir-opt-style driver that registers the CudaTileToMLIR conversion
 // pass together with the dialects it depends on.
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Conversion/CudaTileToGPU/CudaTileToGPU.h"
-#include "mlir/Conversion/CudaTileToGPU/TileIRPtrToView.h"
+#include "mlir/Conversion/CudaTileToMLIR/CudaTileToMLIR.h"
+#include "mlir/Conversion/CudaTileToMLIR/TileIRPtrToView.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -34,7 +34,7 @@ int main(int argc, char **argv) {
       mlir::vector::VectorDialect, mlir::cuda_tile::CudaTileDialect>();
 
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
-    return mlir::createConvertTileIRToGPUPass();
+    return mlir::createConvertTileIRToMLIRPass();
   });
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return mlir::createTileIRPtrToViewPass();
@@ -43,7 +43,7 @@ int main(int argc, char **argv) {
   mlir::registerTransformsPasses();
 
   // If no pass/pipeline flags are given, default to
-  // --convert-cuda-tile-to-gpu.
+  // --convert-cuda-tile-to-mlir.
   bool hasPassFlag = false;
   for (int i = 1; i < argc; ++i) {
     llvm::StringRef arg(argv[i]);
@@ -55,7 +55,7 @@ int main(int argc, char **argv) {
   std::vector<const char *> newArgv(argv, argv + argc);
   // if (!hasPassFlag) {
   //   newArgv.push_back("--pass-pipeline=builtin.module("
-  //                     "convert-cuda-tile-to-gpu,"
+  //                     "convert-cuda-tile-to-mlir,"
   //                     "loop-invariant-code-motion,"
   //                     "canonicalize,"
   //                     "cse)");
@@ -64,5 +64,5 @@ int main(int argc, char **argv) {
 
   return mlir::asMainReturnCode(
       mlir::MlirOptMain(newArgc, const_cast<char **>(newArgv.data()),
-                        "CudaTileToGPU optimizer driver\n", registry));
+                        "CudaTileToMLIR optimizer driver\n", registry));
 }

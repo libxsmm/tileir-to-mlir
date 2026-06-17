@@ -1,4 +1,4 @@
-// RUN: cudatile-to-gpu --convert-cuda-tile-to-gpu %s | FileCheck %s
+// RUN: cudatile-to-mlir --convert-cuda-tile-to-mlir %s | FileCheck %s
 
 // Verifies that when the upper bound of a cuda_tile.for loop is produced by
 // `cuda_tile.divi <expr>, <constant N>`, the loop is rescaled so that the

@@ -3,9 +3,9 @@
 config.llvm_tools_dir = "@LLVM_TOOLS_DIR@"
 config.llvm_shlib_ext = "@CMAKE_SHARED_LIBRARY_SUFFIX@"
 
-config.cudatile_to_gpu_obj_root = "@CMAKE_BINARY_DIR@"
-config.cudatile_to_gpu_tool_dir = "@CMAKE_BINARY_DIR@/tools"
-config.cudatile_to_gpu_source_root = "@CMAKE_SOURCE_DIR@/test"
+config.cudatile_to_mlir_obj_root = "@CMAKE_BINARY_DIR@"
+config.cudatile_to_mlir_tool_dir = "@CMAKE_BINARY_DIR@/tools"
+config.cudatile_to_mlir_source_root = "@CMAKE_SOURCE_DIR@/test"
 
 import lit.llvm
 lit.llvm.initialize(lit_config, config)

@@ -1,9 +1,9 @@
-add_library(CudaTileToGPU STATIC
-  CudaTileToGPU.cpp
+add_library(CudaTileToMLIR STATIC
+  CudaTileToMLIR.cpp
   TileIRPtrToView.cpp
 )
 
-target_link_libraries(CudaTileToGPU
+target_link_libraries(CudaTileToMLIR
   PRIVATE
   MLIRArithDialect
   MLIRFuncDialect

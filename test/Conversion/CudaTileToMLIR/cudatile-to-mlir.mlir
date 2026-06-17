@@ -1,5 +1,5 @@
-// RUN: cudatile-to-gpu --convert-cuda-tile-to-gpu %s | FileCheck %s
-// RUN: cudatile-to-gpu --convert-cuda-tile-to-gpu %s | mlir-opt --loop-invariant-code-motion -canonicalize -cse > /dev/null
+// RUN: cudatile-to-mlir --convert-cuda-tile-to-mlir %s | FileCheck %s
+// RUN: cudatile-to-mlir --convert-cuda-tile-to-mlir %s | mlir-opt --loop-invariant-code-motion -canonicalize -cse > /dev/null
 
 // Additional tests that complement cuda_tile_ir_ops.mlir.
 // Focuses on: 2D array constants, vector iter_args, assume chaining,

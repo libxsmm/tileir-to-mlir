@@ -1,5 +1,5 @@
-// RUN: cudatile-to-gpu --convert-cuda-tile-to-gpu %s | FileCheck %s
-// RUN: cudatile-to-gpu --convert-cuda-tile-to-gpu %s | mlir-opt --loop-invariant-code-motion -canonicalize -cse > /dev/null
+// RUN: cudatile-to-mlir --convert-cuda-tile-to-mlir %s | FileCheck %s
+// RUN: cudatile-to-mlir --convert-cuda-tile-to-mlir %s | mlir-opt --loop-invariant-code-motion -canonicalize -cse > /dev/null
 
 // CHECK: #map = affine_map<(d0, d1) -> (d1, d0)>
 // CHECK: #map1 = affine_map<(d0, d1, d2) -> (d0, d2)>

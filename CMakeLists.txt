@@ -4,6 +4,52 @@ project(VectorToCudaTile LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Honor -DCMAKE_LINKER=<name-or-path> for compiler-driver links (clang/gcc).
+# This also marks CMAKE_LINKER as used, so CMake will not report it as unused.
+if(CMAKE_LINKER)
+  set(_v2ct_linker_raw "${CMAKE_LINKER}")
+
+  if(IS_ABSOLUTE "${_v2ct_linker_raw}")
+    set(_v2ct_linker_path "${_v2ct_linker_raw}")
+  else()
+    find_program(_v2ct_linker_path
+      NAMES "${_v2ct_linker_raw}" "ld.${_v2ct_linker_raw}")
+    if(NOT _v2ct_linker_path)
+      message(FATAL_ERROR
+        "CMAKE_LINKER='${_v2ct_linker_raw}' was requested, but no matching linker "
+        "executable was found in PATH.")
+    endif()
+  endif()
+
+  # Keep CMAKE_LINKER canonicalized to the resolved executable path.
+  set(CMAKE_LINKER "${_v2ct_linker_path}" CACHE FILEPATH
+      "Path to linker executable" FORCE)
+
+  # Map common linker executable names to -fuse-ld values.
+  get_filename_component(_v2ct_linker_name "${_v2ct_linker_path}" NAME)
+  set(_v2ct_fuse_ld "${_v2ct_linker_name}")
+  if(_v2ct_linker_name STREQUAL "ld.lld")
+    set(_v2ct_fuse_ld "lld")
+  elseif(_v2ct_linker_name MATCHES "^ld\\.")
+    string(REGEX REPLACE "^ld\\." "" _v2ct_fuse_ld "${_v2ct_linker_name}")
+  endif()
+
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    add_link_options("-fuse-ld=${_v2ct_fuse_ld}")
+    message(STATUS
+      "Using requested linker: ${CMAKE_LINKER} (-fuse-ld=${_v2ct_fuse_ld})")
+  else()
+    message(WARNING
+      "CMAKE_LINKER is set to '${CMAKE_LINKER}', but automatic propagation via "
+      "-fuse-ld is only implemented for GNU/Clang C++ compilers.")
+  endif()
+
+  unset(_v2ct_linker_raw)
+  unset(_v2ct_linker_path)
+  unset(_v2ct_linker_name)
+  unset(_v2ct_fuse_ld)
+endif()
+
 # Match LLVM/MLIR: no RTTI, no exceptions.
 if(NOT LLVM_ENABLE_RTTI)
   if(MSVC)

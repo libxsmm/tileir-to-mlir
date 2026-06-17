@@ -5,12 +5,12 @@
 // `cuda_tile.load_ptr_tko` / `cuda_tile.store_ptr_tko` into the higher-level
 // `cuda_tile.make_tensor_view` + `cuda_tile.make_partition_view` +
 // `cuda_tile.load_view_tko` / `cuda_tile.store_view_tko` form, which the
-// `--convert-cuda-tile-to-gpu` pass can lower.
+// `--convert-cuda-tile-to-mlir` pass can lower.
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef MLIR_CONVERSION_CUDATILETOGPU_TILEIRPTRTOVIEW_H
-#define MLIR_CONVERSION_CUDATILETOGPU_TILEIRPTRTOVIEW_H
+#ifndef MLIR_CONVERSION_CUDATILETOMLIR_TILEIRPTRTOVIEW_H
+#define MLIR_CONVERSION_CUDATILETOMLIR_TILEIRPTRTOVIEW_H
 
 #include "mlir/Pass/Pass.h"
 
@@ -23,4 +23,4 @@ std::unique_ptr<OperationPass<ModuleOp>> createTileIRPtrToViewPass();
 
 } // namespace mlir
 
-#endif // MLIR_CONVERSION_CUDATILETOGPU_TILEIRPTRTOVIEW_H
+#endif // MLIR_CONVERSION_CUDATILETOMLIR_TILEIRPTRTOVIEW_H

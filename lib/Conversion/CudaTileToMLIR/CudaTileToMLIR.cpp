@@ -1,4 +1,4 @@
-//===- TileIRToGPU.cpp - CudaTile IR to GPU conversion ----------*- C++ -*-===//
+//===- TileIRToMLIR.cpp - CudaTile IR to MLIR conversion --------*- C++ -*-===//
 //
 // Conversion pass from CudaTile IR to GPU/vector/scf/arith/memref ops.
 //
@@ -141,7 +141,7 @@
 // own pattern (e.g. ConvertGatherScatterLoad/Store) rather than being folded
 // into the shared transfer plan.
 
-#include "mlir/Conversion/CudaTileToGPU/CudaTileToGPU.h"
+#include "mlir/Conversion/CudaTileToMLIR/CudaTileToMLIR.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -3555,8 +3555,8 @@ using ConvertYield = ConvertToScfYield<cuda_tile::YieldOp>;
 //===----------------------------------------------------------------------===//
 
 /// Populate type-conversion rules for cuda_tile -> gpu/vector lowering.
-static void populateTileIRToGPUTypeConverter(TypeConverter &converter,
-                                             MLIRContext *ctx) {
+static void populateTileIRToMLIRTypeConverter(TypeConverter &converter,
+                                              MLIRContext *ctx) {
   // Fallback: keep types unchanged.
   converter.addConversion([](Type type) { return type; });
 
@@ -3622,8 +3622,8 @@ static void populateTileIRToGPUTypeConverter(TypeConverter &converter,
 }
 
 /// Register all cuda_tile -> gpu/vector conversion patterns.
-static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
-                                                  RewritePatternSet &patterns) {
+static void populateTileIRToMLIRConversionPatterns(TypeConverter &converter,
+                                                   RewritePatternSet &patterns) {
   MLIRContext *ctx = patterns.getContext();
   patterns.add<
       ConvertAbsF, ConvertAbsI, ConvertAddF, ConvertAddI, ConvertAlloca,
@@ -3655,11 +3655,11 @@ static void populateTileIRToGPUConversionPatterns(TypeConverter &converter,
 //===----------------------------------------------------------------------===//
 
 /// Pass driver for lowering CudaTile IR to GPU/vector/scf/arith/memref.
-struct ConvertTileIRToGPUPass
-    : public PassWrapper<ConvertTileIRToGPUPass, OperationPass<ModuleOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ConvertTileIRToGPUPass)
+struct ConvertTileIRToMLIRPass
+    : public PassWrapper<ConvertTileIRToMLIRPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ConvertTileIRToMLIRPass)
 
-  StringRef getArgument() const override { return "convert-cuda-tile-to-gpu"; }
+  StringRef getArgument() const override { return "convert-cuda-tile-to-mlir"; }
 
   StringRef getDescription() const override {
     return "Convert CudaTile IR to GPU/vector/scf/arith ops";
@@ -3681,10 +3681,10 @@ struct ConvertTileIRToGPUPass
     ModuleOp module = getOperation();
 
     TypeConverter typeConverter;
-    populateTileIRToGPUTypeConverter(typeConverter, ctx);
+    populateTileIRToMLIRTypeConverter(typeConverter, ctx);
 
     RewritePatternSet patterns(ctx);
-    populateTileIRToGPUConversionPatterns(typeConverter, patterns);
+    populateTileIRToMLIRConversionPatterns(typeConverter, patterns);
 
     ConversionTarget target(*ctx);
 
@@ -3756,6 +3756,6 @@ struct ConvertTileIRToGPUPass
 
 } // namespace
 
-std::unique_ptr<OperationPass<ModuleOp>> mlir::createConvertTileIRToGPUPass() {
-  return std::make_unique<ConvertTileIRToGPUPass>();
+std::unique_ptr<OperationPass<ModuleOp>> mlir::createConvertTileIRToMLIRPass() {
+  return std::make_unique<ConvertTileIRToMLIRPass>();
 }

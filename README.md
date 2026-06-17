@@ -1,4 +1,4 @@
-# CudaTileToGPU
+# CudaTileToMLIR
 
 Conversion pass and tooling for lowering CudaTile IR to MLIR GPU/vector/scf/arith/math/memref dialects.
 
@@ -26,7 +26,7 @@ Notes:
 - `CUDA_TILE_DIR` must point to the root of the `cuda-tile` project (the directory that contains `include/` and `build/`), or to a cuda-tile install directory (contains `lib/` and `include/include/`).
 - `MLIR_DIR` must point to the same LLVM/MLIR build that was used to build `cuda-tile`; mixing different LLVM revisions is not supported.
 - If your setup needs it, you can also pass `-DLLVM_DIR=/path/to/llvm-project/build/lib/cmake/llvm`.
-- `test/Conversion/CudaTileToGPU/cudatile-appendix.mlir` includes a gemm example.
+- `test/Conversion/CudaTileToMLIR/cudatile-appendix.mlir` includes a gemm example.
 
 ## Build
 
@@ -38,10 +38,10 @@ cmake --build build
 
 ## Run Tests
 
-Run the CudaTile-to-GPU regression suite:
+Run the CudaTile-to-MLIR regression suite:
 
 ```bash
-cmake --build build --target check-cudatile-to-gpu
+cmake --build build --target check-cudatile-to-mlir
 ```
 
 Use the convenience alias to run all configured test suites:
@@ -55,17 +55,17 @@ cmake --build build --target test
 Example invocation:
 
 ```bash
-build/tools/cudatile-to-gpu --convert-cuda-tile-to-gpu input.mlir
+build/tools/cudatile-to-mlir --convert-cuda-tile-to-mlir input.mlir
 ```
 
 You can pipe output into `FileCheck` for ad-hoc validation:
 
 ```bash
-build/tools/cudatile-to-gpu --convert-cuda-tile-to-gpu test/Conversion/CudaTileToGPU/cudatile-to-mlir.mlir | FileCheck test/Conversion/CudaTileToGPU/cudatile-to-mlir.mlir
+build/tools/cudatile-to-mlir --convert-cuda-tile-to-mlir test/Conversion/CudaTileToMLIR/cudatile-to-mlir.mlir | FileCheck test/Conversion/CudaTileToMLIR/cudatile-to-mlir.mlir
 ```
 
 Example: convert the appendix example and run canonical cleanup passes:
 
 ```bash
-build/tools/cudatile-to-gpu --convert-cuda-tile-to-gpu test/Conversion/CudaTileToGPU/cudatile-appendix.mlir | mlir-opt --loop-invariant-code-motion -canonicalize -cse
+build/tools/cudatile-to-mlir --convert-cuda-tile-to-mlir test/Conversion/CudaTileToMLIR/cudatile-appendix.mlir | mlir-opt --loop-invariant-code-motion -canonicalize -cse
 ```
