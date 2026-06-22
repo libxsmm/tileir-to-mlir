@@ -2,16 +2,13 @@ add_executable(cudatile-to-mlir
   cudatile-to-mlir.cpp
 )
 
-add_executable(tileiras
-  tileiras.cpp
-)
-
 target_link_libraries(cudatile-to-mlir
   PRIVATE
   CudaTileToMLIR
   MLIROptLib
   MLIRArithDialect
   MLIRFuncDialect
+  MLIRFuncInlinerExtension
   MLIRGPUDialect
   MLIRMemRefDialect
   MLIRSCFDialect
@@ -22,39 +19,5 @@ target_link_libraries(cudatile-to-mlir
   MLIRPass
   MLIRIR
   MLIRSupport
-  CudaTileDialect
-)
-
-target_link_libraries(tileiras
-  PRIVATE
-  CudaTileToMLIR
-  MLIROptLib
-  MLIRArithDialect
-  MLIRFuncDialect
-  MLIRGPUDialect
-  MLIRMemRefDialect
-  MLIRSCFDialect
-  MLIRUBDialect
-  MLIRVectorDialect
-  MLIRNVGPUDialect
-  MLIRNVVMDialect
-  MLIRTransforms
-  MLIRTransformUtils
-  MLIRPass
-  MLIRIR
-  MLIRSupport
-  MLIRRegisterAllDialects
-  MLIRRegisterAllPasses
-  MLIRRegisterAllExtensions
-  MLIRArithToLLVM
-  MLIRControlFlowToLLVM
-  MLIRFuncToLLVM
-  MLIRMemRefToLLVM
-  MLIRSCFToControlFlow
-  MLIRGPUToNVVMTransforms
-  MLIRNVGPUToNVVM
-  MLIRNVVMToLLVM
-  MLIRGPUPipelines
-  MLIRConvertToLLVMInterface
   CudaTileDialect
 )

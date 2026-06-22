@@ -5,10 +5,12 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "mlir/Conversion/CudaTileToMLIR/ConvertMemrefArgsToPtrArgs.h"
 #include "mlir/Conversion/CudaTileToMLIR/CudaTileToMLIR.h"
 #include "mlir/Conversion/CudaTileToMLIR/TileIRPtrToView.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -33,11 +35,16 @@ int main(int argc, char **argv) {
       mlir::memref::MemRefDialect, mlir::scf::SCFDialect, mlir::ub::UBDialect,
       mlir::vector::VectorDialect, mlir::cuda_tile::CudaTileDialect>();
 
+  mlir::func::registerInlinerExtension(registry);
+
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return mlir::createConvertTileIRToMLIRPass();
   });
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return mlir::createTileIRPtrToViewPass();
+  });
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::createConvertMemrefArgsToPtrArgsPass();
   });
 
   mlir::registerTransformsPasses();

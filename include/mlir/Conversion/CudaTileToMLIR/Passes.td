@@ -40,6 +40,35 @@ def ConvertTileIRToMLIRPass : Pass<"convert-cuda-tile-to-mlir", "ModuleOp"> {
   ];
 }
 
+def ConvertMemrefArgsToPtrArgsPass : Pass<"convert-memref-args-to-ptr-args", "ModuleOp"> {
+  let summary = "Promote unranked-memref function arguments to !llvm.ptr";
+  let description = [{
+    Detects function arguments of unranked-memref type (`memref<*xT>`) whose
+    every use is an identical `memref.reinterpret_cast` that pins down a concrete
+    ranked layout, and rewrites the function signature to take a bare `!llvm.ptr`
+    instead. The ranked `memref` is recovered once at the top of the body with an
+    `unrealized_conversion_cast` from that pointer, and the now-redundant
+    `reinterpret_cast` ops (and any address-computation ops that solely fed them)
+    are erased.
+
+    The rewrite is conservative. An argument is promoted only when:
+      * it is of unranked-memref type and has at least one use,
+      * every use is a `memref.reinterpret_cast` whose source is that argument,
+      * all those casts are mutually identical (same ranked result type and the
+        same offset / size / stride operands), so the promoted type is
+        unambiguous, and
+      * the function is not referenced (called / launched) from within the
+        module, so no in-module call site is invalidated.
+    When any of these conditions fails the argument is left untouched.
+  }];
+  let dependentDialects = [
+    "memref::MemRefDialect",
+    "func::FuncDialect",
+    "arith::ArithDialect",
+    "LLVM::LLVMDialect",
+  ];
+}
+
 def TileIRPtrToViewPass : Pass<"tileir-ptr-to-view", "ModuleOp"> {
   let summary = "Rewrite Triton-style cuda_tile ptr-arithmetic into "
                 "make_tensor_view + make_partition_view + load/store_view_tko";

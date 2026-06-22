@@ -1,4 +1,5 @@
 add_library(CudaTileToMLIR STATIC
+  ConvertMemrefArgsToPtrArgs.cpp
   CudaTileToMLIR.cpp
   TileIRPtrToView.cpp
 )
@@ -10,6 +11,8 @@ target_link_libraries(CudaTileToMLIR
   MLIRArithDialect
   MLIRFuncDialect
   MLIRGPUDialect
+  MLIRLLVMCommonConversion
+  MLIRLLVMDialect
   MLIRMemRefDialect
   MLIRSCFDialect
   MLIRUBDialect
