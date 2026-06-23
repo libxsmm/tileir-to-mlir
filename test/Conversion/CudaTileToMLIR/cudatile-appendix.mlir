@@ -40,9 +40,9 @@ cuda_tile.module @gemm_kloop_module {
 
         // Convert the unstructured pointers `ptr` to `tensor_view`.
         //
-        // CHECK: %[[A_ARG:.*]] = memref.reinterpret_cast {{.*}} memref<*xf16> to memref<?x?xf16, strided<[?, 1]>>
-        // CHECK: %[[B_ARG:.*]] = memref.reinterpret_cast {{.*}} memref<*xf16> to memref<?x?xf16, strided<[?, 1]>>
-        // CHECK: %[[C_ARG:.*]] = memref.reinterpret_cast {{.*}} memref<*xf32> to memref<?x?xf32, strided<[?, 1]>>
+        // CHECK: %[[A_ARG:.*]] = memref.reinterpret_cast {{.*}} memref<*xf16> to memref<?x?xf16, strided<[?, 1], offset: ?>>
+        // CHECK: %[[B_ARG:.*]] = memref.reinterpret_cast {{.*}} memref<*xf16> to memref<?x?xf16, strided<[?, 1], offset: ?>>
+        // CHECK: %[[C_ARG:.*]] = memref.reinterpret_cast {{.*}} memref<*xf32> to memref<?x?xf32, strided<[?, 1], offset: ?>>
         // A reference to the A tensor pointed to by A_ptr, (K x M)
         %A = make_tensor_view %A_ptr_assume, shape = [%K, %M], strides = [%stride_ak, 1] : tile<i32> -> tensor_view<?x?xf16, strides=[?,1]>
         // A reference to the B tensor pointed to by B_ptr, (N x K)
@@ -69,11 +69,11 @@ cuda_tile.module @gemm_kloop_module {
         %bidx, %bidy, %bidz = get_tile_block_id : tile<i32>
 
         // Because we allow for dynamic dimensions we must get the reduction dimension `K` dynamically.
-        // CHECK: %[[D0:.*]] = memref.dim %[[A_ARG]], %{{.*}} : memref<?x?xf16, strided<[?, 1]>>
+        // CHECK: %[[D0:.*]] = memref.dim %[[A_ARG]], %{{.*}} : memref<?x?xf16, strided<[?, 1], offset: ?>>
         // CHECK: %[[C256:.*]] = arith.constant 256 : index
         // CHECK: %[[CEIL0:.*]] = arith.ceildivui %[[D0]], %[[C256]] : index
         // CHECK: arith.index_cast %[[CEIL0]] : index to i32
-        // CHECK: %[[D1:.*]] = memref.dim %[[A_ARG]], %{{.*}} : memref<?x?xf16, strided<[?, 1]>>
+        // CHECK: %[[D1:.*]] = memref.dim %[[A_ARG]], %{{.*}} : memref<?x?xf16, strided<[?, 1], offset: ?>>
         // CHECK: %[[C64:.*]] = arith.constant 64 : index
         // CHECK: %[[CEIL1:.*]] = arith.ceildivui %[[D1]], %[[C64]] : index
         // CHECK: %[[CEIL1_I32:.*]] = arith.index_cast %[[CEIL1]] : index to i32
@@ -90,11 +90,11 @@ cuda_tile.module @gemm_kloop_module {
             iter_values(%acc_prev = %cst) -> (tile<256x128xf32>)
         {
             // Load a single 256x64 matrix from the tile.
-            // CHECK: %[[A_FRAG:.*]] = vector.transfer_read %[[A_ARG]][%[[IV]], %{{.*}}], %{{.*}} {permutation_map = #map} : memref<?x?xf16, strided<[?, 1]>>, vector<256x64xf16>
+            // CHECK: %[[A_FRAG:.*]] = vector.transfer_read %[[A_ARG]][%[[IV]], %{{.*}}], %{{.*}} {permutation_map = #map} : memref<?x?xf16, strided<[?, 1], offset: ?>>, vector<256x64xf16>
             %A_frag, %t1 = load_view_tko weak %A_block[%bidx, %k] : partition_view<tile=(256x64), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>, tile<i32> -> tile<256x64xf16>, !cuda_tile.token
 
             // Load a single 64x128 matrix from the tile.
-            // CHECK: %[[B_FRAG:.*]] = vector.transfer_read %[[B_ARG]][%{{.*}}, %[[IV]]], %{{.*}} {permutation_map = #map} : memref<?x?xf16, strided<[?, 1]>>, vector<64x128xf16>
+            // CHECK: %[[B_FRAG:.*]] = vector.transfer_read %[[B_ARG]][%{{.*}}, %[[IV]]], %{{.*}} {permutation_map = #map} : memref<?x?xf16, strided<[?, 1], offset: ?>>, vector<64x128xf16>
             %B_frag, %t2 = load_view_tko weak %B_block [%k, %bidy] : partition_view<tile=(64x128), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>, tile<i32> -> tile<64x128xf16>, !cuda_tile.token
 
             // Compute the mma(A_frag, B_frag) + acc_prev.
@@ -106,7 +106,7 @@ cuda_tile.module @gemm_kloop_module {
         }
 
         // Finally store the complete 256x128 tile to the view of C.
-        // CHECK: vector.transfer_write %{{.*}}, %[[C_ARG]][%{{.*}}, %{{.*}}] : vector<256x128xf32>, memref<?x?xf32, strided<[?, 1]>>
+        // CHECK: vector.transfer_write %{{.*}}, %[[C_ARG]][%{{.*}}, %{{.*}}] : vector<256x128xf32>, memref<?x?xf32, strided<[?, 1], offset: ?>>
         // CHECK-NOT: permutation_map = #map
         // CHECK: gpu.return
         %t3 = store_view_tko weak %result, %C_block[%bidx, %bidy] : tile<256x128xf32>, partition_view<tile=(256x128), tensor_view<?x?xf32, strides=[?,1]>, dim_map=[0, 1]>, tile<i32> -> !cuda_tile.token
@@ -117,7 +117,7 @@ cuda_tile.module @gemm_kloop_module {
     // Description: Same GEMM loop structure but tensor_views with known shapes replace ptr + make_tensor_view.
     // A and B inputs are not permuted.
     // CHECK-LABEL: gpu.func @gemm_kloop_static(
-    // CHECK-SAME: %[[SA:[a-zA-Z0-9_]+]]: memref<4096x4096xf16>, %[[SB:[a-zA-Z0-9_]+]]: memref<4096x4096xf16>, %[[SC:[a-zA-Z0-9_]+]]: memref<4096x4096xf32>
+    // CHECK-SAME: %[[SA:[a-zA-Z0-9_]+]]: memref<4096x4096xf16, strided<[4096, 1], offset: ?>>, %[[SB:[a-zA-Z0-9_]+]]: memref<4096x4096xf16, strided<[4096, 1], offset: ?>>, %[[SC:[a-zA-Z0-9_]+]]: memref<4096x4096xf32, strided<[4096, 1], offset: ?>>
     entry @gemm_kloop_static(
         %A: !cuda_tile.tensor_view<4096x4096xf16, strides=[4096,1]>,
         %B: !cuda_tile.tensor_view<4096x4096xf16, strides=[4096,1]>,
@@ -147,10 +147,10 @@ cuda_tile.module @gemm_kloop_module {
         %result = for %k in (%i0 to %mk_len_i32#1, step %i1) : tile<i32>
             iter_values(%acc_prev = %cst) -> (tile<256x128xf32>)
         {
-            // CHECK: %[[SA_FRAG:.*]] = vector.transfer_read %[[SA]][%{{.*}}, %[[SIV]]], %{{.*}} {in_bounds = [true, true]} : memref<4096x4096xf16>, vector<256x32xf16>
+            // CHECK: %[[SA_FRAG:.*]] = vector.transfer_read %[[SA]][%{{.*}}, %[[SIV]]], %{{.*}} {in_bounds = [true, true]} : memref<4096x4096xf16, strided<[4096, 1], offset: ?>>, vector<256x32xf16>
             %A_frag, %t1 = load_view_tko weak %A_block[%bidx, %k] : partition_view<tile=(256x32), tensor_view<4096x4096xf16, strides=[4096,1]>, dim_map=[0, 1]>, tile<i32> -> tile<256x32xf16>, !cuda_tile.token
 
-            // CHECK: %[[SB_FRAG:.*]] = vector.transfer_read %[[SB]][%[[SIV]], %{{.*}}], %{{.*}} {in_bounds = [true, true]} : memref<4096x4096xf16>, vector<32x128xf16>
+            // CHECK: %[[SB_FRAG:.*]] = vector.transfer_read %[[SB]][%[[SIV]], %{{.*}}], %{{.*}} {in_bounds = [true, true]} : memref<4096x4096xf16, strided<[4096, 1], offset: ?>>, vector<32x128xf16>
             %B_frag, %t2 = load_view_tko weak %B_block[%k, %bidy] : partition_view<tile=(32x128), tensor_view<4096x4096xf16, strides=[4096,1]>, dim_map=[0, 1]>, tile<i32> -> tile<32x128xf16>, !cuda_tile.token
 
             // CHECK: %[[SACC:.*]] = vector.contract {indexing_maps = [#map1, #map2, #map3], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %[[SA_FRAG]], %[[SB_FRAG]], %{{.*}} : vector<256x32xf16>, vector<32x128xf16> into vector<256x128xf32>
@@ -159,7 +159,7 @@ cuda_tile.module @gemm_kloop_module {
             continue %acc : tile<256x128xf32>
         }
 
-        // CHECK: vector.transfer_write %{{.*}}, %[[SC]][%{{.*}}, %{{.*}}] {in_bounds = [true, true]} : vector<256x128xf32>, memref<4096x4096xf32>
+        // CHECK: vector.transfer_write %{{.*}}, %[[SC]][%{{.*}}, %{{.*}}] {in_bounds = [true, true]} : vector<256x128xf32>, memref<4096x4096xf32, strided<[4096, 1], offset: ?>>
         // CHECK: gpu.return
         %t3 = store_view_tko weak %result, %C_block[%bidx, %bidy] : tile<256x128xf32>, partition_view<tile=(256x128), tensor_view<4096x4096xf32, strides=[4096,1]>, dim_map=[0, 1]>, tile<i32> -> !cuda_tile.token
     }

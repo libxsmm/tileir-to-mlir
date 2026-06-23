@@ -175,46 +175,39 @@ namespace {
 
 /// Derive the ranked MemRefType that corresponds to a tensor_view type.
 ///
-/// If the tensor_view describes a default contiguous row-major layout with
-/// fully static shape/strides, a plain (layout-free) memref is returned;
-/// otherwise a strided-layout memref is returned (which also covers any
-/// dynamic shape or stride).
+/// The memref always carries a *dynamic* offset in its strided layout. A
+/// tensor_view may start at an arbitrary position within its buffer when its
+/// base pointer was pre-shifted by a scalar `offset` op (e.g. a per-batch /
+/// per-channel output base). `memref.reinterpret_cast`'s offset is absolute to
+/// the underlying buffer, so the memref type must be able to represent that
+/// (possibly non-zero) offset for it to survive make_tensor_view and the
+/// downstream transfer lowering. Strides come straight from the tensor_view
+/// (and may themselves be dynamic).
 static MemRefType tensorViewToMemRefType(cuda_tile::TensorViewType tvTy) {
   auto shape = tvTy.getShape();
   auto strides = tvTy.getStrides();
   Type elemTy = tvTy.getElementType();
-  unsigned rank = shape.size();
-
-  bool isDefaultLayout = true;
-  if (rank == 0) {
-    isDefaultLayout = true;
-  } else {
-    for (unsigned i = 0; i < rank; ++i) {
-      if (strides[i] == ShapedType::kDynamic ||
-          shape[i] == ShapedType::kDynamic) {
-        isDefaultLayout = false;
-        break;
-      }
-    }
-    if (isDefaultLayout) {
-      int64_t expected = 1;
-      for (int i = rank - 1; i >= 0; --i) {
-        if (strides[i] != expected) {
-          isDefaultLayout = false;
-          break;
-        }
-        expected *= shape[i];
-      }
-    }
-  }
 
   SmallVector<int64_t> memrefShape(shape.begin(), shape.end());
-  if (isDefaultLayout)
-    return MemRefType::get(memrefShape, elemTy);
   SmallVector<int64_t> memrefStrides(strides.begin(), strides.end());
-  auto layout =
-      StridedLayoutAttr::get(elemTy.getContext(), /*offset=*/0, memrefStrides);
+  auto layout = StridedLayoutAttr::get(
+      elemTy.getContext(), /*offset=*/ShapedType::kDynamic, memrefStrides);
   return MemRefType::get(memrefShape, elemTy, layout);
+}
+
+/// Build a 1-D memref type with unit stride and dynamic offset.
+///
+/// This is the canonical transient view type used when lowering unranked
+/// pointer values (`memref<*xT>`) through reinterpret_cast-based arithmetic or
+/// metadata extraction. `size` is either a static extent (e.g. 1) or
+/// `ShapedType::kDynamic`.
+static MemRefType get1DDynamicOffsetMemRefType(Type elemTy, int64_t size,
+                                               Attribute memorySpace = {}) {
+  return MemRefType::get({size}, elemTy,
+                         StridedLayoutAttr::get(elemTy.getContext(),
+                                                ShapedType::kDynamic,
+                                                SmallVector<int64_t>{1}),
+                         memorySpace);
 }
 
 /// Layout information extracted from a tile-view operand at a use site.
@@ -2567,6 +2560,66 @@ struct ConvertMakeGatherScatterView
   }
 };
 
+/// Recover the runtime offset (the descriptor's offset field) carried by an
+/// unranked converted pointer value (`memref<*xT>`).
+///
+/// `memref.reinterpret_cast` expresses an offset that is *absolute* to the
+/// underlying buffer, so any pattern that needs to advance such a pointer
+/// (chained scalar `offset` ops, or a `make_tensor_view` whose base was
+/// pre-shifted) must read the base's current offset and add to it rather than
+/// overwrite it. The unranked base is cast to a ranked memref with a dynamic
+/// offset / unit stride, then its offset field is read via
+/// memref.extract_strided_metadata.
+///
+/// Kernel-pointer function arguments are a special case: they enter as raw
+/// pointers with a statically-zero descriptor offset, so there is nothing to
+/// recover. We short-circuit them to a static `0` and emit *no* IR. This is not
+/// just an optimization: ConvertMemrefArgsToPtrArgs only promotes an unranked
+/// argument to `!llvm.ptr` when every use of it is one and the same cast.
+/// Emitting an extra `memref.cast` of the argument here would create a second,
+/// divergent use and defeat that promotion, leaving the argument unranked and
+/// the enclosing `func.func` unconvertible under the bare-pointer calling
+/// convention.
+static OpFoldResult
+recoverUnrankedPtrOffset(ConversionPatternRewriter &rewriter, Location loc,
+                         Value unrankedBase) {
+  if (isa<BlockArgument>(unrankedBase))
+    return rewriter.getIndexAttr(0);
+  auto unrankedTy = cast<UnrankedMemRefType>(unrankedBase.getType());
+  auto rankedTy = get1DDynamicOffsetMemRefType(unrankedTy.getElementType(),
+                                               ShapedType::kDynamic,
+                                               unrankedTy.getMemorySpace());
+  Value ranked = memref::CastOp::create(rewriter, loc, rankedTy, unrankedBase);
+  auto meta = memref::ExtractStridedMetadataOp::create(rewriter, loc, ranked);
+  return meta.getOffset();
+}
+
+/// Reinterpret an unranked converted pointer (`memref<*xT>`) as a rank-0 memref
+/// the scalar load/store/atomic patterns can address, *preserving* the
+/// descriptor's absolute offset.
+///
+/// `memref.reinterpret_cast` offsets are absolute to the underlying buffer, so
+/// reinterpreting with a literal offset of 0 would reset a pre-shifted pointer
+/// (e.g. the result of a scalar `offset` op) back to the buffer start and read
+/// the wrong element. We recover the base's current offset and re-apply it,
+/// mirroring how `make_tensor_view` and scalar `offset` preserve offsets.
+static Value
+reinterpretScalarPtrPreservingOffset(ConversionPatternRewriter &rewriter,
+                                     Location loc, Value unrankedBase) {
+  auto unrankedTy = cast<UnrankedMemRefType>(unrankedBase.getType());
+  OpFoldResult off = recoverUnrankedPtrOffset(rewriter, loc, unrankedBase);
+  auto rank0Ty = MemRefType::get(
+      {}, unrankedTy.getElementType(),
+      StridedLayoutAttr::get(rewriter.getContext(), ShapedType::kDynamic, {}),
+      unrankedTy.getMemorySpace());
+  return memref::ReinterpretCastOp::create(
+             rewriter, loc, rank0Ty, unrankedBase,
+             /*offset=*/off,
+             /*sizes=*/SmallVector<OpFoldResult>{},
+             /*strides=*/SmallVector<OpFoldResult>{})
+      .getResult();
+}
+
 /// Convert cuda_tile.make_tensor_view to memref.reinterpret_cast.
 ///
 /// The base operand is a scalar `tile<ptr<T>>`, which the type converter maps
@@ -2629,9 +2682,15 @@ struct ConvertMakeTensorView
         strides.push_back(rewriter.getIndexAttr(tvStrides[d]));
     }
 
+    // make_tensor_view reshapes the buffer at the base pointer's current
+    // location, so it must preserve whatever absolute offset the base memref
+    // descriptor carries. Recover it unconditionally rather than matching only
+    // a specific producer shape (e.g. direct scalar `offset`).
+    OpFoldResult offset =
+        recoverUnrankedPtrOffset(rewriter, op.getLoc(), adaptor.getBase());
+
     rewriter.replaceOpWithNewOp<memref::ReinterpretCastOp>(
-        op, resultTy, adaptor.getBase(), /*offset=*/rewriter.getIndexAttr(0),
-        sizes, strides);
+        op, resultTy, adaptor.getBase(), offset, sizes, strides);
     return success();
   }
 };
@@ -2829,15 +2888,27 @@ struct ConvertOffsetScalarPtr
       return rewriter.notifyMatchFailure(
           op, "offset addend could not be converted to index");
 
-    auto rank1ViewTy = MemRefType::get(
-        {1}, elemTy,
-        StridedLayoutAttr::get(rewriter.getContext(), ShapedType::kDynamic,
-                               SmallVector<int64_t>{1}),
-        memSpace);
+    // reinterpret_cast's offset is absolute to the underlying buffer. Always
+    // accumulate the source pointer's current descriptor offset so semantically
+    // equivalent sources (direct offset, ptr_to_ptr chain, block arg, etc.)
+    // are handled uniformly. A raw kernel-pointer argument carries a static
+    // zero offset, in which case the addend alone is the absolute offset.
+    OpFoldResult srcOff =
+        recoverUnrankedPtrOffset(rewriter, op.getLoc(), adaptor.getPtr());
+    OpFoldResult totalOff;
+    if (isa<Attribute>(srcOff)) {
+      totalOff = OpFoldResult(offIdx);
+    } else {
+      totalOff = OpFoldResult(arith::AddIOp::create(rewriter, op.getLoc(),
+                                                    cast<Value>(srcOff), offIdx)
+                                  .getResult());
+    }
+
+    auto rank1ViewTy =
+        get1DDynamicOffsetMemRefType(elemTy, /*size=*/1, memSpace);
 
     auto rc = memref::ReinterpretCastOp::create(
-        rewriter, op.getLoc(), rank1ViewTy, adaptor.getPtr(),
-        OpFoldResult(offIdx),
+        rewriter, op.getLoc(), rank1ViewTy, adaptor.getPtr(), totalOff,
         SmallVector<OpFoldResult>{rewriter.getIndexAttr(1)},
         SmallVector<OpFoldResult>{rewriter.getIndexAttr(1)});
 
@@ -2909,16 +2980,9 @@ struct ConvertLoadPtrTkoScalar
           op, "expected unranked memref pointer source");
 
     Location loc = op.getLoc();
-    auto rank0Ty = MemRefType::get({}, srcUnranked.getElementType(),
-                                   MemRefLayoutAttrInterface{},
-                                   srcUnranked.getMemorySpace());
-    auto rc = memref::ReinterpretCastOp::create(
-        rewriter, loc, rank0Ty, adaptor.getSource(),
-        /*offset=*/rewriter.getIndexAttr(0),
-        /*sizes=*/SmallVector<OpFoldResult>{},
-        /*strides=*/SmallVector<OpFoldResult>{});
-    auto loadOp =
-        memref::LoadOp::create(rewriter, loc, rc.getResult(), ValueRange{});
+    Value rc = reinterpretScalarPtrPreservingOffset(rewriter, loc,
+                                                    adaptor.getSource());
+    auto loadOp = memref::LoadOp::create(rewriter, loc, rc, ValueRange{});
     preserveDroppedOptHints(op, loadOp);
     rewriter.replaceOp(op, {loadOp.getResult(), Value()});
     return success();
@@ -2954,16 +3018,10 @@ struct ConvertStorePtrTkoScalar
           op, "expected unranked memref pointer destination");
 
     Location loc = op.getLoc();
-    auto rank0Ty = MemRefType::get({}, dstUnranked.getElementType(),
-                                   MemRefLayoutAttrInterface{},
-                                   dstUnranked.getMemorySpace());
-    auto rc = memref::ReinterpretCastOp::create(
-        rewriter, loc, rank0Ty, adaptor.getDestination(),
-        /*offset=*/rewriter.getIndexAttr(0),
-        /*sizes=*/SmallVector<OpFoldResult>{},
-        /*strides=*/SmallVector<OpFoldResult>{});
+    Value rc = reinterpretScalarPtrPreservingOffset(rewriter, loc,
+                                                    adaptor.getDestination());
     auto storeOp = memref::StoreOp::create(rewriter, loc, adaptor.getValue(),
-                                           rc.getResult(), ValueRange{});
+                                           rc, ValueRange{});
     preserveDroppedOptHints(op, storeOp);
     rewriter.eraseOp(op);
     return success();
@@ -3068,8 +3126,14 @@ static LogicalResult deriveGatherScatterMemRefAndMask(
   if (!scalarBase)
     return rewriter.notifyMatchFailure(op, "cannot find converted base memref");
 
-  // Cast to memref<?xelemTy> for gather/scatter.
-  auto flatMemTy = MemRefType::get({ShapedType::kDynamic}, elemTy);
+  // Cast to memref<?xelemTy> for gather/scatter. The flat type must keep a
+  // dynamic offset: the scalar base may be a `memref.reinterpret_cast` that
+  // carries a non-zero offset (e.g. the per-row `h_in*W` of a pooling window).
+  // A plain `memref<?xelemTy>` has a *static* offset of 0, which would make the
+  // gather/scatter address computation (getStridedElementPtr) ignore the
+  // descriptor's offset field and drop the row stride entirely.
+  auto flatMemTy =
+      get1DDynamicOffsetMemRefType(elemTy, /*size=*/ShapedType::kDynamic);
   if (!isa<MemRefType>(scalarBase.getType()) &&
       !isa<UnrankedMemRefType>(scalarBase.getType()))
     return rewriter.notifyMatchFailure(op, "base is not a memref");
@@ -3268,17 +3332,11 @@ struct ConvertAtomicRMWTko
           op, "expected unranked memref pointer source");
 
     Location loc = op.getLoc();
-    auto rank0Ty = MemRefType::get({}, srcUnranked.getElementType(),
-                                   MemRefLayoutAttrInterface{},
-                                   srcUnranked.getMemorySpace());
-    auto rc = memref::ReinterpretCastOp::create(
-        rewriter, loc, rank0Ty, adaptor.getPointers(),
-        /*offset=*/rewriter.getIndexAttr(0),
-        /*sizes=*/SmallVector<OpFoldResult>{},
-        /*strides=*/SmallVector<OpFoldResult>{});
-    auto rmw = memref::AtomicRMWOp::create(rewriter, loc, *kind,
-                                           adaptor.getArg(), rc.getResult(),
-                                           /*indices=*/ValueRange{});
+    Value rc = reinterpretScalarPtrPreservingOffset(rewriter, loc,
+                                                    adaptor.getPointers());
+    auto rmw =
+        memref::AtomicRMWOp::create(rewriter, loc, *kind, adaptor.getArg(), rc,
+                                    /*indices=*/ValueRange{});
     rmw->setAttr(
         "tir-dropped-memory-ordering",
         rewriter.getStringAttr(cuda_tile::stringifyMemoryOrderingSemantics(

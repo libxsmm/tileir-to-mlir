@@ -65,7 +65,7 @@ cuda_tile.module @m {
     %p = get_global @g_f32_aligned : tile<ptr<f32>>
     %q = ptr_to_ptr %p : tile<ptr<f32>> -> tile<ptr<f32>>
     // CHECK-NOT: memref.cast {{.*}} : memref<\*xf32> to memref<\*xf32>
-    // CHECK: %[[PTPG_V:.*]] = memref.reinterpret_cast %[[PTPG_P]] to offset: [0], sizes: [4], strides: [1] : memref<*xf32> to memref<4xf32>
+    // CHECK: %[[PTPG_V:.*]] = memref.reinterpret_cast %[[PTPG_P]] to offset: [%{{.*}}], sizes: [4], strides: [1] : memref<*xf32> to memref<4xf32, strided<[1], offset: ?>>
     %tv = make_tensor_view %q, shape = [4], strides = [1] : tensor_view<4xf32, strides=[1]>
     return
   }
@@ -77,7 +77,7 @@ cuda_tile.module @m {
     %q = ptr_to_ptr %p : tile<ptr<f16>> -> tile<ptr<f16>>
     // CHECK: %[[PTPD_MI:.*]] = arith.index_cast %[[PTPD_M]] : i32 to index
     // CHECK: %[[PTPD_SI:.*]] = arith.index_cast %[[PTPD_S]] : i32 to index
-    // CHECK: %[[PTPD_V:.*]] = memref.reinterpret_cast %[[PTPD_BASE]] to offset: [0], sizes: [%[[PTPD_MI]], 8], strides: [%[[PTPD_SI]], 1] : memref<*xf16> to memref<?x8xf16, strided<[?, 1]>>
+    // CHECK: %[[PTPD_V:.*]] = memref.reinterpret_cast %[[PTPD_BASE]] to offset: [0], sizes: [%[[PTPD_MI]], 8], strides: [%[[PTPD_SI]], 1] : memref<*xf16> to memref<?x8xf16, strided<[?, 1], offset: ?>>
     %tv = make_tensor_view %q, shape = [%m, 8], strides = [%s, 1] : tile<i32> -> tensor_view<?x8xf16, strides=[?,1]>
     return
   }
@@ -104,9 +104,9 @@ cuda_tile.module @m {
   }
 
   // --- scalar offset feeding make_tensor_view (composition) ---
-  // The view's reinterpret_cast must use offset 0 on the offset-shifted memref
-  // so the absolute-offset semantics of reinterpret_cast does not discard the
-  // pointer shift introduced by the offset op.
+  // The view's reinterpret_cast must recover and re-apply the offset-shifted
+  // memref's descriptor offset, because reinterpret_cast offsets are absolute:
+  // using offset 0 would discard the pointer shift introduced by the offset op.
   // CHECK-LABEL: gpu.func @test_offset_then_view
   // CHECK-SAME: %[[OTV_BASE:[a-zA-Z0-9_]+]]: memref<*xf16>, %[[OTV_O:[a-zA-Z0-9_]+]]: i32, %[[OTV_M:[a-zA-Z0-9_]+]]: i32
   entry @test_offset_then_view(%p: !cuda_tile.tile<!cuda_tile.ptr<f16>>, %o: !cuda_tile.tile<i32>, %m: !cuda_tile.tile<i32>) {
@@ -115,7 +115,7 @@ cuda_tile.module @m {
     // CHECK: %[[OTV_CAST:.*]] = memref.cast %[[OTV_R]] : memref<1xf16, strided<[1], offset: ?>> to memref<*xf16>
     %q = offset %p, %o : tile<ptr<f16>>, tile<i32> -> tile<ptr<f16>>
     // CHECK: %[[OTV_MI:.*]] = arith.index_cast %[[OTV_M]] : i32 to index
-    // CHECK: memref.reinterpret_cast %[[OTV_CAST]] to offset: [0], sizes: [%[[OTV_MI]], 8], strides: [8, 1] : memref<*xf16> to memref<?x8xf16, strided<[8, 1]>>
+    // CHECK: memref.reinterpret_cast %[[OTV_CAST]] to offset: [%{{.*}}], sizes: [%[[OTV_MI]], 8], strides: [8, 1] : memref<*xf16> to memref<?x8xf16, strided<[8, 1], offset: ?>>
     %tv = make_tensor_view %q, shape = [%m, 8], strides = [8, 1] : tile<i32> -> tensor_view<?x8xf16, strides=[8,1]>
     return
   }
@@ -210,7 +210,7 @@ cuda_tile.module @m {
   // CHECK-SAME: %[[GTSD_UPTR:[a-zA-Z0-9_]+]]: memref<*xf16>
   entry @test_get_tensor_shape_dynamic(%p: !cuda_tile.tile<!cuda_tile.ptr<f16>>, %m: !cuda_tile.tile<i32>, %n: !cuda_tile.tile<i32>, %s: !cuda_tile.tile<i32>) {
     %tv = make_tensor_view %p, shape = [%m, %n], strides = [%s, 1] : tile<i32> -> tensor_view<?x?xf16, strides=[?,1]>
-    // CHECK: %[[GTSD_VIEW:.*]] = memref.reinterpret_cast %[[GTSD_UPTR]]{{.*}} : memref<*xf16> to memref<?x?xf16, strided<[?, 1]>>
+    // CHECK: %[[GTSD_VIEW:.*]] = memref.reinterpret_cast %[[GTSD_UPTR]]{{.*}} : memref<*xf16> to memref<?x?xf16, strided<[?, 1], offset: ?>>
     // CHECK: %[[GTSD_D0:.*]] = memref.dim %[[GTSD_VIEW]], {{.*}}0
     // CHECK: %[[GTSD_R0:.*]] = arith.index_castui %[[GTSD_D0]] : index to i32
     // CHECK: %[[GTSD_D1:.*]] = memref.dim %[[GTSD_VIEW]], {{.*}}1
@@ -224,7 +224,7 @@ cuda_tile.module @m {
   // CHECK-SAME: %[[GTSM_UPTR:[a-zA-Z0-9_]+]]: memref<*xf16>
   entry @test_get_tensor_shape_mixed(%p: !cuda_tile.tile<!cuda_tile.ptr<f16>>, %n: !cuda_tile.tile<i32>, %s: !cuda_tile.tile<i32>) {
     %tv = make_tensor_view %p, shape = [64, %n], strides = [%s, 1] : tile<i32> -> tensor_view<64x?xf16, strides=[?,1]>
-    // CHECK: %[[GTSM_VIEW:.*]] = memref.reinterpret_cast %[[GTSM_UPTR]]{{.*}} : memref<*xf16> to memref<64x?xf16, strided<[?, 1]>>
+    // CHECK: %[[GTSM_VIEW:.*]] = memref.reinterpret_cast %[[GTSM_UPTR]]{{.*}} : memref<*xf16> to memref<64x?xf16, strided<[?, 1], offset: ?>>
     // CHECK: %[[GTSM_C64:.*]] = arith.constant 64 : index
     // CHECK: %[[GTSM_R0:.*]] = arith.index_castui %[[GTSM_C64]] : index to i64
     // CHECK: %[[GTSM_D1:.*]] = memref.dim %[[GTSM_VIEW]], {{.*}}1
@@ -260,7 +260,7 @@ cuda_tile.module @m {
     %pv = make_partition_view %tv : partition_view<tile=(4x2), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[0, 1]>
     // CHECK: %[[LID_PTR:.*]] = memref.reinterpret_cast %[[LID_UPTR]]
     // CHECK: %[[LID_PAD:.*]] = ub.poison : f16
-    // CHECK: %[[LID_TILE:.*]] = vector.transfer_read %[[LID_PTR]]{{.*}}, %[[LID_PAD]] : memref<?x?xf16, strided<[?, 1]>>, vector<4x2xf16>
+    // CHECK: %[[LID_TILE:.*]] = vector.transfer_read %[[LID_PTR]]{{.*}}, %[[LID_PAD]] : memref<?x?xf16, strided<[?, 1], offset: ?>>, vector<4x2xf16>
     // CHECK-NOT: permutation_map
     %tile, %tok = load_view_tko weak %pv[%c0, %c1] : partition_view<tile=(4x2), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[0, 1]>, tile<i32> -> tile<4x2xf16>, !cuda_tile.token
   }
@@ -275,7 +275,7 @@ cuda_tile.module @m {
     %pv = make_partition_view %tv : partition_view<tile=(4x2), padding_value = zero, tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>
     // CHECK: %[[LSW_PTR:.*]] = memref.reinterpret_cast %[[LSW_UPTR]]
     // CHECK: %[[LSW_PAD:.*]] = arith.constant 0.000000e+00 : f16
-    // CHECK: %[[LSW_TILE:.*]] = vector.transfer_read %[[LSW_PTR]][%{{.*}}, %{{.*}}], %[[LSW_PAD]] {permutation_map = #{{.*}}} : memref<?x?xf16, strided<[?, 1]>>, vector<4x2xf16>
+    // CHECK: %[[LSW_TILE:.*]] = vector.transfer_read %[[LSW_PTR]][%{{.*}}, %{{.*}}], %[[LSW_PAD]] {permutation_map = #{{.*}}} : memref<?x?xf16, strided<[?, 1], offset: ?>>, vector<4x2xf16>
     %tile, %tok = load_view_tko weak %pv[%c0, %c1] : partition_view<tile=(4x2), padding_value = zero, tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>, tile<i32> -> tile<4x2xf16>, !cuda_tile.token
   }
 
@@ -306,7 +306,7 @@ cuda_tile.module @m {
     %pv = make_partition_view %tv : partition_view<tile=(4x2), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>
     // CHECK: %[[STS_BCAST:.*]] = arith.constant dense<1.000000e+00> : vector<4x2xf16>
     // CHECK: %[[STS_PTR:.*]] = memref.reinterpret_cast %[[STS_UPTR]]
-    // CHECK: vector.transfer_write %[[STS_BCAST]], %[[STS_PTR]][%{{.*}}, %{{.*}}] {permutation_map = #{{.*}}} : vector<4x2xf16>, memref<?x?xf16, strided<[?, 1]>>
+    // CHECK: vector.transfer_write %[[STS_BCAST]], %[[STS_PTR]][%{{.*}}, %{{.*}}] {permutation_map = #{{.*}}} : vector<4x2xf16>, memref<?x?xf16, strided<[?, 1], offset: ?>>
     %tok = store_view_tko weak %tile, %pv[%c0, %c1] : tile<4x2xf16>, partition_view<tile=(4x2), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>, tile<i32> -> !cuda_tile.token
   }
 
@@ -314,8 +314,8 @@ cuda_tile.module @m {
   // CHECK-LABEL: gpu.func @test_scalar_load_ptr
   // CHECK-SAME: %[[SLP_UPTR:[a-zA-Z0-9_]+]]: memref<*xf32>
   entry @test_scalar_load_ptr(%p: !cuda_tile.tile<!cuda_tile.ptr<f32>>) {
-    // CHECK: %[[SLP_R0:.*]] = memref.reinterpret_cast %[[SLP_UPTR]] to offset: [0], sizes: [], strides: [] : memref<*xf32> to memref<f32>
-    // CHECK: %[[SLP_VAL:.*]] = memref.load %[[SLP_R0]][] : memref<f32>
+    // CHECK: %[[SLP_R0:.*]] = memref.reinterpret_cast %[[SLP_UPTR]] to offset: [0], sizes: [], strides: [] : memref<*xf32> to memref<f32, strided<[], offset: ?>>
+    // CHECK: %[[SLP_VAL:.*]] = memref.load %[[SLP_R0]][] : memref<f32, strided<[], offset: ?>>
     // CHECK-NOT: load_ptr_tko
     %v, %tok = load_ptr_tko weak %p : tile<ptr<f32>> -> tile<f32>, !cuda_tile.token
     return
@@ -327,8 +327,8 @@ cuda_tile.module @m {
   entry @test_scalar_store_ptr(%p: !cuda_tile.tile<!cuda_tile.ptr<f32>>) {
     %v = constant <f32: 1.000000e+00> : tile<f32>
     // CHECK: %[[SSP_VAL:.*]] = arith.constant 1.000000e+00 : f32
-    // CHECK: %[[SSP_R0:.*]] = memref.reinterpret_cast %[[SSP_UPTR]] to offset: [0], sizes: [], strides: [] : memref<*xf32> to memref<f32>
-    // CHECK: memref.store %[[SSP_VAL]], %[[SSP_R0]][] : memref<f32>
+    // CHECK: %[[SSP_R0:.*]] = memref.reinterpret_cast %[[SSP_UPTR]] to offset: [0], sizes: [], strides: [] : memref<*xf32> to memref<f32, strided<[], offset: ?>>
+    // CHECK: memref.store %[[SSP_VAL]], %[[SSP_R0]][] : memref<f32, strided<[], offset: ?>>
     // CHECK-NOT: store_ptr_tko
     %tok = store_ptr_tko weak %p, %v : tile<ptr<f32>>, tile<f32> -> !cuda_tile.token
     return
@@ -1354,8 +1354,8 @@ cuda_tile.module @m {
   entry @test_atomic_rmw_scalar_xchg(%p: !cuda_tile.tile<!cuda_tile.ptr<i32>>) {
     %v = constant <i32: 7> : tile<i32>
     // CHECK: %[[AX_V:.*]] = arith.constant 7 : i32
-    // CHECK: %[[AX_R0:.*]] = memref.reinterpret_cast %[[AX_UPTR]] to offset: [0], sizes: [], strides: [] : memref<*xi32> to memref<i32>
-    // CHECK: %[[AX_OLD:.*]] = memref.atomic_rmw assign %[[AX_V]], %[[AX_R0]][] {{.*dropped-memory-ordering.*acq_rel.*dropped-memory-scope.*sys.*}} : (i32, memref<i32>) -> i32
+    // CHECK: %[[AX_R0:.*]] = memref.reinterpret_cast %[[AX_UPTR]] to offset: [0], sizes: [], strides: [] : memref<*xi32> to memref<i32, strided<[], offset: ?>>
+    // CHECK: %[[AX_OLD:.*]] = memref.atomic_rmw assign %[[AX_V]], %[[AX_R0]][] {{.*dropped-memory-ordering.*acq_rel.*dropped-memory-scope.*sys.*}} : (i32, memref<i32, strided<[], offset: ?>>) -> i32
     %old, %tok = atomic_rmw_tko acq_rel sys %p, xchg, %v : tile<ptr<i32>>, tile<i32> -> tile<i32>, !cuda_tile.token
     return
   }
@@ -1392,7 +1392,7 @@ cuda_tile.module @m {
     %tv = make_tensor_view %p, shape=[8192, 8192, 64], strides=[524288,64,1] : tensor_view<8192x8192x64xf32, strides=[524288,64,1]>
     %sv = make_strided_view %tv : strided_view<tile=(1024x1x32), traversal_strides=[512,1,10], tensor_view<8192x8192x64xf32, strides=[524288,64,1]>>
     // The view aliases the tensor_view, so its memref carries the full tensor shape.
-    // CHECK: memref.reinterpret_cast %[[SIS_UPTR]] to offset: [0], sizes: [8192, 8192, 64], strides: [524288, 64, 1] : memref<*xf32> to memref<8192x8192x64xf32>
+    // CHECK: memref.reinterpret_cast %[[SIS_UPTR]] to offset: [0], sizes: [8192, 8192, 64], strides: [524288, 64, 1] : memref<*xf32> to memref<8192x8192x64xf32, strided<[524288, 64, 1], offset: ?>>
     // The three results are the folded index-space extents, in tile-dim order:
     //   dim0 ceildiv(8192,512)=16, dim1 ceildiv(8192,1)=8192, dim2 ceildiv(64,10)=7.
     // CHECK: %[[SIS_C16:.*]] = arith.constant 16 : index
@@ -1412,10 +1412,10 @@ cuda_tile.module @m {
   entry @test_strided_index_space_dynamic(%p: !cuda_tile.tile<!cuda_tile.ptr<f32>>, %m: !cuda_tile.tile<i32>, %s: !cuda_tile.tile<i32>) {
     %tv = make_tensor_view %p, shape=[%m, 8192, 64], strides=[%s, 64, 1] : tile<i32> -> tensor_view<?x8192x64xf32, strides=[?,64,1]>
     %sv = make_strided_view %tv : strided_view<tile=(1024x1x32), traversal_strides=[512,1,10], tensor_view<?x8192x64xf32, strides=[?,64,1]>>
-    // CHECK: %[[SISD_PTR:.*]] = memref.reinterpret_cast %[[SISD_UPTR]] to offset: [0], sizes: [%{{.*}}, 8192, 64], strides: [%{{.*}}, 64, 1] : memref<*xf32> to memref<?x8192x64xf32, strided<[?, 64, 1]>>
+    // CHECK: %[[SISD_PTR:.*]] = memref.reinterpret_cast %[[SISD_UPTR]] to offset: [0], sizes: [%{{.*}}, 8192, 64], strides: [%{{.*}}, 64, 1] : memref<*xf32> to memref<?x8192x64xf32, strided<[?, 64, 1], offset: ?>>
     // dim0 is dynamic: ceildivui(dim0, traversal_strides[0]=512).
     // CHECK: %[[SISD_C0:.*]] = arith.constant 0 : index
-    // CHECK: %[[SISD_D0:.*]] = memref.dim %[[SISD_PTR]], %[[SISD_C0]] : memref<?x8192x64xf32, strided<[?, 64, 1]>>
+    // CHECK: %[[SISD_D0:.*]] = memref.dim %[[SISD_PTR]], %[[SISD_C0]] : memref<?x8192x64xf32, strided<[?, 64, 1], offset: ?>>
     // CHECK: %[[SISD_C512:.*]] = arith.constant 512 : index
     // CHECK: %[[SISD_Q0:.*]] = arith.ceildivui %[[SISD_D0]], %[[SISD_C512]] : index
     // CHECK: arith.index_cast %[[SISD_Q0]] : index to i32
@@ -1438,14 +1438,14 @@ cuda_tile.module @m {
     %tv = make_tensor_view %p, shape=[8], strides=[1] : tensor_view<8xf32, strides=[1]>
     %sv = make_strided_view %tv : strided_view<tile=(2), traversal_strides=[1], tensor_view<8xf32, strides=[1]>>
     // CHECK: %[[SLO_IDXIN:.*]] = arith.constant 0 : i32
-    // CHECK: %[[SLO_PTR:.*]] = memref.reinterpret_cast %[[SLO_UPTR]] to offset: [0], sizes: [8], strides: [1] : memref<*xf32> to memref<8xf32>
+    // CHECK: %[[SLO_PTR:.*]] = memref.reinterpret_cast %[[SLO_UPTR]] to offset: [0], sizes: [8], strides: [1] : memref<*xf32> to memref<8xf32, strided<[1], offset: ?>>
     // offset = index * traversal_strides[0] (= 1 here), not tile_shape.
     // CHECK: %[[SLO_IDX:.*]] = arith.index_cast %[[SLO_IDXIN]] : i32 to index
     // CHECK: %[[SLO_C1:.*]] = arith.constant 1 : index
     // CHECK: %[[SLO_OFF:.*]] = arith.muli %[[SLO_IDX]], %[[SLO_C1]] overflow<nsw> : index
     // CHECK: %[[SLO_PAD:.*]] = ub.poison : f32
     // Overlapping tiles (stride 1 < tile 2): the trailing tile spills out, so NO in_bounds.
-    // CHECK: vector.transfer_read %[[SLO_PTR]][%[[SLO_OFF]]], %[[SLO_PAD]] : memref<8xf32>, vector<2xf32>
+    // CHECK: vector.transfer_read %[[SLO_PTR]][%[[SLO_OFF]]], %[[SLO_PAD]] : memref<8xf32, strided<[1], offset: ?>>, vector<2xf32>
     // CHECK-NOT: in_bounds
     %t, %tok = load_view_tko weak %sv[%c0] : strided_view<tile=(2), traversal_strides=[1], tensor_view<8xf32, strides=[1]>>, tile<i32> -> tile<2xf32>, !cuda_tile.token
     return
@@ -1460,13 +1460,13 @@ cuda_tile.module @m {
     %tv = make_tensor_view %p, shape=[16], strides=[1] : tensor_view<16xf32, strides=[1]>
     %sv = make_strided_view %tv : strided_view<tile=(2), traversal_strides=[2], tensor_view<16xf32, strides=[1]>>
     // CHECK: %[[SLE_IDXIN:.*]] = arith.constant 1 : i32
-    // CHECK: %[[SLE_PTR:.*]] = memref.reinterpret_cast %[[SLE_UPTR]] to offset: [0], sizes: [16], strides: [1] : memref<*xf32> to memref<16xf32>
+    // CHECK: %[[SLE_PTR:.*]] = memref.reinterpret_cast %[[SLE_UPTR]] to offset: [0], sizes: [16], strides: [1] : memref<*xf32> to memref<16xf32, strided<[1], offset: ?>>
     // offset = index * traversal_strides[0] (= 2 here).
     // CHECK: %[[SLE_IDX:.*]] = arith.index_cast %[[SLE_IDXIN]] : i32 to index
     // CHECK: %[[SLE_C2:.*]] = arith.constant 2 : index
     // CHECK: %[[SLE_OFF:.*]] = arith.muli %[[SLE_IDX]], %[[SLE_C2]] overflow<nsw> : index
     // Exact tiling (stride 2 == tile 2): every tile fits, so in_bounds = [true].
-    // CHECK: vector.transfer_read %[[SLE_PTR]][%[[SLE_OFF]]], %{{.*}} {in_bounds = [true]} : memref<16xf32>, vector<2xf32>
+    // CHECK: vector.transfer_read %[[SLE_PTR]][%[[SLE_OFF]]], %{{.*}} {in_bounds = [true]} : memref<16xf32, strided<[1], offset: ?>>, vector<2xf32>
     %t, %tok = load_view_tko weak %sv[%c1] : strided_view<tile=(2), traversal_strides=[2], tensor_view<16xf32, strides=[1]>>, tile<i32> -> tile<2xf32>, !cuda_tile.token
     return
   }
@@ -1483,7 +1483,7 @@ cuda_tile.module @m {
     %sv = make_strided_view %tv : strided_view<tile=(4x2), traversal_strides=[4,3], padding_value = nan, tensor_view<64x16xf32, strides=[16,1]>, dim_map=[1, 0]>
     // CHECK: %[[SLS_IDX0IN:.*]] = arith.constant 0 : i32
     // CHECK: %[[SLS_IDX1IN:.*]] = arith.constant 1 : i32
-    // CHECK: %[[SLS_PTR:.*]] = memref.reinterpret_cast %[[SLS_UPTR]] to offset: [0], sizes: [64, 16], strides: [16, 1] : memref<*xf32> to memref<64x16xf32>
+    // CHECK: %[[SLS_PTR:.*]] = memref.reinterpret_cast %[[SLS_UPTR]] to offset: [0], sizes: [64, 16], strides: [16, 1] : memref<*xf32> to memref<64x16xf32, strided<[16, 1], offset: ?>>
     // tile dim0 (index %c0) maps to tensor dim1 with traversal stride 4.
     // CHECK: %[[SLS_IDX0:.*]] = arith.index_cast %[[SLS_IDX0IN]] : i32 to index
     // CHECK: %[[SLS_S4:.*]] = arith.constant 4 : index
@@ -1495,7 +1495,7 @@ cuda_tile.module @m {
     // CHECK: %[[SLS_PAD:.*]] = arith.constant 0x7FC00000 : f32
     // Swizzle proof: memref indices are in tensor-dim order [dim0=OFF1, dim1=OFF0].
     // in_bounds: dim0 (size16/stride4/tile4) fits -> true; dim1 (size64/stride3/tile2) spills -> false.
-    // CHECK: vector.transfer_read %[[SLS_PTR]][%[[SLS_OFF1]], %[[SLS_OFF0]]], %[[SLS_PAD]] {in_bounds = [true, false], permutation_map = #{{.*}}} : memref<64x16xf32>, vector<4x2xf32>
+    // CHECK: vector.transfer_read %[[SLS_PTR]][%[[SLS_OFF1]], %[[SLS_OFF0]]], %[[SLS_PAD]] {in_bounds = [true, false], permutation_map = #{{.*}}} : memref<64x16xf32, strided<[16, 1], offset: ?>>, vector<4x2xf32>
     %t, %tok = load_view_tko weak %sv[%c0, %c1] : strided_view<tile=(4x2), traversal_strides=[4,3], padding_value = nan, tensor_view<64x16xf32, strides=[16,1]>, dim_map=[1, 0]>, tile<i32> -> tile<4x2xf32>, !cuda_tile.token
     return
   }
@@ -1513,7 +1513,7 @@ cuda_tile.module @m {
     // CHECK: %[[SST_IDX0IN:.*]] = arith.constant 0 : i32
     // CHECK: %[[SST_IDX1IN:.*]] = arith.constant 1 : i32
     // CHECK: %[[SST_BCAST:.*]] = arith.constant dense<1.000000e+00> : vector<4x2xf32>
-    // CHECK: %[[SST_PTR:.*]] = memref.reinterpret_cast %[[SST_UPTR]] to offset: [0], sizes: [64, 16], strides: [16, 1] : memref<*xf32> to memref<64x16xf32>
+    // CHECK: %[[SST_PTR:.*]] = memref.reinterpret_cast %[[SST_UPTR]] to offset: [0], sizes: [64, 16], strides: [16, 1] : memref<*xf32> to memref<64x16xf32, strided<[16, 1], offset: ?>>
     // identity dim_map: tile dim0 uses stride 4, tile dim1 uses stride 2.
     // CHECK: %[[SST_IDX0:.*]] = arith.index_cast %[[SST_IDX0IN]] : i32 to index
     // CHECK: %[[SST_S4:.*]] = arith.constant 4 : index
@@ -1522,7 +1522,7 @@ cuda_tile.module @m {
     // CHECK: %[[SST_S2:.*]] = arith.constant 2 : index
     // CHECK: %[[SST_OFF1:.*]] = arith.muli %[[SST_IDX1]], %[[SST_S2]] overflow<nsw> : index
     // identity dim_map: memref index order is [OFF0, OFF1], both dims fit -> in_bounds = [true, true], no permutation_map.
-    // CHECK: vector.transfer_write %[[SST_BCAST]], %[[SST_PTR]][%[[SST_OFF0]], %[[SST_OFF1]]] {in_bounds = [true, true]} : vector<4x2xf32>, memref<64x16xf32>
+    // CHECK: vector.transfer_write %[[SST_BCAST]], %[[SST_PTR]][%[[SST_OFF0]], %[[SST_OFF1]]] {in_bounds = [true, true]} : vector<4x2xf32>, memref<64x16xf32, strided<[16, 1], offset: ?>>
     // CHECK-NOT: permutation_map
     %tok = store_view_tko weak %tile, %sv[%c0, %c1] : tile<4x2xf32>, strided_view<tile=(4x2), traversal_strides=[4,2], tensor_view<64x16xf32, strides=[16,1]>>, tile<i32> -> !cuda_tile.token
     return
@@ -1533,7 +1533,7 @@ cuda_tile.module @m {
   // CHECK-SAME: %[[GSV_UPTR:[a-zA-Z0-9_]+]]: memref<*xf32>
   entry @test_make_gather_scatter_view(%p: !cuda_tile.tile<!cuda_tile.ptr<f32>>) {
     %tv = make_tensor_view %p, shape=[8192, 8192], strides=[8192, 1] : tensor_view<8192x8192xf32, strides=[8192,1]>
-    // CHECK: %[[GSV_PTR:.*]] = memref.reinterpret_cast %[[GSV_UPTR]] to offset: [0], sizes: [8192, 8192], strides: [8192, 1] : memref<*xf32> to memref<8192x8192xf32>
+    // CHECK: %[[GSV_PTR:.*]] = memref.reinterpret_cast %[[GSV_UPTR]] to offset: [0], sizes: [8192, 8192], strides: [8192, 1] : memref<*xf32> to memref<8192x8192xf32, strided<[8192, 1], offset: ?>>
     // CHECK-NOT: make_gather_scatter_view
     %gsv = make_gather_scatter_view %tv : gather_scatter_view<tile=(128x128), tensor_view<8192x8192xf32, strides=[8192,1]>, sparse_dim=0>
     return
