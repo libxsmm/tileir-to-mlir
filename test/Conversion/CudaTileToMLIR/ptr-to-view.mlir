@@ -552,13 +552,79 @@ module {
       // CHECK: %[[OFF:.*]] = offset %{{.*}}, %{{.*}} : tile<32x32xptr<bf16>>, tile<32x32xi32> -> tile<32x32xptr<bf16>>
       // CHECK: %[[GV:.*]], %[[GTOK:.*]] = load_ptr_tko weak %[[OFF]], %[[GMASK:.*]], %{{.*}} : tile<32x32xptr<bf16>>, tile<32x32xi1>, tile<32x32xbf16> -> tile<32x32xbf16>, token
       // CHECK-GPU-DAG: %[[GBASE:.*]] = memref.cast %[[SBASE]] : memref<*xbf16> to memref<?xbf16, strided<[1], offset: ?>>
-      // CHECK-GPU-DAG: arith.constant 0 : index
-      // CHECK-GPU: %[[GATHERED:.*]] = vector.gather %[[GBASE]][%{{.*}}] [%{{.*}}], %{{.*}}, %{{.*}} : memref<?xbf16, strided<[1], offset: ?>>, vector<32x32xindex>, vector<32x32xi1>, vector<32x32xbf16> into vector<32x32xbf16>
+      // vector.gather only lowers to LLVM for rank-1 vectors, so the multi-dim
+      // index/mask/passthrough are flattened to rank-1 with vector.shape_cast,
+      // a single rank-1 gather is emitted, and the result is shape_cast back.
+      // CHECK-GPU: %[[GIDX:.*]] = vector.shape_cast %{{.*}} : vector<32x32xindex> to vector<1024xindex>
+      // CHECK-GPU: %[[GMASK1D:.*]] = vector.shape_cast %{{.*}} : vector<32x32xi1> to vector<1024xi1>
+      // CHECK-GPU: %[[GPAD:.*]] = vector.shape_cast %{{.*}} : vector<32x32xbf16> to vector<1024xbf16>
+      // CHECK-GPU: %[[GATHERED1D:.*]] = vector.gather %[[GBASE]][%{{.*}}] [%[[GIDX]]], %[[GMASK1D]], %[[GPAD]] : memref<?xbf16, strided<[1], offset: ?>>, vector<1024xindex>, vector<1024xi1>, vector<1024xbf16> into vector<1024xbf16>
+      // CHECK-GPU: %[[GATHERED:.*]] = vector.shape_cast %[[GATHERED1D]] : vector<1024xbf16> to vector<32x32xbf16>
       %v, %t = load_ptr_tko weak %ptr, %mask, %pad : tile<32x32xptr<bf16>>, tile<32x32xi1>, tile<32x32xbf16> -> tile<32x32xbf16>, !cuda_tile.token
       // Store (scatter)
       // CHECK: store_ptr_tko weak %[[OFF]], %[[GV]], %[[GMASK]] : tile<32x32xptr<bf16>>, tile<32x32xbf16>, tile<32x32xi1> -> token
-      // CHECK-GPU: vector.scatter %{{.*}}[%{{.*}}] [%{{.*}}], %{{.*}}, %[[GATHERED]] : memref<?xbf16, strided<[1], offset: ?>>, vector<32x32xindex>, vector<32x32xi1>, vector<32x32xbf16>
+      // The value is likewise flattened to rank-1 before the rank-1 scatter.
+      // CHECK-GPU: %[[SVAL:.*]] = vector.shape_cast %[[GATHERED]] : vector<32x32xbf16> to vector<1024xbf16>
+      // CHECK-GPU: vector.scatter %{{.*}}[%{{.*}}] [%{{.*}}], %{{.*}}, %[[SVAL]] : memref<?xbf16, strided<[1], offset: ?>>, vector<1024xindex>, vector<1024xi1>, vector<1024xbf16>
       %57 = store_ptr_tko weak %ptr, %v, %mask : tile<32x32xptr<bf16>>, tile<32x32xbf16>, tile<32x32xi1> -> !cuda_tile.token
+      return
+    }
+
+    // -----------------------------------------------------------------------
+    // Corner case: 2-D gather/scatter with NO mask (and no padding value). The
+    // helper materializes an all-true mask, which is flattened to rank-1 along
+    // with the index and value so the gather/scatter still lower cleanly. The
+    // distinct 16x16 -> 256 flatten also guards the row-major collapse.
+    // -----------------------------------------------------------------------
+    // CHECK-LABEL: entry @gather_2d_nomask
+    // CHECK-NOT: make_tensor_view
+    // CHECK-GPU-LABEL: gpu.func @gather_2d_nomask
+    // CHECK-GPU-SAME: (%[[NMBASE:.*]]: memref<*xf32>,
+    entry @gather_2d_nomask(%base: tile<ptr<f32>>, %stride0: tile<i32>, %stride1: tile<i32>, %M: tile<i32>) {
+      %iota = iota : tile<16xi32>
+      %blockId_x, %blockId_y, %blockId_z = get_tile_block_id : tile<i32>
+      %c16 = constant <i32: 16> : tile<i32>
+      %start = muli %blockId_x, %c16 : tile<i32>
+      %start_1d = reshape %start : tile<i32> -> tile<1xi32>
+      %start_bc = broadcast %start_1d : tile<1xi32> -> tile<16xi32>
+      %linear = addi %start_bc, %iota : tile<16xi32>
+      // row = linear / M, col = linear % M (non-affine — not liftable to a view)
+      %M_1d = reshape %M : tile<i32> -> tile<1xi32>
+      %M_bc = broadcast %M_1d : tile<1xi32> -> tile<16xi32>
+      %row = divi %linear, %M_bc signed : tile<16xi32>
+      %col = remi %linear, %M_bc signed : tile<16xi32>
+      %row_2d = reshape %row : tile<16xi32> -> tile<16x1xi32>
+      %row_bc = broadcast %row_2d : tile<16x1xi32> -> tile<16x16xi32>
+      %stride0_rs = reshape %stride0 : tile<i32> -> tile<1x1xi32>
+      %stride0_bc = broadcast %stride0_rs : tile<1x1xi32> -> tile<16x16xi32>
+      %off0 = muli %row_bc, %stride0_bc : tile<16x16xi32>
+      %col_2d = reshape %col : tile<16xi32> -> tile<1x16xi32>
+      %col_bc = broadcast %col_2d : tile<1x16xi32> -> tile<16x16xi32>
+      %stride1_rs = reshape %stride1 : tile<i32> -> tile<1x1xi32>
+      %stride1_bc = broadcast %stride1_rs : tile<1x1xi32> -> tile<16x16xi32>
+      %off1 = muli %col_bc, %stride1_bc : tile<16x16xi32>
+      %total_off = addi %off0, %off1 : tile<16x16xi32>
+      %base_rs = reshape %base : tile<ptr<f32>> -> tile<1x1xptr<f32>>
+      %base_bc = broadcast %base_rs : tile<1x1xptr<f32>> -> tile<16x16xptr<f32>>
+      %ptr = offset %base_bc, %total_off : tile<16x16xptr<f32>>, tile<16x16xi32> -> tile<16x16xptr<f32>>
+      // Load (gather) — no mask operand.
+      // CHECK: %[[NMOFF:.*]] = offset %{{.*}}, %{{.*}} : tile<16x16xptr<f32>>, tile<16x16xi32> -> tile<16x16xptr<f32>>
+      // CHECK: %[[NMV:.*]], %{{.*}} = load_ptr_tko weak %[[NMOFF]] : tile<16x16xptr<f32>> -> tile<16x16xf32>, token
+      // CHECK-GPU-DAG: %[[NMB:.*]] = memref.cast %[[NMBASE]] : memref<*xf32> to memref<?xf32, strided<[1], offset: ?>>
+      // With no original mask, an all-true mask is materialized then flattened.
+      // CHECK-GPU: %[[NMTRUE:.*]] = arith.constant true
+      // CHECK-GPU: %[[NMMASK2D:.*]] = vector.broadcast %[[NMTRUE]] : i1 to vector<16x16xi1>
+      // CHECK-GPU: %[[NMIDX:.*]] = vector.shape_cast %{{.*}} : vector<16x16xindex> to vector<256xindex>
+      // CHECK-GPU: %[[NMMASK1D:.*]] = vector.shape_cast %[[NMMASK2D]] : vector<16x16xi1> to vector<256xi1>
+      // CHECK-GPU: %[[NMPAD:.*]] = vector.shape_cast %{{.*}} : vector<16x16xf32> to vector<256xf32>
+      // CHECK-GPU: %[[NMGATH1D:.*]] = vector.gather %[[NMB]][%{{.*}}] [%[[NMIDX]]], %[[NMMASK1D]], %[[NMPAD]] : memref<?xf32, strided<[1], offset: ?>>, vector<256xindex>, vector<256xi1>, vector<256xf32> into vector<256xf32>
+      // CHECK-GPU: %[[NMGATH:.*]] = vector.shape_cast %[[NMGATH1D]] : vector<256xf32> to vector<16x16xf32>
+      %v, %t = load_ptr_tko weak %ptr : tile<16x16xptr<f32>> -> tile<16x16xf32>, !cuda_tile.token
+      // Store (scatter) — no mask operand.
+      // CHECK: store_ptr_tko weak %[[NMOFF]], %[[NMV]] : tile<16x16xptr<f32>>, tile<16x16xf32> -> token
+      // CHECK-GPU: %[[NMSVAL:.*]] = vector.shape_cast %[[NMGATH]] : vector<16x16xf32> to vector<256xf32>
+      // CHECK-GPU: vector.scatter %{{.*}}[%{{.*}}] [%{{.*}}], %{{.*}}, %[[NMSVAL]] : memref<?xf32, strided<[1], offset: ?>>, vector<256xindex>, vector<256xi1>, vector<256xf32>
+      %st = store_ptr_tko weak %ptr, %v : tile<16x16xptr<f32>>, tile<16x16xf32> -> !cuda_tile.token
       return
     }
 
@@ -579,7 +645,9 @@ module {
     // CHECK:   continue %[[NMAX]], %[[NIDX]]
     // CHECK-GPU-LABEL: gpu.func @argmax_loop
     // CHECK-GPU: %[[GFOR:.*]]:2 = scf.for %{{.*}} iter_args(%[[M:.*]] = %{{.*}}, %[[I:.*]] = %{{.*}}) -> (vector<32xf32>, vector<32xi32>)
+    // The load is already rank-1, so the flatten guard is skipped: no shape_cast.
     // CHECK-GPU:   vector.gather
+    // CHECK-GPU-NOT:   vector.shape_cast
     // CHECK-GPU:   %[[GCMP:.*]] = arith.cmpf ogt
     // CHECK-GPU:   %[[GMAX:.*]] = arith.select %[[GCMP]]
     // CHECK-GPU:   %[[GIDX:.*]] = arith.select %[[GCMP]]

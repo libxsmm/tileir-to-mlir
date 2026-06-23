@@ -3095,7 +3095,14 @@ struct ConvertOffsetRanked : public OpConversionPattern<cuda_tile::OffsetOp> {
 };
 
 /// Helper for vector.gather/scatter lowering. Derives the common 1D base
-/// memref, N-D mask, and N-D index vector.
+/// memref and the flattened (rank-1) mask and index vectors.
+///
+/// vector.gather/scatter only lower to LLVM for rank-1 vectors, so the index
+/// and mask are flattened here with vector.shape_cast (a pure row-major
+/// reshape). The base is already a flat 1-D memref and the whole address lives
+/// in the per-element index vector, so flattening preserves the
+/// lane<->index<->value correspondence exactly. Callers flatten the
+/// value/result and shape_cast back to the tile shape.
 static LogicalResult deriveGatherScatterMemRefAndMask(
     Operation *op, Value origPtr, Value cvtPtr, Value origMask, Value cvtMask,
     Type elemTy, ArrayRef<int64_t> shape, ConversionPatternRewriter &rewriter,
@@ -3148,6 +3155,16 @@ static LogicalResult deriveGatherScatterMemRefAndMask(
     mask = vector::BroadcastOp::create(rewriter, loc, maskTy, trueVal);
   }
 
+  // Flatten the index and mask to rank-1 so the gather/scatter is legal for
+  // the Vector->LLVM lowering (which only supports rank-1).
+  if (ptrVecTy.getRank() != 1) {
+    int64_t numElts = ptrVecTy.getNumElements();
+    auto flatIdxTy = VectorType::get({numElts}, rewriter.getIndexType());
+    indexVec = vector::ShapeCastOp::create(rewriter, loc, flatIdxTy, indexVec);
+    auto flatMaskTy = VectorType::get({numElts}, rewriter.getI1Type());
+    mask = vector::ShapeCastOp::create(rewriter, loc, flatMaskTy, mask);
+  }
+
   return success();
 }
 
@@ -3196,14 +3213,26 @@ struct ConvertLoadPtrTkoRanked
           arith::ConstantOp::create(rewriter, loc, resultVecTy, zeroAttr);
     }
 
+    // vector.gather lowers to LLVM only for rank-1 vectors. The index/mask were
+    // flattened to rank-1 in the helper; flatten the passthrough to match,
+    // emit a 1-D gather, then shape_cast the result back to the tile shape.
+    auto flatResTy = VectorType::get({resultVecTy.getNumElements()}, elemTy);
+    if (resultVecTy.getRank() != 1)
+      passThru =
+          vector::ShapeCastOp::create(rewriter, loc, flatResTy, passThru);
+
     // Emit vector.gather.
     Value c0 = arith::ConstantIndexOp::create(rewriter, loc, 0);
     auto gatherOp =
-        vector::GatherOp::create(rewriter, loc, resultVecTy, baseMemref,
+        vector::GatherOp::create(rewriter, loc, flatResTy, baseMemref,
                                  ValueRange{c0}, indexVec, mask, passThru);
     preserveDroppedOptHints(op, gatherOp);
 
-    rewriter.replaceOp(op, {gatherOp.getResult(), Value()});
+    Value result = gatherOp.getResult();
+    if (resultVecTy.getRank() != 1)
+      result = vector::ShapeCastOp::create(rewriter, loc, resultVecTy, result);
+
+    rewriter.replaceOp(op, {result, Value()});
     return success();
   }
 };
@@ -3239,6 +3268,14 @@ struct ConvertStorePtrTkoRanked
       return failure();
 
     Value valVec = adaptor.getValue();
+
+    // vector.scatter lowers to LLVM only for rank-1 vectors. The index/mask
+    // were flattened to rank-1 in the helper; flatten the value to match.
+    auto valVecTy = cast<VectorType>(valVec.getType());
+    if (valVecTy.getRank() != 1) {
+      auto flatValTy = VectorType::get({valVecTy.getNumElements()}, elemTy);
+      valVec = vector::ShapeCastOp::create(rewriter, loc, flatValTy, valVec);
+    }
 
     // Emit vector.scatter.
     Value c0 = arith::ConstantIndexOp::create(rewriter, loc, 0);
