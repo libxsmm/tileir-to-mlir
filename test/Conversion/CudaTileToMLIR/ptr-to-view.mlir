@@ -764,5 +764,40 @@ module {
       }
       return
     }
+
+    // Regression test for dead-iter-arg elimination: the loop's only
+    // iter_arg has an externally-unused result but feeds a store every
+    // iteration.  It must be kept (and the store preserved) -- dropping it
+    // would delete the store and leave an empty kernel.
+    // CHECK-LABEL: entry @iter_arg_feeds_store
+    // CHECK-GPU-LABEL: gpu.func @iter_arg_feeds_store
+    entry @iter_arg_feeds_store(%out: tile<ptr<f32>>, %n: tile<i32>) {
+      %c0 = constant <i32: 0> : tile<i32>
+      %c32 = constant <i32: 32> : tile<i32>
+      %f0 = constant <f32: 0.000000e+00> : tile<f32>
+      %f1 = constant <f32: 1.000000e+00> : tile<f32>
+      %iota = iota : tile<32xi32>
+      %n_1d = reshape %n : tile<i32> -> tile<1xi32>
+      %n_bc = broadcast %n_1d : tile<1xi32> -> tile<32xi32>
+      %mask = cmpi less_than %iota, %n_bc, signed : tile<32xi32> -> tile<32xi1>
+      %out_1d = reshape %out : tile<ptr<f32>> -> tile<1xptr<f32>>
+      %out_bc = broadcast %out_1d : tile<1xptr<f32>> -> tile<32xptr<f32>>
+      %ptr = offset %out_bc, %iota : tile<32xptr<f32>>, tile<32xi32> -> tile<32xptr<f32>>
+
+      // CHECK: for %{{.*}} in {{.*}} iter_values(%{{.*}} = %{{.*}}) -> (tile<f32>)
+      // CHECK: store_view_tko
+      // CHECK-NOT: store_ptr_tko
+      // CHECK-GPU: scf.for
+      // CHECK-GPU: vector.transfer_write
+      %for = for %i in (%c0 to %n, step %c32) : tile<i32>
+          iter_values(%acc = %f0) -> (tile<f32>) {
+        %acc_1d = reshape %acc : tile<f32> -> tile<1xf32>
+        %val = broadcast %acc_1d : tile<1xf32> -> tile<32xf32>
+        %t = store_ptr_tko weak %ptr, %val, %mask : tile<32xptr<f32>>, tile<32xf32>, tile<32xi1> -> !cuda_tile.token
+        %nacc = addf %acc, %f1 : tile<f32>
+        continue %nacc : tile<f32>
+      }
+      return
+    }
   }
 }

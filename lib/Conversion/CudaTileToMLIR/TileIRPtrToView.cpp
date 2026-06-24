@@ -78,6 +78,7 @@
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/RegionUtils.h"
 
@@ -1220,6 +1221,40 @@ struct TileIRPtrToViewPass
           return -1;
         return (int)(n - numInduction);
       };
+
+      // An iter_arg is also live if its value (transitively) feeds a
+      // side-effecting op inside the loop body -- e.g. a `cumsum` kernel whose
+      // running-accumulator iter_arg is stored to memory every iteration.  Such
+      // an iter_arg's loop *result* is externally unused, yet dropping it would
+      // delete the store that consumes it.  The continue-slice fixpoint below
+      // only tracks data feeding kept *results*, so seed these here; otherwise
+      // the forward-closure erase further down would silently remove the store.
+      for (unsigned i = 0; i < numIter; ++i) {
+        if (keep[i])
+          continue;
+        SmallVector<Value> work{oldBody->getArgument(numInduction + i)};
+        DenseSet<Value> seen;
+        while (!work.empty() && !keep[i]) {
+          Value v = work.pop_back_val();
+          if (!v || !seen.insert(v).second)
+            continue;
+          for (Operation *user : v.getUsers()) {
+            // The terminator is handled by the result/continue analysis.
+            if (isa<ContinueOp>(user))
+              continue;
+            // A non-pure user (a store, an atomic, ...) makes the iter_arg
+            // live.  `isMemoryEffectFree` also accounts for effects nested in
+            // a user's regions, and conservatively treats ops without the
+            // memory-effect interface as effecting.
+            if (!isMemoryEffectFree(user)) {
+              keep[i] = true;
+              break;
+            }
+            for (Value r : user->getResults())
+              work.push_back(r);
+          }
+        }
+      }
 
       bool grew = true;
       while (grew) {
