@@ -2,23 +2,8 @@
 
 // Verifies the safety guards of --convert-memref-args-to-ptr-args: arguments are left as
 // unranked memrefs (and their reinterpret_casts kept) whenever the promotion
-// would be ambiguous or would break an in-module call site.
-
-// Divergent reinterpretations of the same argument (different ranked result
-// types) are ambiguous, so the argument is not promoted.
-// CHECK-LABEL: func.func @divergent(
-// CHECK-SAME:    %{{[^:]+}}: memref<*xf32>
-// CHECK:         memref.reinterpret_cast
-// CHECK:         memref.reinterpret_cast
-func.func @divergent(%arg0: memref<*xf32>, %arg1: i32) {
-  %cst = arith.constant 0.000000e+00 : f32
-  %0 = arith.index_cast %arg1 : i32 to index
-  %a = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%0], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1]>>
-  %b = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%0, %0], strides: [%0, 1] : memref<*xf32> to memref<?x?xf32, strided<[?, 1]>>
-  %u = vector.transfer_read %a[%0], %cst : memref<?xf32, strided<[1]>>, vector<4xf32>
-  %v = vector.transfer_read %b[%0, %0], %cst : memref<?x?xf32, strided<[?, 1]>>, vector<4x4xf32>
-  return
-}
+// would break an in-module call site or the unranked type is observed by a
+// non-cast user.
 
 // A non-cast use of the argument (here memref.rank observes the unranked type)
 // blocks the promotion: the argument must stay unranked.
