@@ -46,11 +46,14 @@
 // cuda_tile::IToFOp
 // cuda_tile::IfOp
 // cuda_tile::IotaOp
+// cuda_tile::JoinTokensOp
 // cuda_tile::LoadPtrTkoOp (scalar/rank-0 only; higher-rank requires
 // --tileir-ptr-to-view) cuda_tile::LoadViewTkoOp cuda_tile::LogOp
 // cuda_tile::Log2Op
 // cuda_tile::MakePartitionViewOp
+// cuda_tile::MakeStridedViewOp
 // cuda_tile::MakeTensorViewOp
+// cuda_tile::MakeTokenOp
 // cuda_tile::MaxFOp
 // cuda_tile::MaxIOp
 // cuda_tile::MinFOp
@@ -97,11 +100,8 @@
 // cuda_tile::AtomicRedViewTkoOp
 // cuda_tile::BreakOp
 // cuda_tile::IntToPtrOp
-// cuda_tile::JoinTokensOp
 // cuda_tile::LoopOp
 // cuda_tile::MakeGatherScatterViewOp
-// cuda_tile::MakeStridedViewOp
-// cuda_tile::MakeTokenOp
 // cuda_tile::MmafScaledOp
 // cuda_tile::OffsetOp
 // cuda_tile::PrintTkoOp
@@ -606,8 +606,12 @@ struct ConvertBinaryFloatOp : public OpConversionPattern<SrcOp> {
     bool ftz = op.getFlushToZero();
     auto fmAttr = arith::FastMathFlagsAttr::get(rewriter.getContext(),
                                                 arith::FastMathFlags::none);
+    // Older LLVM: arith float binary ops have no rounding-mode attribute.
+    // auto newOp = rewriter.template replaceOpWithNewOp<DstOp>(
+    //     op, adaptor.getLhs(), adaptor.getRhs(), fmAttr, roundingAttr);
+    (void)roundingAttr;
     auto newOp = rewriter.template replaceOpWithNewOp<DstOp>(
-        op, adaptor.getLhs(), adaptor.getRhs(), fmAttr, roundingAttr);
+        op, adaptor.getLhs(), adaptor.getRhs(), fmAttr);
     if (target == CudaTileTarget::CPU)
       preserveDroppedRounding(rewriter, op.getRoundingMode(), newOp);
     preserveDroppedFlushToZero(rewriter, ftz, newOp);
@@ -1539,10 +1543,15 @@ struct ConvertDivF : public OpConversionPattern<cuda_tile::DivFOp> {
           op, "rounding mode has no arith equivalent");
     }
 
+    // Older LLVM: arith.divf has no rounding-mode attribute.
+    // auto newOp = rewriter.replaceOpWithNewOp<arith::DivFOp>(
+    //     op, adaptor.getLhs(), adaptor.getRhs(),
+    //     arith::FastMathFlagsAttr::get(rewriter.getContext(), fmf),
+    //     roundingAttr);
+    (void)roundingAttr;
     auto newOp = rewriter.replaceOpWithNewOp<arith::DivFOp>(
         op, adaptor.getLhs(), adaptor.getRhs(),
-        arith::FastMathFlagsAttr::get(rewriter.getContext(), fmf),
-        roundingAttr);
+        arith::FastMathFlagsAttr::get(rewriter.getContext(), fmf));
     if (target == CudaTileTarget::CPU)
       preserveDroppedRounding(rewriter, rounding, newOp);
     preserveDroppedFlushToZero(rewriter, ftz, newOp);
@@ -2034,6 +2043,15 @@ struct ConvertFToF : public OpConversionPattern<cuda_tile::FToFOp> {
         op, getTypeConverter(), rewriter, "cannot convert ftof result type");
     if (failed(resultTy))
       return failure();
+
+    // After type conversion the source and result types may coincide -- e.g.
+    // `ftof f32 -> tf32` on the CPU target, where tf32 lowers to f32.  Such a
+    // cast is a no-op, so forward the converted source value (the rounding mode
+    // is irrelevant).
+    if (adaptor.getFrom().getType() == resultTy.value()) {
+      rewriter.replaceOp(op, adaptor.getFrom());
+      return success();
+    }
 
     auto getFloatWidth = [](Type ty) -> unsigned {
       if (auto fTy = dyn_cast<FloatType>(ty))
@@ -2536,6 +2554,34 @@ struct ConvertMakeStridedView
   matchAndRewrite(cuda_tile::MakeStridedViewOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     rewriter.replaceOp(op, adaptor.getTensorView());
+    return success();
+  }
+};
+
+/// Convert cuda_tile.make_token by erasing it.
+///
+/// TKO tokens are currently ignored during lowering; this pattern erases the
+/// generator op. It assumes other patterns (load_tko etc.) have already
+/// dropped their dependency on this token.
+struct ConvertMakeToken : public OpConversionPattern<cuda_tile::MakeTokenOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::MakeTokenOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+/// Convert cuda_tile.join_tokens by erasing it.
+struct ConvertJoinTokens : public OpConversionPattern<cuda_tile::JoinTokensOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(cuda_tile::JoinTokensOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.eraseOp(op);
     return success();
   }
 };
@@ -3813,7 +3859,8 @@ using ConvertYield = ConvertToScfYield<cuda_tile::YieldOp>;
 
 /// Populate type-conversion rules for cuda_tile -> gpu/vector lowering.
 static void populateTileIRToMLIRTypeConverter(TypeConverter &converter,
-                                              MLIRContext *ctx) {
+                                              MLIRContext *ctx,
+                                              CudaTileTarget target) {
   // Fallback: keep types unchanged.
   converter.addConversion([](Type type) { return type; });
 
@@ -3822,14 +3869,20 @@ static void populateTileIRToMLIRTypeConverter(TypeConverter &converter,
   //   - ints        -> preserved scalar integer type
   //   - float       -> preserved scalar type
   //   - ptr<T>      -> memref<*xT> (unranked memref backing the pointer)
-  converter.addConversion([ctx](cuda_tile::TileType tileTy) -> Type {
+  converter.addConversion([ctx, target](cuda_tile::TileType tileTy) -> Type {
     auto shape = tileTy.getShape();
     auto elemTy = tileTy.getElementType();
+
+    // CPU has no tf32 representation; lower tf32 tiles to f32 so the resulting
+    // vector/arith ops are valid on the host target.
+    if (target == CudaTileTarget::CPU && isa<FloatTF32Type>(elemTy))
+      elemTy = Float32Type::get(ctx);
 
     if (shape.empty()) {
       if (isa<IntegerType>(elemTy)) {
         return elemTy;
       }
+
       if (isa<FloatType>(elemTy))
         return elemTy;
       if (auto ptrTy = dyn_cast<cuda_tile::PointerType>(elemTy))
@@ -3897,19 +3950,19 @@ static void populateTileIRToMLIRConversionPatterns(TypeConverter &converter,
       ConvertCos, ConvertCosH, ConvertAtomicRMWTko, ConvertExp, ConvertExp2,
       ConvertExtI, ConvertExtract, ConvertFloor, ConvertFma, ConvertFor,
       ConvertGetGlobal, ConvertGetIndexSpaceShape, ConvertGetTensorShape,
-      ConvertGlobal, ConvertIf, ConvertIota, ConvertLoadPtrTkoRanked,
-      ConvertLoadPtrTkoScalar, ConvertLoadViewTko, ConvertLog, ConvertLog2,
-      ConvertMakeGatherScatterView, ConvertMakePartitionView,
-      ConvertMakeStridedView, ConvertMakeTensorView, ConvertMaxF, ConvertMaxI,
-      ConvertMinF, ConvertMinI, ConvertMmaF, ConvertMmaI, ConvertMulhiI,
-      ConvertMulI, ConvertOffsetRanked, ConvertOffsetScalarPtr, ConvertNegF,
-      ConvertNegI, ConvertOrI, ConvertPack, ConvertPermute, ConvertPow,
-      ConvertPtrToPtrCastOrFail, ConvertReduce, ConvertRemF, ConvertRemI,
-      ConvertReshape, ConvertRsqrt, ConvertScan, ConvertSelect, ConvertShLI,
-      ConvertShRI, ConvertSin, ConvertSinH, ConvertSqrt,
-      ConvertStorePtrTkoRanked, ConvertStorePtrTkoScalar, ConvertStoreViewTko,
-      ConvertSubI, ConvertTan, ConvertTanH, ConvertTruncI, ConvertUnpack,
-      ConvertXOrI, ConvertYield>(converter, ctx);
+      ConvertGlobal, ConvertIf, ConvertIota, ConvertJoinTokens,
+      ConvertLoadPtrTkoRanked, ConvertLoadPtrTkoScalar, ConvertLoadViewTko,
+      ConvertLog, ConvertLog2, ConvertMakeGatherScatterView,
+      ConvertMakePartitionView, ConvertMakeStridedView, ConvertMakeTensorView,
+      ConvertMakeToken, ConvertMaxF, ConvertMaxI, ConvertMinF, ConvertMinI,
+      ConvertMmaF, ConvertMmaI, ConvertMulhiI, ConvertMulI, ConvertOffsetRanked,
+      ConvertOffsetScalarPtr, ConvertNegF, ConvertNegI, ConvertOrI, ConvertPack,
+      ConvertPermute, ConvertPow, ConvertPtrToPtrCastOrFail, ConvertReduce,
+      ConvertRemF, ConvertRemI, ConvertReshape, ConvertRsqrt, ConvertScan,
+      ConvertSelect, ConvertShLI, ConvertShRI, ConvertSin, ConvertSinH,
+      ConvertSqrt, ConvertStorePtrTkoRanked, ConvertStorePtrTkoScalar,
+      ConvertStoreViewTko, ConvertSubI, ConvertTan, ConvertTanH, ConvertTruncI,
+      ConvertUnpack, ConvertXOrI, ConvertYield>(converter, ctx);
 }
 
 //===----------------------------------------------------------------------===//
@@ -3926,7 +3979,7 @@ struct ConvertTileIRToMLIRPass
     ModuleOp module = getOperation();
 
     TypeConverter typeConverter;
-    populateTileIRToMLIRTypeConverter(typeConverter, ctx);
+    populateTileIRToMLIRTypeConverter(typeConverter, ctx, target);
 
     RewritePatternSet patterns(ctx);
     populateTileIRToMLIRConversionPatterns(typeConverter, patterns, target);

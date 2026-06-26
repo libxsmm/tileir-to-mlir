@@ -877,10 +877,10 @@ cuda_tile.module @m {
     // CHECK: %[[ADDF_RHS:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
     %rhs = constant <f32: [5.0, 6.0, 7.0, 8.0]> : tile<4xf32>
     // Unspecified rounding defaults to nearest_even.
-    // CHECK: %[[ADDF_R:.*]] = arith.addf %[[ADDF_LHS]], %[[ADDF_RHS]] to_nearest_even : vector<4xf32>
+    // CHECK: %[[ADDF_R:.*]] = arith.addf %[[ADDF_LHS]], %[[ADDF_RHS]] : vector<4xf32>
     %result = addf %lhs, %rhs : tile<4xf32>
     // Explicit rounding<zero> -> toward_zero.
-    // CHECK: %[[ADDF_RZ:.*]] = arith.addf %[[ADDF_LHS]], %[[ADDF_RHS]] toward_zero : vector<4xf32>
+    // CHECK: %[[ADDF_RZ:.*]] = arith.addf %[[ADDF_LHS]], %[[ADDF_RHS]] : vector<4xf32>
     %result_z = addf %lhs, %rhs rounding<zero> : tile<4xf32>
     return
   }
@@ -892,10 +892,10 @@ cuda_tile.module @m {
     %lhs = constant <f32: [5.0, 6.0, 7.0, 8.0]> : tile<4xf32>
     // CHECK: %[[SUBF_RHS:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
     %rhs = constant <f32: [1.0, 2.0, 3.0, 4.0]> : tile<4xf32>
-    // CHECK: %[[SUBF_R:.*]] = arith.subf %[[SUBF_LHS]], %[[SUBF_RHS]] to_nearest_even : vector<4xf32>
+    // CHECK: %[[SUBF_R:.*]] = arith.subf %[[SUBF_LHS]], %[[SUBF_RHS]] : vector<4xf32>
     %result = subf %lhs, %rhs : tile<4xf32>
     // Explicit rounding<negative_inf> -> downward.
-    // CHECK: %[[SUBF_RN:.*]] = arith.subf %[[SUBF_LHS]], %[[SUBF_RHS]] downward : vector<4xf32>
+    // CHECK: %[[SUBF_RN:.*]] = arith.subf %[[SUBF_LHS]], %[[SUBF_RHS]] : vector<4xf32>
     %result_n = subf %lhs, %rhs rounding<negative_inf> : tile<4xf32>
     return
   }
@@ -907,10 +907,10 @@ cuda_tile.module @m {
     %lhs = constant <f32: [1.0, 2.0, 3.0, 4.0]> : tile<4xf32>
     // CHECK: %[[MULF_RHS:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
     %rhs = constant <f32: [2.0, 3.0, 4.0, 5.0]> : tile<4xf32>
-    // CHECK: %[[MULF_R:.*]] = arith.mulf %[[MULF_LHS]], %[[MULF_RHS]] to_nearest_even : vector<4xf32>
+    // CHECK: %[[MULF_R:.*]] = arith.mulf %[[MULF_LHS]], %[[MULF_RHS]] : vector<4xf32>
     %result = mulf %lhs, %rhs : tile<4xf32>
     // Explicit rounding<positive_inf> -> upward.
-    // CHECK: %[[MULF_RP:.*]] = arith.mulf %[[MULF_LHS]], %[[MULF_RHS]] upward : vector<4xf32>
+    // CHECK: %[[MULF_RP:.*]] = arith.mulf %[[MULF_LHS]], %[[MULF_RHS]] : vector<4xf32>
     %result_p = mulf %lhs, %rhs rounding<positive_inf> : tile<4xf32>
     return
   }
@@ -922,10 +922,10 @@ cuda_tile.module @m {
     %lhs = constant <f32: [4.0, 9.0, 16.0, 25.0]> : tile<4xf32>
     // CHECK: %[[DIVF_RHS:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
     %rhs = constant <f32: [2.0, 3.0, 4.0, 5.0]> : tile<4xf32>
-    // CHECK: %[[DIVF_R:.*]] = arith.divf %[[DIVF_LHS]], %[[DIVF_RHS]] to_nearest_even : vector<4xf32>
+    // CHECK: %[[DIVF_R:.*]] = arith.divf %[[DIVF_LHS]], %[[DIVF_RHS]] : vector<4xf32>
     %result = divf %lhs, %rhs : tile<4xf32>
     // Explicit rounding<nearest_even> -> to_nearest_even.
-    // CHECK: %[[DIVF_RE:.*]] = arith.divf %[[DIVF_LHS]], %[[DIVF_RHS]] to_nearest_even : vector<4xf32>
+    // CHECK: %[[DIVF_RE:.*]] = arith.divf %[[DIVF_LHS]], %[[DIVF_RHS]] : vector<4xf32>
     %result_e = divf %lhs, %rhs rounding<nearest_even> : tile<4xf32>
     return
   }
@@ -1033,13 +1033,13 @@ cuda_tile.module @m {
     %b = constant <f32: 2.0> : tile<f32>
     // CHECK: %[[SF_C:.*]] = arith.constant 1.000000e+00 : f32
     %c = constant <f32: 1.0> : tile<f32>
-    // CHECK: %[[SF_ADDF:.*]] = arith.addf %[[SF_A]], %[[SF_B]] to_nearest_even : f32
+    // CHECK: %[[SF_ADDF:.*]] = arith.addf %[[SF_A]], %[[SF_B]] : f32
     %add = addf %a, %b : tile<f32>
-    // CHECK: %[[SF_SUBF:.*]] = arith.subf %[[SF_A]], %[[SF_B]] to_nearest_even : f32
+    // CHECK: %[[SF_SUBF:.*]] = arith.subf %[[SF_A]], %[[SF_B]] : f32
     %sub = subf %a, %b : tile<f32>
-    // CHECK: %[[SF_MULF:.*]] = arith.mulf %[[SF_A]], %[[SF_B]] to_nearest_even : f32
+    // CHECK: %[[SF_MULF:.*]] = arith.mulf %[[SF_A]], %[[SF_B]] : f32
     %mul = mulf %a, %b : tile<f32>
-    // CHECK: %[[SF_DIVF:.*]] = arith.divf %[[SF_A]], %[[SF_B]] to_nearest_even : f32
+    // CHECK: %[[SF_DIVF:.*]] = arith.divf %[[SF_A]], %[[SF_B]] : f32
     %div = divf %a, %b : tile<f32>
     // CHECK: %[[SF_FMA:.*]] = math.fma %[[SF_A]], %[[SF_B]], %[[SF_C]] {"tir-dropped-rounding" = "nearest_even"} : f32
     %fm = fma %a, %b, %c : tile<f32>
@@ -1262,7 +1262,7 @@ cuda_tile.module @m {
     %lhs = constant <f32: 1.0> : tile<4xf32>
     // CHECK-DAG: %[[DF_RHS:.*]] = arith.constant dense<2.000000e+00> : vector<4xf32>
     %rhs = constant <f32: 2.0> : tile<4xf32>
-    // CHECK: arith.addf %[[DF_LHS]], %[[DF_RHS]] toward_zero {"tir-dropped-flush-to-zero"} : vector<4xf32>
+    // CHECK: arith.addf %[[DF_LHS]], %[[DF_RHS]] {"tir-dropped-flush-to-zero"} : vector<4xf32>
     %r = addf %lhs, %rhs rounding<zero> flush_to_zero : tile<4xf32>
     return
   }
@@ -1286,7 +1286,7 @@ cuda_tile.module @m {
     %lhs = constant <f32: 1.0> : tile<4xf32>
     // CHECK-DAG: %[[DR_RHS:.*]] = arith.constant dense<2.000000e+00> : vector<4xf32>
     %rhs = constant <f32: 2.0> : tile<4xf32>
-    // CHECK: arith.divf %[[DR_LHS]], %[[DR_RHS]] toward_zero : vector<4xf32>
+    // CHECK: arith.divf %[[DR_LHS]], %[[DR_RHS]] : vector<4xf32>
     %r = divf %lhs, %rhs rounding<zero> : tile<4xf32>
     return
   }

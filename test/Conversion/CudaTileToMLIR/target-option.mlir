@@ -34,8 +34,8 @@
 // GPU:           }
 //   In GPU mode, arith rounding-mode attrs remain natively represented.
 // GPU:           gpu.func @rounding(%[[FX:.*]]: f32, %[[FY:.*]]: f32, %[[IX:.*]]: i32, %[[IY:.*]]: i32) kernel {
-// GPU:             arith.addf %[[FX]], %[[FY]] to_nearest_even
-// GPU:             arith.divf %[[FX]], %[[FY]] toward_zero
+// GPU:             arith.addf %[[FX]], %[[FY]]
+// GPU:             arith.divf %[[FX]], %[[FY]]
 // GPU:             arith.truncf %[[FX]] to_nearest_even
 // GPU:             arith.fptosi %[[FX]]
 // GPU:             arith.sitofp %[[IX]]

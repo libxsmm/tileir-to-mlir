@@ -20,4 +20,6 @@ target_link_libraries(cudatile-to-mlir
   MLIRIR
   MLIRSupport
   CudaTileDialect
+  CudaTileBytecodeReader
+  CudaTileBytecodeCommon
 )

@@ -19,14 +19,24 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/OwningOpRef.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Pass/PassRegistry.h"
+#include "mlir/Support/FileUtilities.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 #include "mlir/Transforms/Passes.h"
 
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/InitLLVM.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Process.h"
+#include "llvm/Support/ToolOutputFile.h"
+#include "llvm/Support/raw_ostream.h"
 
+#include "cuda_tile/Bytecode/Reader/BytecodeReader.h"
 #include "cuda_tile/Dialect/CudaTile/IR/Dialect.h"
+
+#include <iostream>
 
 int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
@@ -49,27 +59,76 @@ int main(int argc, char **argv) {
 
   mlir::registerTransformsPasses();
 
-  // If no pass/pipeline flags are given, default to
-  // --convert-cuda-tile-to-mlir.
-  bool hasPassFlag = false;
-  for (int i = 1; i < argc; ++i) {
-    llvm::StringRef arg(argv[i]);
-    if (arg.starts_with("--convert-") || arg.starts_with("--pass-pipeline") ||
-        arg.starts_with("-convert-") || arg.starts_with("-pass-pipeline"))
-      hasPassFlag = true;
+  llvm::InitLLVM y(argc, argv);
+
+  // Register and parse the command line options up front so we can decide how
+  // to load the input (textual MLIR vs. TileIR bytecode) before handing the
+  // already-parsed IR to MlirOptMain.
+  std::string inputFilename, outputFilename;
+  std::tie(inputFilename, outputFilename) = mlir::registerAndParseCLIOptions(
+      argc, argv, "CudaTileToMLIR optimizer driver\n", registry);
+
+  mlir::MlirOptMainConfig config =
+      mlir::MlirOptMainConfig::createFromCLOptions();
+
+  // When reading from stdin and the input is a tty, warn the user (mirrors the
+  // behavior of the default MlirOptMain driver).
+  if (inputFilename == "-" &&
+      llvm::sys::Process::FileDescriptorIsDisplayed(fileno(stdin)))
+    llvm::errs() << "(processing input from stdin now, hit ctrl-c/ctrl-d to "
+                    "interrupt)\n";
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::MemoryBuffer> input =
+      mlir::openInputFile(inputFilename, &errorMessage);
+  if (!input) {
+    llvm::errs() << errorMessage << "\n";
+    return EXIT_FAILURE;
   }
 
-  std::vector<const char *> newArgv(argv, argv + argc);
-  // if (!hasPassFlag) {
-  //   newArgv.push_back("--pass-pipeline=builtin.module("
-  //                     "convert-cuda-tile-to-mlir,"
-  //                     "loop-invariant-code-motion,"
-  //                     "canonicalize,"
-  //                     "cse)");
-  // }
-  int newArgc = static_cast<int>(newArgv.size());
+  std::unique_ptr<llvm::ToolOutputFile> output =
+      mlir::openOutputFile(outputFilename, &errorMessage);
+  if (!output) {
+    llvm::errs() << errorMessage << "\n";
+    return EXIT_FAILURE;
+  }
 
-  return mlir::asMainReturnCode(
-      mlir::MlirOptMain(newArgc, const_cast<char **>(newArgv.data()),
-                        "CudaTileToMLIR optimizer driver\n", registry));
+  // Treat the input as TileIR bytecode when the file has the ".tileirbc"
+  // extension, or (e.g. when coming from stdin) when the buffer carries the
+  // TileIR bytecode magic.
+  bool isBytecode = llvm::StringRef(inputFilename).ends_with(".tileirbc") ||
+                    mlir::cuda_tile::isTileIRBytecode(input->getMemBufferRef());
+
+  std::unique_ptr<llvm::MemoryBuffer> buffer;
+  if (isBytecode) {
+    // Decode the bytecode into a TileIR module and re-serialize it as textual
+    // MLIR so it can flow through the regular MlirOptMain processing pipeline.
+    mlir::MLIRContext context(registry);
+    context.loadAllAvailableDialects();
+    mlir::OwningOpRef<mlir::cuda_tile::ModuleOp> module =
+        mlir::cuda_tile::readBytecode(input->getMemBufferRef(), context);
+    if (!module) {
+      llvm::errs() << "failed to read TileIR bytecode from '" << inputFilename
+                   << "'\n";
+      return EXIT_FAILURE;
+    }
+    std::cout << "Successfully read TileIR bytecode from '" << inputFilename
+              << std::flush;
+
+    std::string text;
+    llvm::raw_string_ostream os(text);
+    module.get().getOperation()->print(os);
+    os.flush();
+    buffer = llvm::MemoryBuffer::getMemBufferCopy(text, inputFilename);
+  } else {
+    buffer = std::move(input);
+  }
+
+  if (failed(
+          mlir::MlirOptMain(output->os(), std::move(buffer), registry, config)))
+    return EXIT_FAILURE;
+
+  // Keep the output file if the invocation of MlirOptMain was successful.
+  output->keep();
+  return EXIT_SUCCESS;
 }
