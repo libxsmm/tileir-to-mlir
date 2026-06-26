@@ -15,7 +15,11 @@ def ConvertTileIRToMLIRPass : Pass<"convert-cuda-tile-to-mlir", "ModuleOp"> {
     Lowers CudaTile IR to a mix of GPU, vector, scf, arith, math, memref and ub
     operations. The `target` option selects the lowering flavor: `gpu` (the
     default) marks the result as a GPU container module, while `cpu` lowers
-    without the GPU container-module marker.
+    without the GPU container-module marker. `append-grid-args` controls
+    whether lowered entry functions receive six trailing `i32`
+    launch-coordinate arguments (block-id x/y/z and grid-dim x/y/z), and
+    whether dim-query ops read those arguments (`true`) or lower to gpu
+    dim-query ops (`false`, GPU target only).
   }];
   let dependentDialects = [
     "cuda_tile::CudaTileDialect",
@@ -37,6 +41,9 @@ def ConvertTileIRToMLIRPass : Pass<"convert-cuda-tile-to-mlir", "ModuleOp"> {
                          "Lower to a GPU container module"),
               clEnumValN(::mlir::CudaTileTarget::CPU, "cpu",
                          "Lower without the GPU container-module marker"))}]>,
+    Option<"appendGridArgs", "append-grid-args", "bool",
+          /*default=*/"false",
+          "Append six launch-coordinate i32 args to lowered entry signatures and source dim queries from them (required on non-GPU targets when dim-query ops are used)">,
   ];
 }
 

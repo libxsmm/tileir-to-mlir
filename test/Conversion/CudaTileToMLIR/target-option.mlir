@@ -1,8 +1,10 @@
-// RUN: cudatile-to-mlir --convert-cuda-tile-to-mlir %s | FileCheck %s --check-prefix=GPU
-// RUN: cudatile-to-mlir --convert-cuda-tile-to-mlir='target=gpu' %s | FileCheck %s --check-prefix=GPU
-// RUN: cudatile-to-mlir --convert-cuda-tile-to-mlir='target=cpu' %s | FileCheck %s --check-prefix=CPU
+// RUN: cudatile-to-mlir --convert-cuda-tile-to-mlir='append-grid-args=false' %s | FileCheck %s --check-prefix=GPU
+// RUN: cudatile-to-mlir --convert-cuda-tile-to-mlir='target=gpu append-grid-args=false' %s | FileCheck %s --check-prefix=GPU
+// RUN: cudatile-to-mlir --convert-cuda-tile-to-mlir='target=cpu append-grid-args=true' %s | FileCheck %s --check-prefix=CPU
 
 // Verifies the `target` option of convert-cuda-tile-to-mlir.
+// append-grid-args is set explicitly per RUN line so this test isolates target
+// behavior.
 //
 //  * target=gpu (the default) wraps the kernels in a gpu.module that is marked
 //    as a GPU container module, lowers each `entry` to a `gpu.func` kernel and
@@ -32,10 +34,11 @@
 // GPU:             gpu.grid_dim x
 // GPU:             gpu.return
 // GPU:           }
-//   In GPU mode, arith rounding-mode attrs remain natively represented.
+//   Rounding is kept natively when representable and preserved as
+//   tir-dropped-rounding otherwise (same policy on both targets).
 // GPU:           gpu.func @rounding(%[[FX:.*]]: f32, %[[FY:.*]]: f32, %[[IX:.*]]: i32, %[[IY:.*]]: i32) kernel {
 // GPU:             arith.addf %[[FX]], %[[FY]]
-// GPU:             arith.divf %[[FX]], %[[FY]]
+// GPU:             arith.divf %[[FX]], %[[FY]] {"tir-dropped-rounding" = "zero"}
 // GPU:             arith.truncf %[[FX]] to_nearest_even
 // GPU:             arith.fptosi %[[FX]]
 // GPU:             arith.sitofp %[[IX]]
@@ -70,16 +73,14 @@
 // CPU:           arith.addi %[[S0]], %[[E0]]
 // CPU:           return
 // CPU:         }
-//   In CPU mode, rounding is always preserved via tir-dropped-rounding.
+//   CPU follows the same representable-vs-dropped rounding policy.
 // CPU:         func.func @rounding(%[[FX:.*]]: f32, %[[FY:.*]]: f32, %[[IX:.*]]: i32, %[[IY:.*]]: i32, %{{.*}}: i32, %{{.*}}: i32, %{{.*}}: i32, %{{.*}}: i32, %{{.*}}: i32, %{{.*}}: i32) {
-// CPU:           arith.addf %[[FX]], %[[FY]] {"tir-dropped-rounding" = "nearest_even"}
+// CPU:           arith.addf %[[FX]], %[[FY]]
 // CPU:           arith.divf %[[FX]], %[[FY]] {"tir-dropped-rounding" = "zero"}
-// CPU:           arith.truncf %[[FX]] {{.*}}{"tir-dropped-rounding" = "nearest_even"}
-// CPU:           arith.fptosi %[[FX]] {{.*}}{"tir-dropped-rounding" = "nearest_int_to_zero"}
-// CPU:           arith.sitofp %[[IX]] {{.*}}{"tir-dropped-rounding" = "nearest_even"}
-// CPU:           arith.divsi %[[IX]], %[[IY]] {"tir-dropped-rounding" = "zero"}
-// CPU-NOT:       to_nearest_even
-// CPU-NOT:       toward_zero
+// CPU:           arith.truncf %[[FX]] to_nearest_even
+// CPU:           arith.fptosi %[[FX]]
+// CPU:           arith.sitofp %[[IX]]
+// CPU:           arith.divsi %[[IX]], %[[IY]]
 // CPU:           return
 // CPU:         }
 // CPU-NOT:     gpu.func

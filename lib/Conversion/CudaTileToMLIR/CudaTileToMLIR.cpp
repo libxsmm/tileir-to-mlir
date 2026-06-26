@@ -363,6 +363,16 @@ static void preserveDroppedRounding(OpBuilder &builder,
       builder.getStringAttr(cuda_tile::stringifyRoundingMode(rounding)));
 }
 
+/// Attach `tir-dropped-rounding` when the source rounding mode is not
+/// represented by the lowered target op.
+static void
+preserveDroppedRoundingIfUnsupported(OpBuilder &builder,
+                                     cuda_tile::RoundingMode rounding,
+                                     bool isRepresented, Operation *newOp) {
+  if (!isRepresented)
+    preserveDroppedRounding(builder, rounding, newOp);
+}
+
 /// Map cuda_tile integer-overflow flags to arith integer-overflow flags.
 static arith::IntegerOverflowFlags
 mapIntegerOverflowFlags(cuda_tile::IntegerOverflow overflow) {
@@ -580,45 +590,32 @@ struct ConvertUnaryApproxMathOp : public OpConversionPattern<SrcOp> {
 
 /// Convert float binary ops to arith float ops.
 ///
-/// The cuda_tile rounding mode is mapped onto the arith op's rounding-mode
-/// attribute when a direct equivalent exists; the pattern bails when it does
-/// not. `flush_to_zero` has no arith equivalent and is preserved on the result
-/// op as the discardable attribute `tir-dropped-flush-to-zero`.
+/// On current supported LLVM versions these arith ops do not expose a
+/// rounding-mode attribute, so only the default nearest-even behavior is
+/// represented natively; other rounding modes are preserved as
+/// `tir-dropped-rounding`. `flush_to_zero` has no arith equivalent and is
+/// preserved as `tir-dropped-flush-to-zero`.
 template <typename SrcOp, typename DstOp>
 struct ConvertBinaryFloatOp : public OpConversionPattern<SrcOp> {
-  ConvertBinaryFloatOp(const TypeConverter &tc, MLIRContext *ctx,
-                       CudaTileTarget target)
-      : OpConversionPattern<SrcOp>(tc, ctx), target(target) {}
+  using OpConversionPattern<SrcOp>::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(SrcOp op,
                   typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    arith::RoundingModeAttr roundingAttr;
-    if (target == CudaTileTarget::GPU) {
-      auto arithRounding = mapRoundingModeToArith(op.getRoundingMode());
-      if (!arithRounding)
-        return rewriter.notifyMatchFailure(
-            op, "rounding mode has no arith equivalent");
-      roundingAttr =
-          arith::RoundingModeAttr::get(rewriter.getContext(), *arithRounding);
-    }
+    auto rounding = op.getRoundingMode();
+    bool roundingRepresented =
+        rounding == cuda_tile::RoundingMode::NEAREST_EVEN;
     bool ftz = op.getFlushToZero();
     auto fmAttr = arith::FastMathFlagsAttr::get(rewriter.getContext(),
                                                 arith::FastMathFlags::none);
-    // Older LLVM: arith float binary ops have no rounding-mode attribute.
-    // auto newOp = rewriter.template replaceOpWithNewOp<DstOp>(
-    //     op, adaptor.getLhs(), adaptor.getRhs(), fmAttr, roundingAttr);
-    (void)roundingAttr;
     auto newOp = rewriter.template replaceOpWithNewOp<DstOp>(
         op, adaptor.getLhs(), adaptor.getRhs(), fmAttr);
-    if (target == CudaTileTarget::CPU)
-      preserveDroppedRounding(rewriter, op.getRoundingMode(), newOp);
+    preserveDroppedRoundingIfUnsupported(rewriter, rounding,
+                                         roundingRepresented, newOp);
     preserveDroppedFlushToZero(rewriter, ftz, newOp);
     return success();
   }
-
-  CudaTileTarget target;
 };
 
 /// Convert integer binary ops that carry overflow flags (addi, subi, shli).
@@ -659,26 +656,22 @@ struct ConvertBinaryLhsRhsOp : public OpConversionPattern<SrcOp> {
 ///   - cuda_tile.ftoi  -> arith.fptosi / arith.fptoui
 ///   - cuda_tile.itof  -> arith.sitofp / arith.uitofp
 ///
-///   1. Require the source op rounding mode to match `ExpectedRounding`.
+///   1. Lower to the cast op regardless of source rounding mode.
+///   2. If the source rounding mode differs from `ExpectedRounding`, preserve
+///      it as `tir-dropped-rounding`.
 ///   2. Convert the destination tile type (`to`) via the type converter.
 ///   3. Dispatch by signedness to the signed/unsigned arith destination op.
 template <typename SrcOp, typename SignedDstOp, typename UnsignedDstOp,
           cuda_tile::RoundingMode ExpectedRounding>
 struct ConvertFromToSignednessCastWithRoundingOp
     : public OpConversionPattern<SrcOp> {
-  ConvertFromToSignednessCastWithRoundingOp(const TypeConverter &tc,
-                                            MLIRContext *ctx,
-                                            CudaTileTarget target)
-      : OpConversionPattern<SrcOp>(tc, ctx), target(target) {}
+  using OpConversionPattern<SrcOp>::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(SrcOp op,
                   typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (target == CudaTileTarget::GPU &&
-        op.getRoundingMode() != ExpectedRounding)
-      return rewriter.notifyMatchFailure(op,
-                                         "unsupported rounding mode for cast");
+    bool roundingRepresented = op.getRoundingMode() == ExpectedRounding;
 
     auto resultTy =
         getConvertedResultTypeOrFail(op, this->getTypeConverter(), rewriter,
@@ -698,12 +691,10 @@ struct ConvertFromToSignednessCastWithRoundingOp
                       op, resultTy.value(), adaptor.getFrom())
                   .getOperation();
 
-    if (target == CudaTileTarget::CPU)
-      preserveDroppedRounding(rewriter, op.getRoundingMode(), newOp);
+    preserveDroppedRoundingIfUnsupported(rewriter, op.getRoundingMode(),
+                                         roundingRepresented, newOp);
     return success();
   }
-
-  CudaTileTarget target;
 };
 
 /// Convert cuda_tile terminators (continue / yield) to scf.yield.
@@ -721,12 +712,10 @@ struct ConvertToScfYield : public OpConversionPattern<SrcOp> {
   }
 };
 
-/// Layout of the six trailing launch-coordinate arguments that the CPU target
-/// appends to every lowered entry function (see ConvertEntry). They appear in
-/// the order: tile block id x/y/z, then grid dim x/y/z. The GPU target instead
-/// obtains these from gpu.block_id / gpu.grid_dim, so it adds no extra
-/// arguments.
-struct CpuLaunchArgLayout {
+/// Layout of the six trailing launch-coordinate arguments appended when
+/// `append-grid-args=true` (see ConvertEntry). They appear in
+/// the order: tile block id x/y/z, then grid dim x/y/z.
+struct AppendedGridArgLayout {
   /// Total number of trailing launch-coordinate arguments.
   static constexpr unsigned kNumArgs = 6;
   /// Offset of the tile-block-id triple from the start of the launch
@@ -736,7 +725,8 @@ struct CpuLaunchArgLayout {
   /// coordinates.
   static constexpr unsigned kGridDimBase = 3;
 
-  /// Look up the CPU function-argument index carrying the value for the query
+  /// Look up the appended function-argument index carrying the value for the
+  /// query
   /// whose triple starts at offset `argBase` (kBlockIdBase or kGridDimBase)
   /// along `dim`.
   static unsigned argIndex(unsigned numArgs, unsigned argBase,
@@ -760,15 +750,19 @@ struct CpuLaunchArgLayout {
 ///   - GPU: three GPU dimension-query ops (x, y, z), e.g.
 ///     get_tile_block_id -> gpu.block_id and get_num_tile_blocks ->
 ///     gpu.grid_dim.
-///   - CPU: the matching trailing function arguments, whose indices are looked
-///     up via CpuLaunchArgLayout starting at `CpuArgBase`.
+///   - appendGridArgs=true: read matching trailing function arguments,
+///     whose indices are looked up via AppendedGridArgLayout starting at
+///     `CpuArgBase`.
+///   - appendGridArgs=false: lower to gpu dimension-query ops only when
+///     `target=gpu`; otherwise fail conversion.
 ///
 /// Each result is cast to the converted result type as needed.
 template <typename SrcOp, typename GpuDimOp, unsigned CpuArgBase>
 struct ConvertDimQueryOp : public OpConversionPattern<SrcOp> {
   ConvertDimQueryOp(const TypeConverter &tc, MLIRContext *ctx,
-                    CudaTileTarget target)
-      : OpConversionPattern<SrcOp>(tc, ctx), target(target) {}
+                    CudaTileTarget target, bool appendGridArgs)
+      : OpConversionPattern<SrcOp>(tc, ctx), target(target),
+        appendGridArgs(appendGridArgs) {}
 
   LogicalResult
   matchAndRewrite(SrcOp op, typename OpConversionPattern<SrcOp>::OpAdaptor,
@@ -779,24 +773,45 @@ struct ConvertDimQueryOp : public OpConversionPattern<SrcOp> {
     if (!resultTy)
       return rewriter.notifyMatchFailure(op, "cannot convert result type");
 
-    // On CPU the launch coordinates are passed as trailing function arguments;
-    // resolve the enclosing function once.
-    func::FuncOp func;
-    if (target == CudaTileTarget::CPU) {
-      func = op->template getParentOfType<func::FuncOp>();
-      if (!func || func.getNumArguments() < CpuLaunchArgLayout::kNumArgs)
+    // When requested, source launch coordinates from trailing function
+    // arguments (for either func.func or gpu.func).
+    bool useAppendedGridArgs = appendGridArgs;
+    unsigned numFuncArgs = 0;
+    func::FuncOp parentFunc;
+    gpu::GPUFuncOp parentGpuFunc;
+    if (useAppendedGridArgs) {
+      if (auto func = op->template getParentOfType<func::FuncOp>()) {
+        parentFunc = func;
+      } else if (auto gpuFunc =
+                     op->template getParentOfType<gpu::GPUFuncOp>()) {
+        parentGpuFunc = gpuFunc;
+      }
+      if (parentFunc)
+        numFuncArgs = parentFunc.getNumArguments();
+      else if (parentGpuFunc)
+        numFuncArgs = parentGpuFunc.getNumArguments();
+
+      if ((!parentFunc && !parentGpuFunc) ||
+          numFuncArgs < AppendedGridArgLayout::kNumArgs)
         return rewriter.notifyMatchFailure(
-            op,
-            "expected enclosing func.func with launch-coordinate arguments");
+            op, "expected enclosing function with appended launch-coordinate "
+                "arguments");
     }
+
+    if (!useAppendedGridArgs && target != CudaTileTarget::GPU)
+      return rewriter.notifyMatchFailure(
+          op, "dim-query lowering on non-GPU targets requires "
+              "append-grid-args=true");
 
     SmallVector<Value, 3> results;
     for (gpu::Dimension dim :
          {gpu::Dimension::x, gpu::Dimension::y, gpu::Dimension::z}) {
-      Value raw = target == CudaTileTarget::GPU
-                      ? Value(GpuDimOp::create(rewriter, loc, dim))
-                      : Value(func.getArgument(CpuLaunchArgLayout::argIndex(
-                            func.getNumArguments(), CpuArgBase, dim)));
+      unsigned argIdx =
+          AppendedGridArgLayout::argIndex(numFuncArgs, CpuArgBase, dim);
+      Value raw = useAppendedGridArgs
+                      ? Value(parentFunc ? parentFunc.getArgument(argIdx)
+                                         : parentGpuFunc.getArgument(argIdx))
+                      : Value(GpuDimOp::create(rewriter, loc, dim));
       Value casted = castValueToType(rewriter, loc, raw, resultTy);
       if (!casted)
         return rewriter.notifyMatchFailure(
@@ -808,6 +823,7 @@ struct ConvertDimQueryOp : public OpConversionPattern<SrcOp> {
   }
 
   CudaTileTarget target;
+  bool appendGridArgs;
 };
 
 /// Convert cuda_tile.maxf/minf based on propagate_nan.
@@ -1513,15 +1529,14 @@ using ConvertCosH = ConvertUnarySourceOp<cuda_tile::CosHOp, math::CoshOp>;
 
 /// Convert cuda_tile.divf to arith.divf.
 ///
-/// The cuda_tile rounding mode is mapped onto arith.divf's rounding-mode
-/// attribute when a direct equivalent exists. `rounding<approx>` has no
-/// rounding-mode equivalent but maps to the `arcp` (allow reciprocal) FastMath
-/// flag. Any other unmapped rounding mode causes the pattern to bail.
+/// `rounding<approx>` is represented by the `arcp` (allow reciprocal) FastMath
+/// flag. The default `rounding<nearest_even>` is represented by arith.divf's
+/// default semantics. Other rounding modes are preserved as
+/// `tir-dropped-rounding`.
 /// `flush_to_zero` has no arith equivalent and is preserved on the result as
 /// `tir-dropped-flush-to-zero`.
 struct ConvertDivF : public OpConversionPattern<cuda_tile::DivFOp> {
-  ConvertDivF(const TypeConverter &tc, MLIRContext *ctx, CudaTileTarget target)
-      : OpConversionPattern(tc, ctx), target(target) {}
+  using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::DivFOp op, OpAdaptor adaptor,
@@ -1529,50 +1544,37 @@ struct ConvertDivF : public OpConversionPattern<cuda_tile::DivFOp> {
     auto rounding = op.getRoundingMode();
     bool ftz = op.getFlushToZero();
 
-    arith::RoundingModeAttr roundingAttr;
     arith::FastMathFlags fmf = arith::FastMathFlags::none;
+    bool roundingRepresented =
+        rounding == cuda_tile::RoundingMode::NEAREST_EVEN;
     if (rounding == cuda_tile::RoundingMode::APPROX) {
       // approx has no rounding-mode equivalent; map to the arcp FastMath flag.
       fmf = arith::FastMathFlags::arcp;
-    } else if (auto arithRounding = mapRoundingModeToArith(rounding)) {
-      if (target == CudaTileTarget::GPU)
-        roundingAttr =
-            arith::RoundingModeAttr::get(rewriter.getContext(), *arithRounding);
-    } else if (target == CudaTileTarget::GPU) {
-      return rewriter.notifyMatchFailure(
-          op, "rounding mode has no arith equivalent");
+      roundingRepresented = true;
     }
 
-    // Older LLVM: arith.divf has no rounding-mode attribute.
-    // auto newOp = rewriter.replaceOpWithNewOp<arith::DivFOp>(
-    //     op, adaptor.getLhs(), adaptor.getRhs(),
-    //     arith::FastMathFlagsAttr::get(rewriter.getContext(), fmf),
-    //     roundingAttr);
-    (void)roundingAttr;
     auto newOp = rewriter.replaceOpWithNewOp<arith::DivFOp>(
         op, adaptor.getLhs(), adaptor.getRhs(),
         arith::FastMathFlagsAttr::get(rewriter.getContext(), fmf));
-    if (target == CudaTileTarget::CPU)
-      preserveDroppedRounding(rewriter, rounding, newOp);
+    preserveDroppedRoundingIfUnsupported(rewriter, rounding,
+                                         roundingRepresented, newOp);
     preserveDroppedFlushToZero(rewriter, ftz, newOp);
     return success();
   }
-
-  CudaTileTarget target;
 };
 
-/// Convert cuda_tile.divi to arith.divsi/divui; rejects non-ZERO rounding.
+/// Convert cuda_tile.divi to arith.divsi/divui.
+///
+/// `rounding<zero>` is represented by the integer division semantics; other
+/// rounding modes are preserved as `tir-dropped-rounding`.
 struct ConvertDivI : public OpConversionPattern<cuda_tile::DivIOp> {
-  ConvertDivI(const TypeConverter &tc, MLIRContext *ctx, CudaTileTarget target)
-      : OpConversionPattern(tc, ctx), target(target) {}
+  using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::DivIOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (target == CudaTileTarget::GPU &&
-        op.getRounding() != cuda_tile::RoundingMode::ZERO)
-      return rewriter.notifyMatchFailure(
-          op, "only rounding<zero> (truncating) division is supported");
+    bool roundingRepresented =
+        op.getRounding() == cuda_tile::RoundingMode::ZERO;
     Operation *newOp = nullptr;
     if (op.getSignedness() == cuda_tile::Signedness::Unsigned)
       newOp = rewriter
@@ -1584,12 +1586,10 @@ struct ConvertDivI : public OpConversionPattern<cuda_tile::DivIOp> {
                   .replaceOpWithNewOp<arith::DivSIOp>(op, adaptor.getLhs(),
                                                       adaptor.getRhs())
                   .getOperation();
-    if (target == CudaTileTarget::CPU)
-      preserveDroppedRounding(rewriter, op.getRounding(), newOp);
+    preserveDroppedRoundingIfUnsupported(rewriter, op.getRounding(),
+                                         roundingRepresented, newOp);
     return success();
   }
-
-  CudaTileTarget target;
 };
 
 /// Convert cuda_tile.entry to gpu.func (gpu target) or func.func (cpu target).
@@ -1599,17 +1599,18 @@ struct ConvertDivI : public OpConversionPattern<cuda_tile::DivIOp> {
 /// `i32`). The entry body is signature-converted in place and then moved into
 /// the new function body.
 ///
-/// For the CPU target the function additionally receives six trailing `i32`
-/// arguments carrying the launch coordinates that the GPU target obtains from
-/// dimension-query ops: the three tile block ids (x, y, z) followed by the
-/// three grid dimensions (x, y, z). These follow the converted entry
-/// arguments.
+/// When `append-grid-args=true`, the function additionally receives six
+/// trailing `i32` arguments carrying launch coordinates: the three tile block
+/// ids (x, y, z) followed by the three grid dimensions (x, y, z). These follow
+/// the converted entry arguments.
 ///
 /// `optimization_hints`, when present, is preserved on the produced function as
 /// the discardable attribute `tir-dropped-optimization-hints`.
 struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
-  ConvertEntry(const TypeConverter &tc, MLIRContext *ctx, CudaTileTarget target)
-      : OpConversionPattern(tc, ctx), target(target) {}
+  ConvertEntry(const TypeConverter &tc, MLIRContext *ctx, CudaTileTarget target,
+               bool appendGridArgs)
+      : OpConversionPattern(tc, ctx), target(target),
+        appendGridArgs(appendGridArgs) {}
 
   LogicalResult
   matchAndRewrite(cuda_tile::EntryOp entryOp, OpAdaptor adaptor,
@@ -1636,10 +1637,10 @@ struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
       sigConv.addInputs(i, converted);
     }
 
-    // CPU launch coordinates are passed in as six trailing i32 arguments since
-    // gpu dimension-query ops are unavailable on that target.
-    if (target == CudaTileTarget::CPU) {
-      SmallVector<Type> launchArgTypes(CpuLaunchArgLayout::kNumArgs,
+    // Optionally append launch coordinates as six trailing i32 arguments
+    // (block id x/y/z then grid dim x/y/z), used by dim-query lowerings.
+    if (appendGridArgs) {
+      SmallVector<Type> launchArgTypes(AppendedGridArgLayout::kNumArgs,
                                        IntegerType::get(ctx, 32));
       funcArgTypes.append(launchArgTypes.begin(), launchArgTypes.end());
       sigConv.addInputs(launchArgTypes);
@@ -1678,6 +1679,7 @@ struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
   }
 
   CudaTileTarget target;
+  bool appendGridArgs;
 };
 
 using ConvertExp = ConvertUnarySourceOp<cuda_tile::ExpOp, math::ExpOp>;
@@ -2028,13 +2030,12 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
 ///     widening is exact); the source rounding mode is preserved on the result
 ///     as the discardable attribute `tir-dropped-rounding`.
 ///   - Narrowing uses arith.truncf, which carries a rounding-mode attribute, so
-///     the source rounding mode is mapped onto it; the pattern bails when the
-///     cuda_tile rounding mode has no direct arith equivalent.
+///     the source rounding mode is mapped onto it when possible and preserved
+///     as `tir-dropped-rounding` otherwise.
 ///
 /// Works for both scalar float and vector<float> types.
 struct ConvertFToF : public OpConversionPattern<cuda_tile::FToFOp> {
-  ConvertFToF(const TypeConverter &tc, MLIRContext *ctx, CudaTileTarget target)
-      : OpConversionPattern(tc, ctx), target(target) {}
+  using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::FToFOp op, OpAdaptor adaptor,
@@ -2077,29 +2078,27 @@ struct ConvertFToF : public OpConversionPattern<cuda_tile::FToFOp> {
       return success();
     }
     if (srcWidth > dstWidth) {
-      // arith.truncf carries a rounding-mode attribute; map it directly and
-      // bail when there is no equivalent.
+      // arith.truncf carries a rounding-mode attribute; map it when possible
+      // and preserve non-representable modes as a discardable annotation.
       auto arithRounding = mapRoundingModeToArith(op.getRoundingMode());
-      if (target == CudaTileTarget::GPU && !arithRounding)
-        return rewriter.notifyMatchFailure(
-            op, "ftof rounding mode has no arith.truncf equivalent");
       arith::RoundingModeAttr roundingAttr;
-      if (target == CudaTileTarget::GPU && arithRounding)
+      bool roundingRepresented = false;
+      if (arithRounding) {
         roundingAttr =
             arith::RoundingModeAttr::get(rewriter.getContext(), *arithRounding);
+        roundingRepresented = true;
+      }
       auto truncOp = rewriter.replaceOpWithNewOp<arith::TruncFOp>(
           op, resultTy.value(), adaptor.getFrom(), roundingAttr,
           /*fastmath=*/arith::FastMathFlagsAttr{});
-      if (target == CudaTileTarget::CPU)
-        preserveDroppedRounding(rewriter, op.getRoundingMode(), truncOp);
+      preserveDroppedRoundingIfUnsupported(rewriter, op.getRoundingMode(),
+                                           roundingRepresented, truncOp);
       return success();
     }
 
     return rewriter.notifyMatchFailure(op,
                                        "ftof source/result widths must differ");
   }
-
-  CudaTileTarget target;
 };
 
 using ConvertFToI = ConvertFromToSignednessCastWithRoundingOp<
@@ -2239,7 +2238,7 @@ struct ConvertGetIndexSpaceShape
 
 using ConvertGetNumTileBlocks =
     ConvertDimQueryOp<cuda_tile::GetNumTileBlocksOp, gpu::GridDimOp,
-                      CpuLaunchArgLayout::kGridDimBase>;
+                      AppendedGridArgLayout::kGridDimBase>;
 
 /// Convert cuda_tile.get_tensor_shape.
 ///
@@ -2302,7 +2301,7 @@ struct ConvertGetTensorShape
 
 using ConvertGetTileBlockId =
     ConvertDimQueryOp<cuda_tile::GetTileBlockIdOp, gpu::BlockIdOp,
-                      CpuLaunchArgLayout::kBlockIdBase>;
+                      AppendedGridArgLayout::kBlockIdBase>;
 
 /// Convert cuda_tile.global to memref.global.
 ///
@@ -3934,34 +3933,36 @@ static void populateTileIRToMLIRTypeConverter(TypeConverter &converter,
 /// Register all cuda_tile -> gpu/vector conversion patterns.
 static void populateTileIRToMLIRConversionPatterns(TypeConverter &converter,
                                                    RewritePatternSet &patterns,
-                                                   CudaTileTarget target) {
+                                                   CudaTileTarget target,
+                                                   bool appendGridArgs) {
   MLIRContext *ctx = patterns.getContext();
   // Target-dependent patterns select gpu vs func ops (module / entry / return)
   // and gpu dim-query ops vs leading function arguments (block id / grid dim).
-  patterns.add<ConvertEntry, ConvertModule, ConvertReturn,
-               ConvertGetNumTileBlocks, ConvertGetTileBlockId>(converter, ctx,
-                                                               target);
-  patterns.add<ConvertAddF, ConvertDivF, ConvertDivI, ConvertFToF, ConvertFToI,
-               ConvertIToF, ConvertMulF, ConvertSubF>(converter, ctx, target);
+  patterns.add<ConvertEntry>(converter, ctx, target, appendGridArgs);
+  patterns.add<ConvertGetNumTileBlocks, ConvertGetTileBlockId>(
+      converter, ctx, target, appendGridArgs);
+  patterns.add<ConvertModule, ConvertReturn>(converter, ctx, target);
   patterns.add<
-      ConvertAbsF, ConvertAbsI, ConvertAddI, ConvertAlloca, ConvertAndI,
-      ConvertAssume, ConvertAtan2, ConvertBitcast, ConvertBroadcast, ConvertCat,
-      ConvertCeil, ConvertCmpF, ConvertCmpI, ConvertConstant, ConvertContinue,
-      ConvertCos, ConvertCosH, ConvertAtomicRMWTko, ConvertExp, ConvertExp2,
-      ConvertExtI, ConvertExtract, ConvertFloor, ConvertFma, ConvertFor,
-      ConvertGetGlobal, ConvertGetIndexSpaceShape, ConvertGetTensorShape,
-      ConvertGlobal, ConvertIf, ConvertIota, ConvertJoinTokens,
-      ConvertLoadPtrTkoRanked, ConvertLoadPtrTkoScalar, ConvertLoadViewTko,
-      ConvertLog, ConvertLog2, ConvertMakeGatherScatterView,
+      ConvertAbsF, ConvertAbsI, ConvertAddF, ConvertAddI, ConvertAlloca,
+      ConvertAndI, ConvertAssume, ConvertAtan2, ConvertBitcast,
+      ConvertBroadcast, ConvertCat, ConvertCeil, ConvertCmpF, ConvertCmpI,
+      ConvertConstant, ConvertContinue, ConvertCos, ConvertCosH, ConvertDivF,
+      ConvertDivI, ConvertAtomicRMWTko, ConvertExp, ConvertExp2, ConvertExtI,
+      ConvertExtract, ConvertFloor, ConvertFma, ConvertFor, ConvertFToF,
+      ConvertFToI, ConvertGetGlobal, ConvertGetIndexSpaceShape,
+      ConvertGetTensorShape, ConvertGlobal, ConvertIf, ConvertIota, ConvertIToF,
+      ConvertJoinTokens, ConvertLoadPtrTkoRanked, ConvertLoadPtrTkoScalar,
+      ConvertLoadViewTko, ConvertLog, ConvertLog2, ConvertMakeGatherScatterView,
       ConvertMakePartitionView, ConvertMakeStridedView, ConvertMakeTensorView,
       ConvertMakeToken, ConvertMaxF, ConvertMaxI, ConvertMinF, ConvertMinI,
-      ConvertMmaF, ConvertMmaI, ConvertMulhiI, ConvertMulI, ConvertOffsetRanked,
-      ConvertOffsetScalarPtr, ConvertNegF, ConvertNegI, ConvertOrI, ConvertPack,
-      ConvertPermute, ConvertPow, ConvertPtrToPtrCastOrFail, ConvertReduce,
-      ConvertRemF, ConvertRemI, ConvertReshape, ConvertRsqrt, ConvertScan,
-      ConvertSelect, ConvertShLI, ConvertShRI, ConvertSin, ConvertSinH,
-      ConvertSqrt, ConvertStorePtrTkoRanked, ConvertStorePtrTkoScalar,
-      ConvertStoreViewTko, ConvertSubI, ConvertTan, ConvertTanH, ConvertTruncI,
+      ConvertMmaF, ConvertMmaI, ConvertMulF, ConvertMulhiI, ConvertMulI,
+      ConvertOffsetRanked, ConvertOffsetScalarPtr, ConvertNegF, ConvertNegI,
+      ConvertOrI, ConvertPack, ConvertPermute, ConvertPow,
+      ConvertPtrToPtrCastOrFail, ConvertReduce, ConvertRemF, ConvertRemI,
+      ConvertReshape, ConvertRsqrt, ConvertScan, ConvertSelect, ConvertShLI,
+      ConvertShRI, ConvertSin, ConvertSinH, ConvertSqrt,
+      ConvertStorePtrTkoRanked, ConvertStorePtrTkoScalar, ConvertStoreViewTko,
+      ConvertSubF, ConvertSubI, ConvertTan, ConvertTanH, ConvertTruncI,
       ConvertUnpack, ConvertXOrI, ConvertYield>(converter, ctx);
 }
 
@@ -3982,14 +3983,15 @@ struct ConvertTileIRToMLIRPass
     populateTileIRToMLIRTypeConverter(typeConverter, ctx, target);
 
     RewritePatternSet patterns(ctx);
-    populateTileIRToMLIRConversionPatterns(typeConverter, patterns, target);
+    populateTileIRToMLIRConversionPatterns(typeConverter, patterns, target,
+                                           appendGridArgs);
 
     ConversionTarget conversionTarget(*ctx);
 
     // GPU/vector/arith/scf/memref/ub/func ops are legal.
     if (target == CudaTileTarget::GPU)
       conversionTarget.addLegalDialect<gpu::GPUDialect>();
-    else
+    if (target == CudaTileTarget::CPU)
       conversionTarget.addLegalDialect<func::FuncDialect>();
     conversionTarget.addLegalDialect<arith::ArithDialect, math::MathDialect,
                                      memref::MemRefDialect, scf::SCFDialect,
