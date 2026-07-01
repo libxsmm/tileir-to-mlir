@@ -350,7 +350,7 @@ cuda_tile.module @ops_module {
     // CHECK: %[[NEGI_IN:.*]] = arith.constant dense<[0, 1, 2, 3]> : vector<4xi16>
     %source = constant <i16: [0, 1, 2, 3]> : tile<4xi16>
     // CHECK: %[[NEGI_ZERO:.*]] = arith.constant dense<0> : vector<4xi16>
-    // CHECK: %[[NEGI_R:.*]] = arith.subi %[[NEGI_ZERO]], %[[NEGI_IN]] {"tir-dropped-overflow" = "none"} : vector<4xi16>
+    // CHECK: %[[NEGI_R:.*]] = arith.subi %[[NEGI_ZERO]], %[[NEGI_IN]] : vector<4xi16>
     %result = negi %source : tile<4xi16>
     return
   }

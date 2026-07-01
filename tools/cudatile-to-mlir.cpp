@@ -6,6 +6,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Conversion/CudaTileToMLIR/ConvertMemrefArgsToPtrArgs.h"
+#include "mlir/Conversion/CudaTileToMLIR/ConvertMemrefArgsToRankedMemref.h"
 #include "mlir/Conversion/CudaTileToMLIR/CudaTileToMLIR.h"
 #include "mlir/Conversion/CudaTileToMLIR/TileIRPtrToView.h"
 
@@ -21,12 +22,14 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Pass/PassOptions.h"
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 #include "mlir/Transforms/Passes.h"
 
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Process.h"
@@ -35,8 +38,6 @@
 
 #include "cuda_tile/Bytecode/Reader/BytecodeReader.h"
 #include "cuda_tile/Dialect/CudaTile/IR/Dialect.h"
-
-#include <iostream>
 
 int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
@@ -56,6 +57,43 @@ int main(int argc, char **argv) {
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return mlir::createConvertMemrefArgsToPtrArgsPass();
   });
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::createConvertMemrefArgsToRankedMemrefPass();
+  });
+
+  // Composed pipeline covering the common path: raise Triton-style pointer
+  // arithmetic to view ops, then lower CudaTile IR to MLIR. The target and
+  // append-grid-args options are forwarded to the core conversion pass. The
+  // arg-promotion passes are intentionally left out because they are a
+  // situational, mutually-exclusive ABI-shaping choice the caller adds
+  // explicitly.
+  struct CudaTileToMLIRPipelineOptions
+      : public mlir::PassPipelineOptions<CudaTileToMLIRPipelineOptions> {
+    Option<mlir::CudaTileTarget> target{
+        *this, "target", llvm::cl::desc("Lowering target ('gpu' or 'cpu')"),
+        llvm::cl::init(mlir::CudaTileTarget::GPU),
+        llvm::cl::values(
+            clEnumValN(mlir::CudaTileTarget::GPU, "gpu",
+                       "Lower to a GPU container module"),
+            clEnumValN(mlir::CudaTileTarget::CPU, "cpu",
+                       "Lower without the GPU container-module marker"))};
+    Option<bool> appendGridArgs{
+        *this, "append-grid-args",
+        llvm::cl::desc("Append six launch-coordinate i32 args to lowered entry "
+                       "signatures and source dim queries from them"),
+        llvm::cl::init(false)};
+  };
+  mlir::PassPipelineRegistration<CudaTileToMLIRPipelineOptions>(
+      "cuda-tile-to-mlir-pipeline",
+      "Raise Triton pointer arithmetic to view ops, then lower CudaTile IR to "
+      "GPU/vector/scf/arith/memref ops.",
+      [](mlir::OpPassManager &pm, const CudaTileToMLIRPipelineOptions &opts) {
+        pm.addPass(mlir::createTileIRPtrToViewPass());
+        mlir::ConvertTileIRToMLIRPassOptions passOpts;
+        passOpts.target = opts.target;
+        passOpts.appendGridArgs = opts.appendGridArgs;
+        pm.addPass(mlir::createConvertTileIRToMLIRPass(passOpts));
+      });
 
   mlir::registerTransformsPasses();
 
@@ -103,6 +141,10 @@ int main(int argc, char **argv) {
   if (isBytecode) {
     // Decode the bytecode into a TileIR module and re-serialize it as textual
     // MLIR so it can flow through the regular MlirOptMain processing pipeline.
+    // Round-tripping through text (rather than handing MlirOptMain the parsed
+    // module directly) is intentional: it keeps a single IR-entry path through
+    // MlirOptMain and lets all of its standard options (--split-input-file,
+    // diagnostics, etc.) apply uniformly to both textual and bytecode inputs.
     mlir::MLIRContext context(registry);
     context.loadAllAvailableDialects();
     mlir::OwningOpRef<mlir::cuda_tile::ModuleOp> module =
@@ -112,8 +154,6 @@ int main(int argc, char **argv) {
                    << "'\n";
       return EXIT_FAILURE;
     }
-    std::cout << "Successfully read TileIR bytecode from '" << inputFilename
-              << std::flush;
 
     std::string text;
     llvm::raw_string_ostream os(text);

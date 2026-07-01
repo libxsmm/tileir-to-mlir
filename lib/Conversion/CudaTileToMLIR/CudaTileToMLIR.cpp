@@ -2,144 +2,21 @@
 //
 // Conversion pass from CudaTile IR to GPU/vector/scf/arith/memref ops.
 //
+// The patterns registered in populateTileIRToMLIRConversionPatterns are the
+// authoritative list of supported ops. Any cuda_tile op left without a pattern
+// stays illegal and makes the pass fail with a conversion diagnostic.
+//
+// A few ops are intentionally not lowered because they have no faithful
+// representation in the target dialects; they must be removed by an earlier
+// pass or are rejected here: AssertOp, AtomicCASTkoOp, AtomicRedViewTkoOp,
+// BreakOp, IntToPtrOp, LoopOp, MakeGatherScatterViewOp, MmafScaledOp,
+// PrintTkoOp, PtrToIntOp.
+//
+// Pointer-tile accesses (LoadPtrTkoOp, StorePtrTkoOp, AtomicRMWTkoOp) are only
+// lowered for scalar/rank-0 pointers; higher-rank pointer accesses must first
+// be raised to view ops by the --tileir-ptr-to-view pass.
+//
 //===----------------------------------------------------------------------===//
-
-// cuda_tile ops with registered conversion patterns in this pass:
-// cuda_tile::AbsFOp
-// cuda_tile::AbsIOp
-// cuda_tile::AddFOp
-// cuda_tile::AddIOp
-// cuda_tile::AllocOp
-// cuda_tile::AndIOp
-// cuda_tile::AssumeOp
-// cuda_tile::Atan2Op
-// cuda_tile::AtomicRMWTkoOp (scalar/rank-0 only; higher-rank requires
-// --tileir-ptr-to-view)
-// cuda_tile::BitcastOp
-// cuda_tile::BroadcastOp
-// cuda_tile::CatOp
-// cuda_tile::CeilOp
-// cuda_tile::CmpFOp
-// cuda_tile::CmpIOp
-// cuda_tile::ConstantOp
-// cuda_tile::ContinueOp
-// cuda_tile::CosOp
-// cuda_tile::CosHOp
-// cuda_tile::DivFOp
-// cuda_tile::DivIOp
-// cuda_tile::EntryOp
-// cuda_tile::ExpOp
-// cuda_tile::Exp2Op
-// cuda_tile::ExtIOp
-// cuda_tile::ExtractOp
-// cuda_tile::FloorOp
-// cuda_tile::FmaOp
-// cuda_tile::ForOp
-// cuda_tile::FToFOp
-// cuda_tile::FToIOp
-// cuda_tile::GetGlobalOp
-// cuda_tile::GetTensorShapeOp
-// cuda_tile::GetIndexSpaceShapeOp
-// cuda_tile::GetNumTileBlocksOp
-// cuda_tile::GetTileBlockIdOp
-// cuda_tile::GlobalOp
-// cuda_tile::IToFOp
-// cuda_tile::IfOp
-// cuda_tile::IotaOp
-// cuda_tile::JoinTokensOp
-// cuda_tile::LoadPtrTkoOp (scalar/rank-0 only; higher-rank requires
-// --tileir-ptr-to-view) cuda_tile::LoadViewTkoOp cuda_tile::LogOp
-// cuda_tile::Log2Op
-// cuda_tile::MakePartitionViewOp
-// cuda_tile::MakeStridedViewOp
-// cuda_tile::MakeTensorViewOp
-// cuda_tile::MakeTokenOp
-// cuda_tile::MaxFOp
-// cuda_tile::MaxIOp
-// cuda_tile::MinFOp
-// cuda_tile::MinIOp
-// cuda_tile::MmaFOp
-// cuda_tile::MmaIOp
-// cuda_tile::ModuleOp
-// cuda_tile::MulFOp
-// cuda_tile::MulhiIOp
-// cuda_tile::MulIOp
-// cuda_tile::NegFOp
-// cuda_tile::NegIOp
-// cuda_tile::OrIOp
-// cuda_tile::PackOp
-// cuda_tile::PermuteOp
-// cuda_tile::PowOp
-// cuda_tile::PtrToPtrOp
-// cuda_tile::ReduceOp
-// cuda_tile::RemFOp
-// cuda_tile::RemIOp
-// cuda_tile::ReshapeOp
-// cuda_tile::ReturnOp
-// cuda_tile::RsqrtOp
-// cuda_tile::ScanOp
-// cuda_tile::SelectOp
-// cuda_tile::ShLIOp
-// cuda_tile::ShRIOp
-// cuda_tile::SinOp
-// cuda_tile::SinHOp
-// cuda_tile::SqrtOp
-// cuda_tile::StorePtrTkoOp (scalar/rank-0 only; higher-rank requires
-// --tileir-ptr-to-view) cuda_tile::StoreViewTkoOp cuda_tile::SubFOp
-// cuda_tile::SubIOp
-// cuda_tile::TanOp
-// cuda_tile::TanHOp
-// cuda_tile::TruncIOp
-// cuda_tile::UnpackOp
-// cuda_tile::XOrIOp
-// cuda_tile::YieldOp
-//
-// cuda_tile ops without a registered conversion pattern in this pass:
-// cuda_tile::AssertOp
-// cuda_tile::AtomicCASTkoOp
-// cuda_tile::AtomicRedViewTkoOp
-// cuda_tile::BreakOp
-// cuda_tile::IntToPtrOp
-// cuda_tile::LoopOp
-// cuda_tile::MakeGatherScatterViewOp
-// cuda_tile::MmafScaledOp
-// cuda_tile::OffsetOp
-// cuda_tile::PrintTkoOp
-// cuda_tile::PtrToIntOp
-
-// Notes:
-// MmafScaledOp: ff no direct lowering (like to Xe) exists, a fallback would be
-//   1. vector.broadcast + vector.shape_cast the scale tile to the operand's K
-//   extent (infer V = K / scaleK, bail if not exact),
-//   2. arith.scaling_extf %operand, %broadcastScale : <…lowp…>, <…f8E8M0FNU…>
-//   to <…f32…>, then feed the two f32 results plus acc into the existing
-//   buildMmaContractionSpec + vector.contract path used by ConvertMmaF.
-//
-// make_gather_scatter_view
-// This cannot be expressed as a single vector.transfer_read/write. Along
-// sparse_dim, each of the N rows of the result tile comes from an independent
-// base index supplied by the 1-D index tile — i.e. a gather (load) / scatter
-// (store), not a contiguous slice. Type converter + make-pattern: same as
-// strided — map GatherScatterViewType → memref of tensor_view and forward the
-// memref. (Cheap.) A dedicated lowering for load_view_tko / store_view_tko when
-// the view is gather/scatter. The transfer-plan abstraction does not fit.
-// Realistic options: Loop over the sparse dimension: for each row r, compute
-// base = sparseIndex[r] * tensorStride[sparse_dim] plus the scalar offsets of
-// the other dims, do a vector.transfer_read/write of the remaining (dense)
-// sub-tile, and vector.insert/extract it into/out of the result tile. Masking
-// for OOB rows uses the existing padding-value logic.
-// vector.gather/vector.scatter with a computed index vector: build a
-// per-element index vector from the 1-D sparse index broadcast across the dense
-// dims plus an iota for the dense dims; this mirrors how the pointer-tile load
-// (ConvertLoadPtrTko...) is handled. More compact but the index-vector
-// construction is fiddly. get_index_space_shape: the sparse dim's extent is
-// driven by the gather-index count / tile shape rather than the tensor dim; the
-// dense dims use the partition formula. Needs its own branch. verifyIndices
-// shape: the converter must accept a 1-D index tile at sparse_dim (the current
-// code assumes scalar indices everywhere) and thread it through to the
-// gather/scatter. This is substantially more work than strided and warrants its
-// own pattern (e.g. ConvertGatherScatterLoad/Store) rather than being folded
-// into the shared transfer plan.
 
 #include "mlir/Conversion/CudaTileToMLIR/CudaTileToMLIR.h"
 
@@ -155,6 +32,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 
@@ -390,7 +268,25 @@ mapIntegerOverflowFlags(cuda_tile::IntegerOverflow overflow) {
   return arith::IntegerOverflowFlags::none;
 }
 
+/// Attach the discardable `tir-dropped-overflow` string attribute to `newOp`
+/// when the source carried a meaningful (non-`none`) integer-overflow flag that
+/// the lowered op does not represent. `none` carries no information, so it is
+/// not recorded.
+static void preserveDroppedOverflow(OpBuilder &builder,
+                                    cuda_tile::IntegerOverflow overflow,
+                                    Operation *newOp) {
+  if (overflow == cuda_tile::IntegerOverflow::NONE)
+    return;
+  newOp->setAttr(
+      "tir-dropped-overflow",
+      builder.getStringAttr(cuda_tile::stringifyIntegerOverflow(overflow)));
+}
+
 /// Cast between index and integer types when required by lowered ops.
+///
+/// Returns a null Value if the cast is not supported (only index<->integer and
+/// the identity case are handled). Callers must check the result and bail (via
+/// notifyMatchFailure) on null.
 static Value castValueToType(OpBuilder &builder, Location loc, Value value,
                              Type targetType) {
   if (value.getType() == targetType)
@@ -435,6 +331,19 @@ static SmallVector<int64_t> getReducedVectorShape(VectorType sourceType,
                              sourceType.getShape().end());
   shape.erase(shape.begin() + dim);
   return shape;
+}
+
+/// Rebuild `denseAttr` as a DenseElementsAttr of `newType`, preserving its
+/// values and splat-ness. Used to move a constant payload between container
+/// types with the same element count (e.g. tile->vector or tile->tensor).
+static DenseElementsAttr retypeDenseElements(DenseElementsAttr denseAttr,
+                                             ShapedType newType) {
+  if (denseAttr.isSplat())
+    return DenseElementsAttr::get(newType,
+                                  denseAttr.getSplatValue<Attribute>());
+  SmallVector<Attribute> values(denseAttr.getValues<Attribute>().begin(),
+                                denseAttr.getValues<Attribute>().end());
+  return DenseElementsAttr::get(newType, values);
 }
 
 /// Build the ranked memref type corresponding to a cuda_tile.global
@@ -1034,6 +943,14 @@ struct ConvertBinaryLhsRhsWithSignednessOp : public OpConversionPattern<SrcOp> {
 };
 
 /// Validate shared load/store_tko constraints before lowering.
+///
+/// load/store_tko lower to *non-atomic* memref.load/memref.store, which provide
+/// no ordering guarantees. Accepting anything stronger than `weak` (e.g.
+/// acquire/release) would therefore silently weaken the program's semantics, so
+/// such ordering is rejected rather than dropped. This differs deliberately
+/// from atomic_rmw_tko, whose target op (memref.atomic_rmw) is acq_rel and thus
+/// always at least as strong as the requested ordering, allowing it to accept
+/// and merely annotate the dropped ordering/scope.
 template <typename TkoOp>
 static LogicalResult checkCommonTkoGuards(TkoOp op,
                                           ConversionPatternRewriter &rewriter) {
@@ -1506,15 +1423,7 @@ struct ConvertConstant : public OpConversionPattern<cuda_tile::ConstantOp> {
       // Tile -> vector constant (splat or dense), emitted directly as
       // arith.constant with a DenseElementsAttr of the target vector type.
       auto vecTy = cast<VectorType>(resultType);
-      DenseElementsAttr vecAttr;
-      if (denseVal.isSplat()) {
-        vecAttr =
-            DenseElementsAttr::get(vecTy, denseVal.getSplatValue<Attribute>());
-      } else {
-        SmallVector<Attribute> attrs(denseVal.getValues<Attribute>().begin(),
-                                     denseVal.getValues<Attribute>().end());
-        vecAttr = DenseElementsAttr::get(vecTy, attrs);
-      }
+      DenseElementsAttr vecAttr = retypeDenseElements(denseVal, vecTy);
       rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, vecTy, vecAttr);
     }
     return success();
@@ -2342,15 +2251,8 @@ struct ConvertGlobal : public OpConversionPattern<cuda_tile::GlobalOp> {
             op, "global initializer must be a dense elements attribute when "
                 "retyping is required");
 
-      if (denseAttr.isSplat()) {
-        normalizedInitAttr = ElementsAttr(DenseElementsAttr::get(
-            tensorTy, denseAttr.getSplatValue<Attribute>()));
-      } else {
-        SmallVector<Attribute> values(denseAttr.getValues<Attribute>().begin(),
-                                      denseAttr.getValues<Attribute>().end());
-        normalizedInitAttr =
-            ElementsAttr(DenseElementsAttr::get(tensorTy, values));
-      }
+      normalizedInitAttr =
+          ElementsAttr(retypeDenseElements(denseAttr, tensorTy));
     }
 
     IntegerAttr alignmentAttr;
@@ -2625,11 +2527,20 @@ struct ConvertMakeGatherScatterView
 /// divergent use and defeat that promotion, leaving the argument unranked and
 /// the enclosing `func.func` unconvertible under the bare-pointer calling
 /// convention.
+///
+/// The short-circuit is restricted to entry-block arguments of function-like
+/// ops. A pointer carried as a loop/region iter-arg (e.g. an `scf.for` body
+/// argument) may hold a non-zero, pre-shifted offset, so it must go through the
+/// metadata path instead of being assumed zero.
 static OpFoldResult
 recoverUnrankedPtrOffset(ConversionPatternRewriter &rewriter, Location loc,
                          Value unrankedBase) {
-  if (isa<BlockArgument>(unrankedBase))
-    return rewriter.getIndexAttr(0);
+  if (auto blockArg = dyn_cast<BlockArgument>(unrankedBase)) {
+    Operation *parentOp = blockArg.getOwner()->getParentOp();
+    if (blockArg.getOwner()->isEntryBlock() &&
+        isa_and_nonnull<FunctionOpInterface>(parentOp))
+      return rewriter.getIndexAttr(0);
+  }
   auto unrankedTy = cast<UnrankedMemRefType>(unrankedBase.getType());
   auto rankedTy = get1DDynamicOffsetMemRefType(unrankedTy.getElementType(),
                                                ShapedType::kDynamic,
@@ -2985,9 +2896,7 @@ struct ConvertNegI : public OpConversionPattern<cuda_tile::NegIOp> {
     Value zero = arith::ConstantOp::create(rewriter, op.getLoc(), ty, zeroAttr);
     auto newOp = rewriter.replaceOpWithNewOp<arith::SubIOp>(
         op, zero, adaptor.getSource());
-    newOp->setAttr(
-        "tir-dropped-overflow",
-        rewriter.getStringAttr(cuda_tile::stringifyIntegerOverflow(overflow)));
+    preserveDroppedOverflow(rewriter, overflow, newOp);
     return success();
   }
 };
@@ -3374,9 +3283,13 @@ mapAtomicRMWMode(cuda_tile::AtomicRMWMode mode) {
 /// Both ops return the value read at the location before the update, so the
 /// result maps directly. The `memory_ordering_semantics` and `memory_scope`
 /// attributes have no representation on memref.atomic_rmw (which lowers to an
-/// acq_rel LLVM atomicrmw with no scope); they are preserved on the result as
-/// the discardable attributes `tir-dropped-memory-ordering` and
-/// `tir-dropped-memory-scope`.
+/// acq_rel LLVM atomicrmw with no scope). Because acq_rel is at least as strong
+/// as any requested ordering, dropping the request is conservatively safe (it
+/// can only over-synchronize, never under-synchronize); the original values are
+/// preserved on the result as the discardable attributes
+/// `tir-dropped-memory-ordering` and `tir-dropped-memory-scope`. This is why,
+/// unlike the non-atomic load/store_tko lowerings (see checkCommonTkoGuards),
+/// atomic_rmw_tko accepts any ordering rather than rejecting non-`weak`.
 ///
 /// Higher-rank atomics are not lowered in this pass.
 struct ConvertAtomicRMWTko
@@ -3390,15 +3303,20 @@ struct ConvertAtomicRMWTko
     if (!tileTy.getShape().empty())
       return rewriter.notifyMatchFailure(
           op, "only scalar (rank-0) atomic_rmw_tko is supported here");
-    if (auto mask = op.getMask())
-      if (!mask.getType().getShape().empty() ||
-          !mask.getDefiningOp<cuda_tile::ConstantOp>() ||
-          !mask.getDefiningOp<cuda_tile::ConstantOp>()
-               .getValue()
-               .getValues<llvm::APInt>()[0]
-               .getBoolValue())
+    if (auto mask = op.getMask()) {
+      // Only a statically-true scalar mask can be dropped here; a dynamic or
+      // possibly-false mask would require a predicated atomic we cannot
+      // represent. A rank-0 mask constant is always splat, so reading the
+      // splat value is safe once we know it is a scalar constant.
+      auto maskCst = mask.getDefiningOp<cuda_tile::ConstantOp>();
+      bool maskStaticallyTrue =
+          mask.getType().getShape().empty() && maskCst &&
+          maskCst.getValue().isSplat() &&
+          maskCst.getValue().getSplatValue<llvm::APInt>().getBoolValue();
+      if (!maskStaticallyTrue)
         return rewriter.notifyMatchFailure(
             op, "masked scalar atomic_rmw_tko is not supported");
+    }
     if (!op.getResultToken().use_empty())
       return rewriter.notifyMatchFailure(
           op, "result_token has live uses; this lowering drops the token");
@@ -4011,7 +3929,11 @@ struct ConvertTileIRToMLIRPass
     // same tile size, the round-trip collapses. The divui result may be
     // wrapped in index_cast ops, and the two `c` operands may be distinct
     // constant ops with the same value.
-    module.walk([](arith::MulIOp op) {
+    //
+    // Collect the rewrites first and apply them afterwards: erasing the op
+    // currently being visited would invalidate the walker's iterator.
+    SmallVector<std::pair<arith::MulIOp, Value>> mulFolds;
+    module.walk([&](arith::MulIOp op) {
       for (auto [mulOperand, otherOperand] :
            {std::pair(op.getLhs(), op.getRhs()),
             std::pair(op.getRhs(), op.getLhs())}) {
@@ -4022,19 +3944,21 @@ struct ConvertTileIRToMLIRPass
         if (!divOp)
           continue;
         if (divOp.getRhs() == otherOperand) {
-          op.replaceAllUsesWith(divOp.getLhs());
-          op->erase();
+          mulFolds.emplace_back(op, divOp.getLhs());
           return;
         }
         auto divCst = divOp.getRhs().getDefiningOp<arith::ConstantIndexOp>();
         auto mulCst = otherOperand.getDefiningOp<arith::ConstantIndexOp>();
         if (divCst && mulCst && divCst.value() == mulCst.value()) {
-          op.replaceAllUsesWith(divOp.getLhs());
-          op->erase();
+          mulFolds.emplace_back(op, divOp.getLhs());
           return;
         }
       }
     });
+    for (auto [mulOp, replacement] : mulFolds) {
+      mulOp.replaceAllUsesWith(replacement);
+      mulOp->erase();
+    }
 
     // Erase unrealized_conversion_casts left dead by pattern application,
     // to a fixed point.

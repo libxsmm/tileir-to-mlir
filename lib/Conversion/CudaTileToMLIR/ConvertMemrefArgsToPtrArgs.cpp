@@ -26,6 +26,7 @@
 
 #include "mlir/Conversion/CudaTileToMLIR/ConvertMemrefArgsToPtrArgs.h"
 
+#include "ArgPromotionUtils.h"
 #include "mlir/Conversion/LLVMCommon/MemRefBuilder.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -52,22 +53,8 @@ using namespace mlir;
 
 namespace {
 
-/// Returns `true` iff changing `func`'s signature is safe, i.e. the function is
-/// not referenced (called / launched) from within its nearest symbol table.
-/// In-module references would be invalidated by a signature change, so such
-/// functions are left untouched. A non-`SymbolOpInterface` or an unresolved
-/// use set is treated conservatively as "unsafe".
-static bool signatureChangeIsSafe(FunctionOpInterface func) {
-  auto symbol = dyn_cast<SymbolOpInterface>(func.getOperation());
-  if (!symbol)
-    return false;
-  Operation *symbolTableOp = func->getParentWithTrait<OpTrait::SymbolTable>();
-  if (!symbolTableOp)
-    return false;
-  std::optional<SymbolTable::UseRange> uses =
-      SymbolTable::getSymbolUses(func.getOperation(), symbolTableOp);
-  return uses && uses->empty();
-}
+using cudatile::isStaticZero;
+using cudatile::signatureChangeIsSafe;
 
 /// If `arg` is an unranked-memref argument whose every use is a `memref.cast`
 /// or `memref.reinterpret_cast` of that exact argument, collect those casts
@@ -123,12 +110,6 @@ static Value materializeIndex(OpBuilder &builder, Location loc,
   if (val.getType() == indexTy)
     return val;
   return arith::IndexCastOp::create(builder, loc, indexTy, val);
-}
-
-/// Returns `true` if `ofr` is a statically-known zero.
-static bool isStaticZero(OpFoldResult ofr) {
-  auto attr = dyn_cast<Attribute>(ofr);
-  return attr && cast<IntegerAttr>(attr).getInt() == 0;
 }
 
 /// Computes the descriptor layout for `cast` -- an unranked->ranked

@@ -76,6 +76,41 @@ def ConvertMemrefArgsToPtrArgsPass : Pass<"convert-memref-args-to-ptr-args", "Mo
   ];
 }
 
+def ConvertMemrefArgsToRankedMemrefPass : Pass<"convert-memref-args-to-ranked-memref", "ModuleOp"> {
+  let summary = "Promote unranked memref kernel args to ranked memrefs";
+  let description = [{
+    Rewrites function-like kernel signatures produced by
+    `--convert-cuda-tile-to-mlir` from unranked memref pointer arguments plus
+    scalar shape/stride arguments into ranked memref arguments.
+
+    For each unranked memref argument (`memref<*xT>`), the pass matches the
+    canonical pattern where every use is an identical
+    `memref.reinterpret_cast` to the same ranked result type. The argument type
+    is updated to that ranked memref type and the redundant reinterpret casts
+    are erased.
+
+    Scalar arguments that were originally used to materialize the matched
+    cast's dynamic sizes/strides are rewritten to equivalent memref queries:
+      * dynamic shape -> `memref.dim`
+      * dynamic stride -> `memref.extract_strided_metadata`
+    Once all uses are rewritten, such scalar arguments are removed from the
+    signature.
+
+    The rewrite is conservative and skips any function where changing the
+    signature would invalidate in-module symbol users.
+  }];
+  let options = [
+    Option<"removeUnused", "remove-unused", "bool", "true",
+           "Remove arguments that have no uses after the conversion">,
+  ];
+  let dependentDialects = [
+    "memref::MemRefDialect",
+    "func::FuncDialect",
+    "arith::ArithDialect",
+    "gpu::GPUDialect",
+  ];
+}
+
 def TileIRPtrToViewPass : Pass<"tileir-ptr-to-view", "ModuleOp"> {
   let summary = "Rewrite Triton-style cuda_tile ptr-arithmetic into "
                 "make_tensor_view + make_partition_view + load/store_view_tko";

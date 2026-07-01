@@ -1,4 +1,5 @@
 add_library(CudaTileToMLIR STATIC
+  ConvertMemrefArgsToRankedMemref.cpp
   ConvertMemrefArgsToPtrArgs.cpp
   CudaTileToMLIR.cpp
   TileIRPtrToView.cpp
