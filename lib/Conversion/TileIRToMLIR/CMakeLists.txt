@@ -1,13 +1,13 @@
-add_library(CudaTileToMLIR STATIC
+add_library(TileIRToMLIR STATIC
   ConvertMemrefArgsToRankedMemref.cpp
   ConvertMemrefArgsToPtrArgs.cpp
-  CudaTileToMLIR.cpp
+  TileIRToMLIR.cpp
   TileIRPtrToView.cpp
 )
 
-add_dependencies(CudaTileToMLIR MLIRCudaTileToMLIRConversionPassIncGen)
+add_dependencies(TileIRToMLIR MLIRTileIRToMLIRConversionPassIncGen)
 
-target_link_libraries(CudaTileToMLIR
+target_link_libraries(TileIRToMLIR
   PRIVATE
   MLIRArithDialect
   MLIRFuncDialect

@@ -4,11 +4,11 @@
 // function body immediately reinterprets those arguments with a fixed ranked
 // layout and forwards scalar shape/stride arguments into the cast.
 //
-// This pass is intended to run after --convert-cuda-tile-to-mlir.
+// This pass is intended to run after --convert-tileir-to-mlir.
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Conversion/CudaTileToMLIR/ConvertMemrefArgsToRankedMemref.h"
+#include "mlir/Conversion/TileIRToMLIR/ConvertMemrefArgsToRankedMemref.h"
 
 #include "ArgPromotionUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -30,15 +30,15 @@
 
 namespace mlir {
 #define GEN_PASS_DEF_CONVERTMEMREFARGSTORANKEDMEMREFPASS
-#include "mlir/Conversion/CudaTileToMLIR/Passes.h.inc"
+#include "mlir/Conversion/TileIRToMLIR/Passes.h.inc"
 } // namespace mlir
 
 using namespace mlir;
 
 namespace {
 
-using cudatile::isStaticZero;
-using cudatile::signatureChangeIsSafe;
+using tileir::isStaticZero;
+using tileir::signatureChangeIsSafe;
 
 /// Returns true when `lhs` and `rhs` are identical reinterpret_casts for this
 /// transform: same result type and identical mixed offset/size/stride

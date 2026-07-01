@@ -1,5 +1,5 @@
-// RUN: cudatile-to-mlir --convert-cuda-tile-to-mlir='target=gpu' %s | FileCheck %s --check-prefix=GPU
-// RUN: cudatile-to-mlir --convert-cuda-tile-to-mlir='target=cpu' %s | FileCheck %s --check-prefix=CPU
+// RUN: tileir-to-mlir --convert-tileir-to-mlir='target=gpu' %s | FileCheck %s --check-prefix=GPU
+// RUN: tileir-to-mlir --convert-tileir-to-mlir='target=cpu' %s | FileCheck %s --check-prefix=CPU
 
 // The host (CPU) target has no tf32 type, so the type converter lowers tf32
 // tile element types to f32.  The GPU target keeps tf32 unchanged.  The tf32

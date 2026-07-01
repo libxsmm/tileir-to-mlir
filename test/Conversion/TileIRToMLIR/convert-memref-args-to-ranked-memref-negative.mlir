@@ -1,4 +1,4 @@
-// RUN: cudatile-to-mlir --convert-memref-args-to-ranked-memref=remove-unused=false %s | FileCheck %s
+// RUN: tileir-to-mlir --convert-memref-args-to-ranked-memref=remove-unused=false %s | FileCheck %s
 
 // Verifies conservative behavior:
 // 1) referenced functions are not rewritten (signature-change safety),

@@ -1,4 +1,4 @@
-// RUN: cudatile-to-mlir --convert-cuda-tile-to-mlir --verify-diagnostics %s
+// RUN: tileir-to-mlir --convert-tileir-to-mlir --verify-diagnostics %s
 
 // The `global` variant of cuda_tile.alloca (the second case in the Ops.td
 // mlirExample) marks the returned address as shareable across tile threads.

@@ -1,8 +1,8 @@
-// RUN: cudatile-to-mlir --convert-cuda-tile-to-mlir='append-grid-args=false' %s | FileCheck %s --check-prefix=GPU
-// RUN: cudatile-to-mlir --convert-cuda-tile-to-mlir='target=gpu append-grid-args=false' %s | FileCheck %s --check-prefix=GPU
-// RUN: cudatile-to-mlir --convert-cuda-tile-to-mlir='target=cpu append-grid-args=true' %s | FileCheck %s --check-prefix=CPU
+// RUN: tileir-to-mlir --convert-tileir-to-mlir='append-grid-args=false' %s | FileCheck %s --check-prefix=GPU
+// RUN: tileir-to-mlir --convert-tileir-to-mlir='target=gpu append-grid-args=false' %s | FileCheck %s --check-prefix=GPU
+// RUN: tileir-to-mlir --convert-tileir-to-mlir='target=cpu append-grid-args=true' %s | FileCheck %s --check-prefix=CPU
 
-// Verifies the `target` option of convert-cuda-tile-to-mlir.
+// Verifies the `target` option of convert-tileir-to-mlir.
 // append-grid-args is set explicitly per RUN line so this test isolates target
 // behavior.
 //

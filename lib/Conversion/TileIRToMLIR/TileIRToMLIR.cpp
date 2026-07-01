@@ -1,6 +1,6 @@
-//===- TileIRToMLIR.cpp - CudaTile IR to MLIR conversion --------*- C++ -*-===//
+//===- TileIRToMLIR.cpp - Tile IR to MLIR conversion --------*- C++ -*-===//
 //
-// Conversion pass from CudaTile IR to GPU/vector/scf/arith/memref ops.
+// Conversion pass from Tile IR to GPU/vector/scf/arith/memref ops.
 //
 // The patterns registered in populateTileIRToMLIRConversionPatterns are the
 // authoritative list of supported ops. Any cuda_tile op left without a pattern
@@ -18,7 +18,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Conversion/CudaTileToMLIR/CudaTileToMLIR.h"
+#include "mlir/Conversion/TileIRToMLIR/TileIRToMLIR.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -44,7 +44,7 @@
 
 namespace mlir {
 #define GEN_PASS_DEF_CONVERTTILEIRTOMLIRPASS
-#include "mlir/Conversion/CudaTileToMLIR/Passes.h.inc"
+#include "mlir/Conversion/TileIRToMLIR/Passes.h.inc"
 } // namespace mlir
 
 using namespace mlir;
@@ -669,7 +669,7 @@ struct AppendedGridArgLayout {
 template <typename SrcOp, typename GpuDimOp, unsigned CpuArgBase>
 struct ConvertDimQueryOp : public OpConversionPattern<SrcOp> {
   ConvertDimQueryOp(const TypeConverter &tc, MLIRContext *ctx,
-                    CudaTileTarget target, bool appendGridArgs)
+                    TileIRTarget target, bool appendGridArgs)
       : OpConversionPattern<SrcOp>(tc, ctx), target(target),
         appendGridArgs(appendGridArgs) {}
 
@@ -707,7 +707,7 @@ struct ConvertDimQueryOp : public OpConversionPattern<SrcOp> {
                 "arguments");
     }
 
-    if (!useAppendedGridArgs && target != CudaTileTarget::GPU)
+    if (!useAppendedGridArgs && target != TileIRTarget::GPU)
       return rewriter.notifyMatchFailure(
           op, "dim-query lowering on non-GPU targets requires "
               "append-grid-args=true");
@@ -731,7 +731,7 @@ struct ConvertDimQueryOp : public OpConversionPattern<SrcOp> {
     return success();
   }
 
-  CudaTileTarget target;
+  TileIRTarget target;
   bool appendGridArgs;
 };
 
@@ -1516,7 +1516,7 @@ struct ConvertDivI : public OpConversionPattern<cuda_tile::DivIOp> {
 /// `optimization_hints`, when present, is preserved on the produced function as
 /// the discardable attribute `tir-dropped-optimization-hints`.
 struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
-  ConvertEntry(const TypeConverter &tc, MLIRContext *ctx, CudaTileTarget target,
+  ConvertEntry(const TypeConverter &tc, MLIRContext *ctx, TileIRTarget target,
                bool appendGridArgs)
       : OpConversionPattern(tc, ctx), target(target),
         appendGridArgs(appendGridArgs) {}
@@ -1565,7 +1565,7 @@ struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
     if (failed(convertedBlock))
       return failure();
 
-    if (target == CudaTileTarget::GPU) {
+    if (target == TileIRTarget::GPU) {
       // GPU: lower to a gpu.func kernel and merge the converted body into its
       // (auto-created) entry block.
       auto gpuFunc =
@@ -1587,7 +1587,7 @@ struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
     return success();
   }
 
-  CudaTileTarget target;
+  TileIRTarget target;
   bool appendGridArgs;
 };
 
@@ -2035,8 +2035,8 @@ struct ConvertGetGlobal : public OpConversionPattern<cuda_tile::GetGlobalOp> {
                                          "referenced global symbol not found");
 
     FailureOr<MemRefType> rankedMemRefTy = failure();
-    if (auto cudaGlobal = dyn_cast<cuda_tile::GlobalOp>(symbolOp)) {
-      rankedMemRefTy = getGlobalMemRefTypeOrFail(cudaGlobal, rewriter, op);
+    if (auto tileirGlobal = dyn_cast<cuda_tile::GlobalOp>(symbolOp)) {
+      rankedMemRefTy = getGlobalMemRefTypeOrFail(tileirGlobal, rewriter, op);
     } else if (auto memrefGlobal = dyn_cast<memref::GlobalOp>(symbolOp)) {
       auto memrefTy = dyn_cast<MemRefType>(memrefGlobal.getType());
       if (!memrefTy)
@@ -2740,17 +2740,16 @@ struct ConvertMmaI : public OpConversionPattern<cuda_tile::MmaIOp> {
 /// inlined into the enclosing module (the builtin.module the pass runs on) and
 /// the cuda_tile.module wrapper is erased.
 struct ConvertModule : public OpConversionPattern<cuda_tile::ModuleOp> {
-  ConvertModule(const TypeConverter &tc, MLIRContext *ctx,
-                CudaTileTarget target)
+  ConvertModule(const TypeConverter &tc, MLIRContext *ctx, TileIRTarget target)
       : OpConversionPattern(tc, ctx), target(target) {}
 
   LogicalResult
-  matchAndRewrite(cuda_tile::ModuleOp cudaMod, OpAdaptor adaptor,
+  matchAndRewrite(cuda_tile::ModuleOp tileirMod, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (target == CudaTileTarget::GPU) {
-      auto gpuMod = gpu::GPUModuleOp::create(rewriter, cudaMod.getLoc(),
-                                             cudaMod.getSymName());
-      Block *oldBody = &cudaMod.getBody().front();
+    if (target == TileIRTarget::GPU) {
+      auto gpuMod = gpu::GPUModuleOp::create(rewriter, tileirMod.getLoc(),
+                                             tileirMod.getSymName());
+      Block *oldBody = &tileirMod.getBody().front();
       Block *newBody = gpuMod.getBody();
 
       // Move ops from cuda_tile.module body into gpu.module body, inserting
@@ -2762,14 +2761,14 @@ struct ConvertModule : public OpConversionPattern<cuda_tile::ModuleOp> {
     } else {
       // Dissolve the module into the enclosing module by inlining its body
       // ops right before the cuda_tile.module op in its parent block.
-      rewriter.inlineBlockBefore(&cudaMod.getBody().front(), cudaMod);
+      rewriter.inlineBlockBefore(&tileirMod.getBody().front(), tileirMod);
     }
 
-    rewriter.eraseOp(cudaMod);
+    rewriter.eraseOp(tileirMod);
     return success();
   }
 
-  CudaTileTarget target;
+  TileIRTarget target;
 };
 
 using ConvertMulF = ConvertBinaryFloatOp<cuda_tile::MulFOp, arith::MulFOp>;
@@ -3548,21 +3547,20 @@ struct ConvertReshape : public OpConversionPattern<cuda_tile::ReshapeOp> {
 /// Convert cuda_tile.return to gpu.return (gpu target) or func.return (cpu
 /// target).
 struct ConvertReturn : public OpConversionPattern<cuda_tile::ReturnOp> {
-  ConvertReturn(const TypeConverter &tc, MLIRContext *ctx,
-                CudaTileTarget target)
+  ConvertReturn(const TypeConverter &tc, MLIRContext *ctx, TileIRTarget target)
       : OpConversionPattern(tc, ctx), target(target) {}
 
   LogicalResult
   matchAndRewrite(cuda_tile::ReturnOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (target == CudaTileTarget::GPU)
+    if (target == TileIRTarget::GPU)
       rewriter.replaceOpWithNewOp<gpu::ReturnOp>(op);
     else
       rewriter.replaceOpWithNewOp<func::ReturnOp>(op);
     return success();
   }
 
-  CudaTileTarget target;
+  TileIRTarget target;
 };
 
 /// Convert cuda_tile.rsqrt to math.rsqrt.
@@ -3777,7 +3775,7 @@ using ConvertYield = ConvertToScfYield<cuda_tile::YieldOp>;
 /// Populate type-conversion rules for cuda_tile -> gpu/vector lowering.
 static void populateTileIRToMLIRTypeConverter(TypeConverter &converter,
                                               MLIRContext *ctx,
-                                              CudaTileTarget target) {
+                                              TileIRTarget target) {
   // Fallback: keep types unchanged.
   converter.addConversion([](Type type) { return type; });
 
@@ -3792,7 +3790,7 @@ static void populateTileIRToMLIRTypeConverter(TypeConverter &converter,
 
     // CPU has no tf32 representation; lower tf32 tiles to f32 so the resulting
     // vector/arith ops are valid on the host target.
-    if (target == CudaTileTarget::CPU && isa<FloatTF32Type>(elemTy))
+    if (target == TileIRTarget::CPU && isa<FloatTF32Type>(elemTy))
       elemTy = Float32Type::get(ctx);
 
     if (shape.empty()) {
@@ -3851,7 +3849,7 @@ static void populateTileIRToMLIRTypeConverter(TypeConverter &converter,
 /// Register all cuda_tile -> gpu/vector conversion patterns.
 static void populateTileIRToMLIRConversionPatterns(TypeConverter &converter,
                                                    RewritePatternSet &patterns,
-                                                   CudaTileTarget target,
+                                                   TileIRTarget target,
                                                    bool appendGridArgs) {
   MLIRContext *ctx = patterns.getContext();
   // Target-dependent patterns select gpu vs func ops (module / entry / return)
@@ -3888,7 +3886,7 @@ static void populateTileIRToMLIRConversionPatterns(TypeConverter &converter,
 // Pass Definition
 //===----------------------------------------------------------------------===//
 
-/// Pass driver for lowering CudaTile IR to GPU/vector/scf/arith/memref.
+/// Pass driver for lowering Tile IR to GPU/vector/scf/arith/memref.
 struct ConvertTileIRToMLIRPass
     : public impl::ConvertTileIRToMLIRPassBase<ConvertTileIRToMLIRPass> {
   using Base::Base;
@@ -3907,16 +3905,16 @@ struct ConvertTileIRToMLIRPass
     ConversionTarget conversionTarget(*ctx);
 
     // GPU/vector/arith/scf/memref/ub/func ops are legal.
-    if (target == CudaTileTarget::GPU)
+    if (target == TileIRTarget::GPU)
       conversionTarget.addLegalDialect<gpu::GPUDialect>();
-    if (target == CudaTileTarget::CPU)
+    if (target == TileIRTarget::CPU)
       conversionTarget.addLegalDialect<func::FuncDialect>();
     conversionTarget.addLegalDialect<arith::ArithDialect, math::MathDialect,
                                      memref::MemRefDialect, scf::SCFDialect,
                                      ub::UBDialect, vector::VectorDialect>();
     conversionTarget.addLegalOp<UnrealizedConversionCastOp>();
 
-    // CudaTile ops are illegal (target of conversion).
+    // TileIR ops are illegal (target of conversion).
     conversionTarget.addIllegalDialect<cuda_tile::CudaTileDialect>();
 
     if (failed(applyPartialConversion(module, conversionTarget,
@@ -3978,7 +3976,7 @@ struct ConvertTileIRToMLIRPass
 
     // Mark the module as a GPU container module when targeting the GPU. For the
     // CPU target the GPU container-module marker is intentionally omitted.
-    if (target == CudaTileTarget::GPU)
+    if (target == TileIRTarget::GPU)
       module->setAttr(gpu::GPUDialect::getContainerModuleAttrName(),
                       UnitAttr::get(ctx));
   }

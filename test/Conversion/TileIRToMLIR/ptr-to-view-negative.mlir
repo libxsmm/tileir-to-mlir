@@ -1,4 +1,4 @@
-// RUN: cudatile-to-mlir --tileir-ptr-to-view --verify-diagnostics %s | FileCheck %s
+// RUN: tileir-to-mlir --tileir-ptr-to-view --verify-diagnostics %s | FileCheck %s
 
 module {
   cuda_tile.module @cuda_tile_module {

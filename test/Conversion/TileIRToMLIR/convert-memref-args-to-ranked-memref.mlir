@@ -1,5 +1,5 @@
-// RUN: cudatile-to-mlir --convert-memref-args-to-ranked-memref %s | FileCheck %s
-// RUN: cudatile-to-mlir --convert-memref-args-to-ranked-memref=remove-unused=false %s | FileCheck %s --check-prefix=KEEP
+// RUN: tileir-to-mlir --convert-memref-args-to-ranked-memref %s | FileCheck %s
+// RUN: tileir-to-mlir --convert-memref-args-to-ranked-memref=remove-unused=false %s | FileCheck %s --check-prefix=KEEP
 
 // Verifies that unranked memref kernel arguments that are always reinterpreted
 // the same way are promoted to ranked memref arguments, and scalar shape/stride

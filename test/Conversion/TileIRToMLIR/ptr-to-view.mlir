@@ -1,5 +1,5 @@
-// RUN: cudatile-to-mlir --tileir-ptr-to-view %s | FileCheck %s
-// RUN: cudatile-to-mlir --tileir-ptr-to-view --convert-cuda-tile-to-mlir %s | FileCheck %s --check-prefix=CHECK-GPU
+// RUN: tileir-to-mlir --tileir-ptr-to-view %s | FileCheck %s
+// RUN: tileir-to-mlir --tileir-ptr-to-view --convert-tileir-to-mlir %s | FileCheck %s --check-prefix=CHECK-GPU
 
 // CHECK-GPU-LABEL: gpu.module @cuda_tile_module {
 

@@ -1,4 +1,4 @@
-// RUN: cudatile-to-mlir --convert-cuda-tile-to-mlir='target=gpu append-grid-args=true' %s | FileCheck %s --check-prefix=GPU-APPEND
+// RUN: tileir-to-mlir --convert-tileir-to-mlir='target=gpu append-grid-args=true' %s | FileCheck %s --check-prefix=GPU-APPEND
 
 // Verifies append-grid-args=true behavior on GPU target:
 // trailing launch args are appended and dim queries read those args instead of

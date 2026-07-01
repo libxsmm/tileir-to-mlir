@@ -1,4 +1,4 @@
-// RUN: cudatile-to-mlir --convert-cuda-tile-to-mlir='target=cpu append-grid-args=false' --verify-diagnostics %s
+// RUN: tileir-to-mlir --convert-tileir-to-mlir='target=cpu append-grid-args=false' --verify-diagnostics %s
 
 // On non-GPU targets, dim-query ops require append-grid-args=true.
 

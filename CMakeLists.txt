@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(VectorToCudaTile LANGUAGES CXX)
+project(TileIRToMLIR LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -78,7 +78,7 @@ include(AddMLIR)
 include_directories(${LLVM_INCLUDE_DIRS})
 include_directories(${MLIR_INCLUDE_DIRS})
 
-# CudaTile dialect.
+# TileIR dialect.
 #
 # CUDA_TILE_DIR may point either at:
 #   * a cuda-tile source/build root (contains include/ + build/include + build/lib), or
@@ -167,7 +167,7 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR}/include)
 # Subdirectories
 #===----------------------------------------------------------------------===#
 
-add_subdirectory(include/mlir/Conversion/CudaTileToMLIR)
+add_subdirectory(include/mlir/Conversion/TileIRToMLIR)
 add_subdirectory(lib)
 add_subdirectory(tools)
 add_subdirectory(test)

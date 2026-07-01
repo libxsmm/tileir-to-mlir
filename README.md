@@ -1,11 +1,10 @@
-# CudaTileToMLIR
+# TileIRToMLIR
+A conversion pass and tooling to lower Tile IR to MLIR dialects, including GPU, Vector, SCF, Arith, Math, and MemRef.
 
-A conversion pass and tooling to lower CudaTile IR to MLIR dialects, including GPU, Vector, SCF, Arith, Math, and MemRef.
-
-* **`--convert-cuda-tile-to-mlir`**: Lowers CudaTile IR to a mix of standard dialects.
+* **`--convert-tileir-to-mlir`**: Lowers Tile IR to a mix of standard dialects.
   * `target={gpu|cpu}` (default: `gpu`): The `gpu` target wraps the result in a GPU container module; `cpu` lowers without the container marker.
   * `append-grid-args={true|false}` (default: `false`): If `true`, appends six `i32` launch-coordinate arguments (block-id x/y/z, grid-dim x/y/z) to entry functions and sources dimension queries from them. Required on the `cpu` target when dimension queries are present.
-* **`--cuda-tile-to-mlir-pipeline`**: A convenience pipeline that runs `--tileir-ptr-to-view` followed by `--convert-cuda-tile-to-mlir`. It forwards the `target` and `append-grid-args` options.
+* **`--tileir-to-mlir-pipeline`**: A convenience pipeline that runs `--tileir-ptr-to-view` followed by `--convert-tileir-to-mlir`. It forwards the `target` and `append-grid-args` options.
 * **`--tileir-ptr-to-view`**: Recognizes Triton-style pointer arithmetic (iota, reshape, broadcast, offset) feeding `load_ptr_tko` or `store_ptr_tko` and lifts them into higher-level "view" operations for more efficient lowering.
 * **`--convert-memref-args-to-ptr-args`**: Promotes unranked memref arguments (`memref<*xT>`) to bare `!llvm.ptr` when all uses are identical `reinterpret_cast` operations. Intended for use after the core conversion.
 * **`--convert-memref-args-to-ranked-memref`**: Promotes unranked memref kernel arguments and their associated scalar shape/stride arguments into ranked memref arguments. Intended for use after the core conversion.
@@ -18,7 +17,7 @@ A conversion pass and tooling to lower CudaTile IR to MLIR dialects, including G
 * **Ninja** (recommended)
 * **LLVM/MLIR build** with CMake package configuration (`MLIRConfig.cmake`).
   * *Note: LLVM/MLIR revision `13c00cbc2aa2ddc9aae2e72b02bc6cb2a482e0e7` is verified compatible.*
-* **`cuda-tile` build** using the same LLVM/MLIR version.
+* **`cuda-tile` build** using the same LLVM/MLIR version (https://github.com/nvidia/cuda-tile).
   * *Note:* You may need to qualify `TokenType` as `cuda_tile::TokenType` in the `cuda-tile` source to avoid naming conflicts.
 
 ## Configuration
@@ -50,7 +49,7 @@ cmake --build build
 To run the regression suite:
 
 ```bash
-cmake --build build --target check-cudatile-to-mlir
+cmake --build build --target check-tileir-to-mlir
 ```
 
 Alternatively, use the convenience alias for all configured tests:
@@ -64,13 +63,13 @@ cmake --build build --target test
 ### Basic Conversion
 
 ```bash
-build/tools/cudatile-to-mlir --convert-cuda-tile-to-mlir input.mlir
+build/tools/tileir-to-mlir --convert-tileir-to-mlir input.mlir
 ```
 
 ### Validation with FileCheck
 
 ```bash
-build/tools/cudatile-to-mlir --convert-cuda-tile-to-mlir test/Conversion/CudaTileToMLIR/cudatile-to-mlir.mlir | FileCheck test/Conversion/CudaTileToMLIR/cudatile-to-mlir.mlir
+build/tools/tileir-to-mlir --convert-tileir-to-mlir test/Conversion/TileIRToMLIR/tileir-to-mlir.mlir | FileCheck test/Conversion/TileIRToMLIR/tileir-to-mlir.mlir
 ```
 
 ### Full Pipeline with Post-Processing
@@ -78,6 +77,6 @@ build/tools/cudatile-to-mlir --convert-cuda-tile-to-mlir test/Conversion/CudaTil
 Example of a full conversion followed by common optimization passes:
 
 ```bash
-build/tools/cudatile-to-mlir --convert-cuda-tile-to-mlir test/Conversion/CudaTileToMLIR/cudatile-appendix.mlir | \
+build/tools/tileir-to-mlir --convert-tileir-to-mlir test/Conversion/TileIRToMLIR/cudatile-appendix.mlir | \
 mlir-opt --loop-invariant-code-motion -canonicalize -cse
 ```

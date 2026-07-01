@@ -1,4 +1,4 @@
-// RUN: cudatile-to-mlir --convert-memref-args-to-ptr-args %s | FileCheck %s
+// RUN: tileir-to-mlir --convert-memref-args-to-ptr-args %s | FileCheck %s
 
 // Verifies that --convert-memref-args-to-ptr-args promotes unranked-memref
 // function arguments to `!llvm.ptr`, and -- in place of each redundant

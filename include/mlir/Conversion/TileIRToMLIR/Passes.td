@@ -1,18 +1,18 @@
-//===- Passes.td - CudaTileToMLIR pass definitions ---------*- tablegen -*-===//
+//===- Passes.td - TileIRToMLIR pass definitions ---------*- tablegen -*-===//
 //
-// Pass definitions for the CudaTile IR to MLIR conversion.
+// Pass definitions for the Tile IR to MLIR conversion.
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef MLIR_CONVERSION_CUDATILETOMLIR_PASSES
-#define MLIR_CONVERSION_CUDATILETOMLIR_PASSES
+#ifndef MLIR_CONVERSION_TILEIRTOMLIR_PASSES
+#define MLIR_CONVERSION_TILEIRTOMLIR_PASSES
 
 include "mlir/Pass/PassBase.td"
 
-def ConvertTileIRToMLIRPass : Pass<"convert-cuda-tile-to-mlir", "ModuleOp"> {
-  let summary = "Convert CudaTile IR to GPU/vector/scf/arith ops";
+def ConvertTileIRToMLIRPass : Pass<"convert-tileir-to-mlir", "ModuleOp"> {
+  let summary = "Convert Tile IR to GPU/vector/scf/arith ops";
   let description = [{
-    Lowers CudaTile IR to a mix of GPU, vector, scf, arith, math, memref and ub
+    Lowers Tile IR to a mix of GPU, vector, scf, arith, math, memref and ub
     operations. The `target` option selects the lowering flavor: `gpu` (the
     default) marks the result as a GPU container module, while `cpu` lowers
     without the GPU container-module marker. `append-grid-args` controls
@@ -33,13 +33,13 @@ def ConvertTileIRToMLIRPass : Pass<"convert-cuda-tile-to-mlir", "ModuleOp"> {
     "ub::UBDialect",
   ];
   let options = [
-    Option<"target", "target", "::mlir::CudaTileTarget",
-           /*default=*/"::mlir::CudaTileTarget::GPU",
+    Option<"target", "target", "::mlir::TileIRTarget",
+           /*default=*/"::mlir::TileIRTarget::GPU",
            "Lowering target ('gpu' or 'cpu')",
            [{::llvm::cl::values(
-              clEnumValN(::mlir::CudaTileTarget::GPU, "gpu",
+              clEnumValN(::mlir::TileIRTarget::GPU, "gpu",
                          "Lower to a GPU container module"),
-              clEnumValN(::mlir::CudaTileTarget::CPU, "cpu",
+              clEnumValN(::mlir::TileIRTarget::CPU, "cpu",
                          "Lower without the GPU container-module marker"))}]>,
     Option<"appendGridArgs", "append-grid-args", "bool",
           /*default=*/"false",
@@ -80,7 +80,7 @@ def ConvertMemrefArgsToRankedMemrefPass : Pass<"convert-memref-args-to-ranked-me
   let summary = "Promote unranked memref kernel args to ranked memrefs";
   let description = [{
     Rewrites function-like kernel signatures produced by
-    `--convert-cuda-tile-to-mlir` from unranked memref pointer arguments plus
+    `--convert-tileir-to-mlir` from unranked memref pointer arguments plus
     scalar shape/stride arguments into ranked memref arguments.
 
     For each unranked memref argument (`memref<*xT>`), the pass matches the
@@ -120,11 +120,11 @@ def TileIRPtrToViewPass : Pass<"tileir-ptr-to-view", "ModuleOp"> {
     `cuda_tile.load_ptr_tko` / `cuda_tile.store_ptr_tko` and rewrites them into
     the higher-level `cuda_tile.make_tensor_view` + `cuda_tile.make_partition_view`
     + `cuda_tile.load_view_tko` / `cuda_tile.store_view_tko` form, which the
-    `convert-cuda-tile-to-mlir` pass can lower.
+    `convert-tileir-to-mlir` pass can lower.
   }];
   let dependentDialects = [
     "cuda_tile::CudaTileDialect",
   ];
 }
 
-#endif // MLIR_CONVERSION_CUDATILETOMLIR_PASSES
+#endif // MLIR_CONVERSION_TILEIRTOMLIR_PASSES

@@ -5,8 +5,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef CUDATILETOMLIR_ARGPROMOTIONUTILS_H
-#define CUDATILETOMLIR_ARGPROMOTIONUTILS_H
+#ifndef TILEIRTOMLIR_ARGPROMOTIONUTILS_H
+#define TILEIRTOMLIR_ARGPROMOTIONUTILS_H
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/OpDefinition.h"
@@ -16,7 +16,7 @@
 #include <optional>
 
 namespace mlir {
-namespace cudatile {
+namespace tileir {
 
 /// Returns `true` when `ofr` is a statically-known zero offset.
 inline bool isStaticZero(OpFoldResult ofr) {
@@ -42,7 +42,7 @@ inline bool signatureChangeIsSafe(FunctionOpInterface func) {
   return uses && uses->empty();
 }
 
-} // namespace cudatile
+} // namespace tileir
 } // namespace mlir
 
-#endif // CUDATILETOMLIR_ARGPROMOTIONUTILS_H
+#endif // TILEIRTOMLIR_ARGPROMOTIONUTILS_H

@@ -1,10 +1,10 @@
-add_executable(cudatile-to-mlir
-  cudatile-to-mlir.cpp
+add_executable(tileir-to-mlir
+  tileir-to-mlir.cpp
 )
 
-target_link_libraries(cudatile-to-mlir
+target_link_libraries(tileir-to-mlir
   PRIVATE
-  CudaTileToMLIR
+  TileIRToMLIR
   MLIROptLib
   MLIRArithDialect
   MLIRFuncDialect

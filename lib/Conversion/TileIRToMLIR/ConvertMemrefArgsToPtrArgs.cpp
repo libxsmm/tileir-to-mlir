@@ -2,7 +2,7 @@
 //
 // Promotes unranked-memref function arguments to opaque `!llvm.ptr` inputs.
 //
-// The CudaTile-to-MLIR lowering models pointer-typed kernel inputs as unranked
+// The tileir-to-mlir lowering models pointer-typed kernel inputs as unranked
 // `memref<*xT>` and recovers their rank/layout inside the body with a
 // `memref.cast` or `memref.reinterpret_cast`. When every use of such an
 // argument is one of these casts, the argument is really just an opaque
@@ -24,7 +24,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Conversion/CudaTileToMLIR/ConvertMemrefArgsToPtrArgs.h"
+#include "mlir/Conversion/TileIRToMLIR/ConvertMemrefArgsToPtrArgs.h"
 
 #include "ArgPromotionUtils.h"
 #include "mlir/Conversion/LLVMCommon/MemRefBuilder.h"
@@ -46,15 +46,15 @@
 
 namespace mlir {
 #define GEN_PASS_DEF_CONVERTMEMREFARGSTOPTRARGSPASS
-#include "mlir/Conversion/CudaTileToMLIR/Passes.h.inc"
+#include "mlir/Conversion/TileIRToMLIR/Passes.h.inc"
 } // namespace mlir
 
 using namespace mlir;
 
 namespace {
 
-using cudatile::isStaticZero;
-using cudatile::signatureChangeIsSafe;
+using tileir::isStaticZero;
+using tileir::signatureChangeIsSafe;
 
 /// If `arg` is an unranked-memref argument whose every use is a `memref.cast`
 /// or `memref.reinterpret_cast` of that exact argument, collect those casts

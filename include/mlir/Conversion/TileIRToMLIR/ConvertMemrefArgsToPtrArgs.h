@@ -6,8 +6,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef MLIR_CONVERSION_CUDATILETOMLIR_CONVERTMEMREFARGSTOPTRARGS_H
-#define MLIR_CONVERSION_CUDATILETOMLIR_CONVERTMEMREFARGSTOPTRARGS_H
+#ifndef MLIR_CONVERSION_TILEIRTOMLIR_CONVERTMEMREFARGSTOPTRARGS_H
+#define MLIR_CONVERSION_TILEIRTOMLIR_CONVERTMEMREFARGSTOPTRARGS_H
 
 #include "mlir/Pass/Pass.h"
 
@@ -16,8 +16,8 @@ class ModuleOp;
 
 /// Generated pass declarations (createConvertMemrefArgsToPtrArgsPass factory).
 #define GEN_PASS_DECL_CONVERTMEMREFARGSTOPTRARGSPASS
-#include "mlir/Conversion/CudaTileToMLIR/Passes.h.inc"
+#include "mlir/Conversion/TileIRToMLIR/Passes.h.inc"
 
 } // namespace mlir
 
-#endif // MLIR_CONVERSION_CUDATILETOMLIR_CONVERTMEMREFARGSTOPTRARGS_H
+#endif // MLIR_CONVERSION_TILEIRTOMLIR_CONVERTMEMREFARGSTOPTRARGS_H

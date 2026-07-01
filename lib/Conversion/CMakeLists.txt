@@ -1,1 +1,1 @@
-add_subdirectory(CudaTileToMLIR)
+add_subdirectory(TileIRToMLIR)

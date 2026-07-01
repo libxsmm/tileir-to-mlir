@@ -1,4 +1,4 @@
-// RUN: cudatile-to-mlir --convert-memref-args-to-ptr-args %s | FileCheck %s
+// RUN: tileir-to-mlir --convert-memref-args-to-ptr-args %s | FileCheck %s
 
 // Verifies the safety guards of --convert-memref-args-to-ptr-args: arguments are left as
 // unranked memrefs (and their reinterpret_casts kept) whenever the promotion

@@ -1,14 +1,14 @@
-//===- cudatile-to-mlir.cpp - Driver for CudaTileToMLIR pass -------------===//
+//===- tileir-to-mlir.cpp - Driver for TileIRToMLIR pass -------------===//
 //
-// Simple mlir-opt-style driver that registers the CudaTileToMLIR conversion
+// Simple mlir-opt-style driver that registers the TileIRToMLIR conversion
 // pass together with the dialects it depends on.
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Conversion/CudaTileToMLIR/ConvertMemrefArgsToPtrArgs.h"
-#include "mlir/Conversion/CudaTileToMLIR/ConvertMemrefArgsToRankedMemref.h"
-#include "mlir/Conversion/CudaTileToMLIR/CudaTileToMLIR.h"
-#include "mlir/Conversion/CudaTileToMLIR/TileIRPtrToView.h"
+#include "mlir/Conversion/TileIRToMLIR/ConvertMemrefArgsToPtrArgs.h"
+#include "mlir/Conversion/TileIRToMLIR/ConvertMemrefArgsToRankedMemref.h"
+#include "mlir/Conversion/TileIRToMLIR/TileIRPtrToView.h"
+#include "mlir/Conversion/TileIRToMLIR/TileIRToMLIR.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
@@ -62,20 +62,20 @@ int main(int argc, char **argv) {
   });
 
   // Composed pipeline covering the common path: raise Triton-style pointer
-  // arithmetic to view ops, then lower CudaTile IR to MLIR. The target and
+  // arithmetic to view ops, then lower Tile IR to MLIR. The target and
   // append-grid-args options are forwarded to the core conversion pass. The
   // arg-promotion passes are intentionally left out because they are a
   // situational, mutually-exclusive ABI-shaping choice the caller adds
   // explicitly.
-  struct CudaTileToMLIRPipelineOptions
-      : public mlir::PassPipelineOptions<CudaTileToMLIRPipelineOptions> {
-    Option<mlir::CudaTileTarget> target{
+  struct TileIRToMLIRPipelineOptions
+      : public mlir::PassPipelineOptions<TileIRToMLIRPipelineOptions> {
+    Option<mlir::TileIRTarget> target{
         *this, "target", llvm::cl::desc("Lowering target ('gpu' or 'cpu')"),
-        llvm::cl::init(mlir::CudaTileTarget::GPU),
+        llvm::cl::init(mlir::TileIRTarget::GPU),
         llvm::cl::values(
-            clEnumValN(mlir::CudaTileTarget::GPU, "gpu",
+            clEnumValN(mlir::TileIRTarget::GPU, "gpu",
                        "Lower to a GPU container module"),
-            clEnumValN(mlir::CudaTileTarget::CPU, "cpu",
+            clEnumValN(mlir::TileIRTarget::CPU, "cpu",
                        "Lower without the GPU container-module marker"))};
     Option<bool> appendGridArgs{
         *this, "append-grid-args",
@@ -83,11 +83,11 @@ int main(int argc, char **argv) {
                        "signatures and source dim queries from them"),
         llvm::cl::init(false)};
   };
-  mlir::PassPipelineRegistration<CudaTileToMLIRPipelineOptions>(
-      "cuda-tile-to-mlir-pipeline",
-      "Raise Triton pointer arithmetic to view ops, then lower CudaTile IR to "
+  mlir::PassPipelineRegistration<TileIRToMLIRPipelineOptions>(
+      "tileir-to-mlir-pipeline",
+      "Raise Triton pointer arithmetic to view ops, then lower Tile IR to "
       "GPU/vector/scf/arith/memref ops.",
-      [](mlir::OpPassManager &pm, const CudaTileToMLIRPipelineOptions &opts) {
+      [](mlir::OpPassManager &pm, const TileIRToMLIRPipelineOptions &opts) {
         pm.addPass(mlir::createTileIRPtrToViewPass());
         mlir::ConvertTileIRToMLIRPassOptions passOpts;
         passOpts.target = opts.target;
@@ -104,7 +104,7 @@ int main(int argc, char **argv) {
   // already-parsed IR to MlirOptMain.
   std::string inputFilename, outputFilename;
   std::tie(inputFilename, outputFilename) = mlir::registerAndParseCLIOptions(
-      argc, argv, "CudaTileToMLIR optimizer driver\n", registry);
+      argc, argv, "TileIRToMLIR optimizer driver\n", registry);
 
   mlir::MlirOptMainConfig config =
       mlir::MlirOptMainConfig::createFromCLOptions();
