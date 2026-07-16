@@ -477,16 +477,20 @@ struct ConvertUnaryFlushToZeroOp : public OpConversionPattern<SrcOp> {
 /// set, `flush_to_zero` is preserved as `tir-dropped-flush-to-zero`.
 template <typename SrcOp, typename DstOp, bool PreserveFtz>
 struct ConvertUnaryApproxMathOp : public OpConversionPattern<SrcOp> {
-  using OpConversionPattern<SrcOp>::OpConversionPattern;
+  ConvertUnaryApproxMathOp(const TypeConverter &tc, MLIRContext *ctx,
+                           bool dropRoundingModes)
+      : OpConversionPattern<SrcOp>(tc, ctx),
+        dropRoundingModes(dropRoundingModes) {}
 
   LogicalResult
   matchAndRewrite(SrcOp op,
                   typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto rounding = op.getRoundingMode();
-    auto fmf = (rounding == cuda_tile::RoundingMode::APPROX)
-                   ? arith::FastMathFlags::afn
-                   : arith::FastMathFlags::none;
+    auto fmf =
+        (!dropRoundingModes && rounding == cuda_tile::RoundingMode::APPROX)
+            ? arith::FastMathFlags::afn
+            : arith::FastMathFlags::none;
     auto newOp = rewriter.template replaceOpWithNewOp<DstOp>(
         op, adaptor.getSource(),
         arith::FastMathFlagsAttr::get(rewriter.getContext(), fmf));
@@ -495,6 +499,8 @@ struct ConvertUnaryApproxMathOp : public OpConversionPattern<SrcOp> {
       preserveDroppedFlushToZero(rewriter, op.getFlushToZero(), newOp);
     return success();
   }
+
+  bool dropRoundingModes;
 };
 
 /// Convert float binary ops to arith float ops.
@@ -506,7 +512,10 @@ struct ConvertUnaryApproxMathOp : public OpConversionPattern<SrcOp> {
 /// preserved as `tir-dropped-flush-to-zero`.
 template <typename SrcOp, typename DstOp>
 struct ConvertBinaryFloatOp : public OpConversionPattern<SrcOp> {
-  using OpConversionPattern<SrcOp>::OpConversionPattern;
+  ConvertBinaryFloatOp(const TypeConverter &tc, MLIRContext *ctx,
+                       bool dropRoundingModes)
+      : OpConversionPattern<SrcOp>(tc, ctx),
+        dropRoundingModes(dropRoundingModes) {}
 
   LogicalResult
   matchAndRewrite(SrcOp op,
@@ -514,7 +523,7 @@ struct ConvertBinaryFloatOp : public OpConversionPattern<SrcOp> {
                   ConversionPatternRewriter &rewriter) const override {
     auto rounding = op.getRoundingMode();
     bool roundingRepresented =
-        rounding == cuda_tile::RoundingMode::NEAREST_EVEN;
+        !dropRoundingModes && rounding == cuda_tile::RoundingMode::NEAREST_EVEN;
     bool ftz = op.getFlushToZero();
     auto fmAttr = arith::FastMathFlagsAttr::get(rewriter.getContext(),
                                                 arith::FastMathFlags::none);
@@ -525,6 +534,8 @@ struct ConvertBinaryFloatOp : public OpConversionPattern<SrcOp> {
     preserveDroppedFlushToZero(rewriter, ftz, newOp);
     return success();
   }
+
+  bool dropRoundingModes;
 };
 
 /// Convert integer binary ops that carry overflow flags (addi, subi, shli).
@@ -574,13 +585,18 @@ template <typename SrcOp, typename SignedDstOp, typename UnsignedDstOp,
           cuda_tile::RoundingMode ExpectedRounding>
 struct ConvertFromToSignednessCastWithRoundingOp
     : public OpConversionPattern<SrcOp> {
-  using OpConversionPattern<SrcOp>::OpConversionPattern;
+  ConvertFromToSignednessCastWithRoundingOp(const TypeConverter &tc,
+                                            MLIRContext *ctx,
+                                            bool dropRoundingModes)
+      : OpConversionPattern<SrcOp>(tc, ctx),
+        dropRoundingModes(dropRoundingModes) {}
 
   LogicalResult
   matchAndRewrite(SrcOp op,
                   typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    bool roundingRepresented = op.getRoundingMode() == ExpectedRounding;
+    bool roundingRepresented =
+        !dropRoundingModes && op.getRoundingMode() == ExpectedRounding;
 
     auto resultTy =
         getConvertedResultTypeOrFail(op, this->getTypeConverter(), rewriter,
@@ -604,6 +620,8 @@ struct ConvertFromToSignednessCastWithRoundingOp
                                          roundingRepresented, newOp);
     return success();
   }
+
+  bool dropRoundingModes;
 };
 
 /// Convert cuda_tile terminators (continue / yield) to scf.yield.
@@ -1445,7 +1463,8 @@ using ConvertCosH = ConvertUnarySourceOp<cuda_tile::CosHOp, math::CoshOp>;
 /// `flush_to_zero` has no arith equivalent and is preserved on the result as
 /// `tir-dropped-flush-to-zero`.
 struct ConvertDivF : public OpConversionPattern<cuda_tile::DivFOp> {
-  using OpConversionPattern::OpConversionPattern;
+  ConvertDivF(const TypeConverter &tc, MLIRContext *ctx, bool dropRoundingModes)
+      : OpConversionPattern(tc, ctx), dropRoundingModes(dropRoundingModes) {}
 
   LogicalResult
   matchAndRewrite(cuda_tile::DivFOp op, OpAdaptor adaptor,
@@ -1455,8 +1474,8 @@ struct ConvertDivF : public OpConversionPattern<cuda_tile::DivFOp> {
 
     arith::FastMathFlags fmf = arith::FastMathFlags::none;
     bool roundingRepresented =
-        rounding == cuda_tile::RoundingMode::NEAREST_EVEN;
-    if (rounding == cuda_tile::RoundingMode::APPROX) {
+        !dropRoundingModes && rounding == cuda_tile::RoundingMode::NEAREST_EVEN;
+    if (!dropRoundingModes && rounding == cuda_tile::RoundingMode::APPROX) {
       // approx has no rounding-mode equivalent; map to the arcp FastMath flag.
       fmf = arith::FastMathFlags::arcp;
       roundingRepresented = true;
@@ -1470,6 +1489,8 @@ struct ConvertDivF : public OpConversionPattern<cuda_tile::DivFOp> {
     preserveDroppedFlushToZero(rewriter, ftz, newOp);
     return success();
   }
+
+  bool dropRoundingModes;
 };
 
 /// Convert cuda_tile.divi to arith.divsi/divui.
@@ -1477,13 +1498,14 @@ struct ConvertDivF : public OpConversionPattern<cuda_tile::DivFOp> {
 /// `rounding<zero>` is represented by the integer division semantics; other
 /// rounding modes are preserved as `tir-dropped-rounding`.
 struct ConvertDivI : public OpConversionPattern<cuda_tile::DivIOp> {
-  using OpConversionPattern::OpConversionPattern;
+  ConvertDivI(const TypeConverter &tc, MLIRContext *ctx, bool dropRoundingModes)
+      : OpConversionPattern(tc, ctx), dropRoundingModes(dropRoundingModes) {}
 
   LogicalResult
   matchAndRewrite(cuda_tile::DivIOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     bool roundingRepresented =
-        op.getRounding() == cuda_tile::RoundingMode::ZERO;
+        !dropRoundingModes && op.getRounding() == cuda_tile::RoundingMode::ZERO;
     Operation *newOp = nullptr;
     if (op.getSignedness() == cuda_tile::Signedness::Unsigned)
       newOp = rewriter
@@ -1499,6 +1521,8 @@ struct ConvertDivI : public OpConversionPattern<cuda_tile::DivIOp> {
                                          roundingRepresented, newOp);
     return success();
   }
+
+  bool dropRoundingModes;
 };
 
 /// Convert cuda_tile.entry to gpu.func (gpu target) or func.func (cpu target).
@@ -1944,7 +1968,8 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
 ///
 /// Works for both scalar float and vector<float> types.
 struct ConvertFToF : public OpConversionPattern<cuda_tile::FToFOp> {
-  using OpConversionPattern::OpConversionPattern;
+  ConvertFToF(const TypeConverter &tc, MLIRContext *ctx, bool dropRoundingModes)
+      : OpConversionPattern(tc, ctx), dropRoundingModes(dropRoundingModes) {}
 
   LogicalResult
   matchAndRewrite(cuda_tile::FToFOp op, OpAdaptor adaptor,
@@ -1989,7 +2014,9 @@ struct ConvertFToF : public OpConversionPattern<cuda_tile::FToFOp> {
     if (srcWidth > dstWidth) {
       // arith.truncf carries a rounding-mode attribute; map it when possible
       // and preserve non-representable modes as a discardable annotation.
-      auto arithRounding = mapRoundingModeToArith(op.getRoundingMode());
+      auto arithRounding = dropRoundingModes
+                               ? std::optional<arith::RoundingMode>()
+                               : mapRoundingModeToArith(op.getRoundingMode());
       arith::RoundingModeAttr roundingAttr;
       bool roundingRepresented = false;
       if (arithRounding) {
@@ -2008,6 +2035,8 @@ struct ConvertFToF : public OpConversionPattern<cuda_tile::FToFOp> {
     return rewriter.notifyMatchFailure(op,
                                        "ftof source/result widths must differ");
   }
+
+  bool dropRoundingModes;
 };
 
 using ConvertFToI = ConvertFromToSignednessCastWithRoundingOp<
@@ -3850,7 +3879,8 @@ static void populateTileIRToMLIRTypeConverter(TypeConverter &converter,
 static void populateTileIRToMLIRConversionPatterns(TypeConverter &converter,
                                                    RewritePatternSet &patterns,
                                                    TileIRTarget target,
-                                                   bool appendGridArgs) {
+                                                   bool appendGridArgs,
+                                                   bool dropRoundingModes) {
   MLIRContext *ctx = patterns.getContext();
   // Target-dependent patterns select gpu vs func ops (module / entry / return)
   // and gpu dim-query ops vs leading function arguments (block id / grid dim).
@@ -3858,33 +3888,162 @@ static void populateTileIRToMLIRConversionPatterns(TypeConverter &converter,
   patterns.add<ConvertGetNumTileBlocks, ConvertGetTileBlockId>(
       converter, ctx, target, appendGridArgs);
   patterns.add<ConvertModule, ConvertReturn>(converter, ctx, target);
+  patterns.add<ConvertAddF, ConvertSubF, ConvertMulF, ConvertDivF, ConvertDivI,
+               ConvertFToF, ConvertFToI, ConvertIToF, ConvertSqrt, ConvertTanH>(
+      converter, ctx, dropRoundingModes);
   patterns.add<
-      ConvertAbsF, ConvertAbsI, ConvertAddF, ConvertAddI, ConvertAlloca,
-      ConvertAndI, ConvertAssume, ConvertAtan2, ConvertBitcast,
-      ConvertBroadcast, ConvertCat, ConvertCeil, ConvertCmpF, ConvertCmpI,
-      ConvertConstant, ConvertContinue, ConvertCos, ConvertCosH, ConvertDivF,
-      ConvertDivI, ConvertAtomicRMWTko, ConvertExp, ConvertExp2, ConvertExtI,
-      ConvertExtract, ConvertFloor, ConvertFma, ConvertFor, ConvertFToF,
-      ConvertFToI, ConvertGetGlobal, ConvertGetIndexSpaceShape,
-      ConvertGetTensorShape, ConvertGlobal, ConvertIf, ConvertIota, ConvertIToF,
-      ConvertJoinTokens, ConvertLoadPtrTkoRanked, ConvertLoadPtrTkoScalar,
-      ConvertLoadViewTko, ConvertLog, ConvertLog2, ConvertMakeGatherScatterView,
+      ConvertAbsF, ConvertAbsI, ConvertAddI, ConvertAlloca, ConvertAndI,
+      ConvertAssume, ConvertAtan2, ConvertBitcast, ConvertBroadcast, ConvertCat,
+      ConvertCeil, ConvertCmpF, ConvertCmpI, ConvertConstant, ConvertContinue,
+      ConvertCos, ConvertCosH, ConvertAtomicRMWTko, ConvertExp, ConvertExp2,
+      ConvertExtI, ConvertExtract, ConvertFloor, ConvertFma, ConvertFor,
+      ConvertGetGlobal, ConvertGetIndexSpaceShape, ConvertGetTensorShape,
+      ConvertGlobal, ConvertIf, ConvertIota, ConvertJoinTokens,
+      ConvertLoadPtrTkoRanked, ConvertLoadPtrTkoScalar, ConvertLoadViewTko,
+      ConvertLog, ConvertLog2, ConvertMakeGatherScatterView,
       ConvertMakePartitionView, ConvertMakeStridedView, ConvertMakeTensorView,
       ConvertMakeToken, ConvertMaxF, ConvertMaxI, ConvertMinF, ConvertMinI,
-      ConvertMmaF, ConvertMmaI, ConvertMulF, ConvertMulhiI, ConvertMulI,
-      ConvertOffsetRanked, ConvertOffsetScalarPtr, ConvertNegF, ConvertNegI,
-      ConvertOrI, ConvertPack, ConvertPermute, ConvertPow,
-      ConvertPtrToPtrCastOrFail, ConvertReduce, ConvertRemF, ConvertRemI,
-      ConvertReshape, ConvertRsqrt, ConvertScan, ConvertSelect, ConvertShLI,
-      ConvertShRI, ConvertSin, ConvertSinH, ConvertSqrt,
+      ConvertMmaF, ConvertMmaI, ConvertMulhiI, ConvertMulI, ConvertOffsetRanked,
+      ConvertOffsetScalarPtr, ConvertNegF, ConvertNegI, ConvertOrI, ConvertPack,
+      ConvertPermute, ConvertPow, ConvertPtrToPtrCastOrFail, ConvertReduce,
+      ConvertRemF, ConvertRemI, ConvertReshape, ConvertRsqrt, ConvertScan,
+      ConvertSelect, ConvertShLI, ConvertShRI, ConvertSin, ConvertSinH,
       ConvertStorePtrTkoRanked, ConvertStorePtrTkoScalar, ConvertStoreViewTko,
-      ConvertSubF, ConvertSubI, ConvertTan, ConvertTanH, ConvertTruncI,
-      ConvertUnpack, ConvertXOrI, ConvertYield>(converter, ctx);
+      ConvertSubI, ConvertTan, ConvertTruncI, ConvertUnpack, ConvertXOrI,
+      ConvertYield>(converter, ctx);
 }
 
 //===----------------------------------------------------------------------===//
 // Pass Definition
 //===----------------------------------------------------------------------===//
+
+/// Pre-conversion cleanup: strips token-typed loop-carried values from
+/// `cuda_tile.for` because target dialects cannot represent `!cuda_tile.token`
+/// in `scf.for` iter args.
+///
+/// Stripping tokens is semantics-preserving (specifically, a conservative
+/// over-approximation) because lowered memory operations carry read/write
+/// memory effects, so program order and sequential loop execution naturally
+/// subsume token-imposed partial execution orderings. Leftover dangling
+/// references to dropped token block-args/results are mapped to dummy
+/// `make_token` ops, which are then cleaned up by normal conversion patterns.
+///
+/// NOTE: This workaround is required because `cuda_tile.for` does not implement
+/// loop/region-branch interfaces. It can be replaced or removed if proper
+/// token propagation or conversion is introduced in the future.
+static void dropLoopCarriedTokens(ModuleOp module) {
+  MLIRContext *ctx = module.getContext();
+  auto isToken = [](Type t) { return isa<cuda_tile::TokenType>(t); };
+
+  SmallVector<cuda_tile::ForOp> forOps;
+  module.walk([&](cuda_tile::ForOp op) { forOps.push_back(op); });
+
+  for (cuda_tile::ForOp forOp : forOps) {
+    unsigned numIter = forOp.getNumResults();
+    unsigned numInduction = forOp.getNumInductionVars();
+    Block *oldBody = forOp.getBody();
+
+    SmallVector<unsigned> keepIter;
+    for (unsigned i = 0; i < numIter; ++i)
+      if (!isToken(forOp.getResult(i).getType()))
+        keepIter.push_back(i);
+    if (keepIter.size() == numIter)
+      continue; // no token iter values to drop
+
+    OpBuilder builder(forOp);
+
+    // Redirect remaining uses of dropped token block arguments (e.g. a tko op's
+    // `token` operand, or a nested loop's token init) to a fresh make_token, so
+    // the body stays valid once the block argument is gone.
+    builder.setInsertionPointToStart(oldBody);
+    for (unsigned i = 0; i < numIter; ++i) {
+      if (!isToken(forOp.getResult(i).getType()))
+        continue;
+      BlockArgument arg = oldBody->getArgument(numInduction + i);
+      if (arg.use_empty())
+        continue;
+      auto tok = cuda_tile::MakeTokenOp::create(builder, forOp.getLoc(),
+                                                cuda_tile::TokenType::get(ctx));
+      arg.replaceAllUsesWith(tok.getResult());
+    }
+
+    SmallVector<Value> newInits;
+    for (unsigned i : keepIter)
+      newInits.push_back(forOp.getInitValues()[i]);
+
+    builder.setInsertionPoint(forOp);
+    auto newFor = cuda_tile::ForOp::create(
+        builder, forOp.getLoc(), forOp.getLowerBound(), forOp.getUpperBound(),
+        forOp.getStep(), newInits);
+
+    // Map old block args -> new block args (induction var + kept iter args).
+    Block *newBody = newFor.getBody();
+    oldBody->getArgument(0).replaceAllUsesWith(newBody->getArgument(0));
+    for (unsigned newIdx = 0; newIdx < keepIter.size(); ++newIdx)
+      oldBody->getArgument(numInduction + keepIter[newIdx])
+          .replaceAllUsesWith(newBody->getArgument(numInduction + newIdx));
+
+    // Splice the old body into the new one, dropping the auto-generated
+    // terminator of the freshly created body.
+    if (newBody->mightHaveTerminator())
+      newBody->getTerminator()->erase();
+    newBody->getOperations().splice(newBody->end(), oldBody->getOperations());
+
+    // Rebuild the continue to only yield the kept values.
+    auto contOp = cast<cuda_tile::ContinueOp>(newBody->getTerminator());
+    SmallVector<Value> newYields;
+    for (unsigned i : keepIter)
+      newYields.push_back(contOp.getOperand(i));
+    builder.setInsertionPoint(contOp);
+    cuda_tile::ContinueOp::create(builder, contOp.getLoc(), newYields);
+    contOp.erase();
+
+    // Redirect kept results, then redirect any remaining use of a dropped token
+    // result (e.g. carried by an enclosing loop) to a fresh make_token.
+    for (unsigned newIdx = 0; newIdx < keepIter.size(); ++newIdx)
+      forOp.getResult(keepIter[newIdx])
+          .replaceAllUsesWith(newFor.getResult(newIdx));
+    builder.setInsertionPointAfter(newFor);
+    for (unsigned i = 0; i < numIter; ++i) {
+      if (!isToken(forOp.getResult(i).getType()))
+        continue;
+      Value res = forOp.getResult(i);
+      if (res.use_empty())
+        continue;
+      auto tok = cuda_tile::MakeTokenOp::create(builder, forOp.getLoc(),
+                                                cuda_tile::TokenType::get(ctx));
+      res.replaceAllUsesWith(tok.getResult());
+    }
+
+    forOp.erase();
+  }
+}
+
+/// Disconnect straight-line TKO result-token chains before conversion.
+///
+/// The target memory operations carry side effects, and the replacement token
+/// is inserted immediately after its producer, so downstream token users stay
+/// ordered after the producing memory operation. This leaves each TKO result
+/// token unused, as required by the existing conversion patterns.
+static void dropTkoResultTokenUses(ModuleOp module) {
+  SmallVector<Value> liveTkoTokens;
+  module.walk([&](Operation *op) {
+    if (!op->getName().getStringRef().ends_with("_tko"))
+      return;
+    for (Value result : op->getResults())
+      if (isa<cuda_tile::TokenType>(result.getType()) && !result.use_empty())
+        liveTkoTokens.push_back(result);
+  });
+
+  for (Value token : liveTkoTokens) {
+    Operation *producer = token.getDefiningOp();
+    OpBuilder builder(producer);
+    builder.setInsertionPointAfter(producer);
+    auto replacement = cuda_tile::MakeTokenOp::create(
+        builder, producer->getLoc(), token.getType());
+    token.replaceAllUsesWith(replacement.getResult());
+  }
+}
 
 /// Pass driver for lowering Tile IR to GPU/vector/scf/arith/memref.
 struct ConvertTileIRToMLIRPass
@@ -3895,12 +4054,18 @@ struct ConvertTileIRToMLIRPass
     MLIRContext *ctx = &getContext();
     ModuleOp module = getOperation();
 
+    // Strip loop-carried tokens before conversion: the target dialects cannot
+    // represent `!cuda_tile.token` scf.for iter args, and the token ordering is
+    // subsumed by program order among the lowered side-effecting ops.
+    dropLoopCarriedTokens(module);
+    dropTkoResultTokenUses(module);
+
     TypeConverter typeConverter;
     populateTileIRToMLIRTypeConverter(typeConverter, ctx, target);
 
     RewritePatternSet patterns(ctx);
     populateTileIRToMLIRConversionPatterns(typeConverter, patterns, target,
-                                           appendGridArgs);
+                                           appendGridArgs, dropRoundingModes);
 
     ConversionTarget conversionTarget(*ctx);
 

@@ -19,7 +19,9 @@ def ConvertTileIRToMLIRPass : Pass<"convert-tileir-to-mlir", "ModuleOp"> {
     whether lowered entry functions receive six trailing `i32`
     launch-coordinate arguments (block-id x/y/z and grid-dim x/y/z), and
     whether dim-query ops read those arguments (`true`) or lower to gpu
-    dim-query ops (`false`, GPU target only).
+    dim-query ops (`false`, GPU target only). `drop-rounding-modes` forces all
+    lowering patterns for rounding-carrying ops to preserve source rounding
+    only as discardable `tir-dropped-rounding` attributes.
   }];
   let dependentDialects = [
     "cuda_tile::CudaTileDialect",
@@ -44,6 +46,9 @@ def ConvertTileIRToMLIRPass : Pass<"convert-tileir-to-mlir", "ModuleOp"> {
     Option<"appendGridArgs", "append-grid-args", "bool",
           /*default=*/"false",
           "Append six launch-coordinate i32 args to lowered entry signatures and source dim queries from them (required on non-GPU targets when dim-query ops are used)">,
+        Option<"dropRoundingModes", "drop-rounding-modes", "bool",
+          /*default=*/"false",
+          "Always drop source rounding-mode semantics and preserve them only as tir-dropped-rounding annotations">,
   ];
 }
 
