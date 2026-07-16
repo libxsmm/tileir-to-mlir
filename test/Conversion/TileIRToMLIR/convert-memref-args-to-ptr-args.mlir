@@ -129,3 +129,12 @@ func.func @coupled_offset(%arg0: memref<*xf32>, %arg1: i32, %arg2: i32) {
   %v = vector.transfer_read %view[%c0], %cst : memref<?xf32, strided<[1], offset: ?>>, vector<4xf32>
   return
 }
+
+// Unused pointer arguments still need signature conversion. Otherwise they
+// remain as unranked memrefs and prevent the subsequent func-to-LLVM lowering
+// from converting the enclosing function.
+// CHECK-LABEL: func.func @unused_pointer_args(
+// CHECK-SAME:    %{{[^:]+}}: !llvm.ptr, %{{[^:]+}}: !llvm.ptr, %{{[^:]+}}: !llvm.ptr, %{{[^:]+}}: i32)
+func.func @unused_pointer_args(%arg0: memref<*xbf16>, %arg1: memref<*xbf16>, %arg2: memref<*xi32>, %arg3: i32) {
+  return
+}

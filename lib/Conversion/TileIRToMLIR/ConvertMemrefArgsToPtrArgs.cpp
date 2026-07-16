@@ -5,8 +5,8 @@
 // The tileir-to-mlir lowering models pointer-typed kernel inputs as unranked
 // `memref<*xT>` and recovers their rank/layout inside the body with a
 // `memref.cast` or `memref.reinterpret_cast`. When every use of such an
-// argument is one of these casts, the argument is really just an opaque
-// pointer. This pass rewrites the signature to take a bare
+// argument is one of these casts -- or when the argument has no uses -- the
+// argument is really just an opaque pointer. This pass rewrites the signature to take a bare
 // `!llvm.ptr` and, in place of each redundant cast, builds a standard LLVM
 // memref descriptor struct from that pointer -- using the argument pointer as
 // the descriptor's base buffer and storing the cast's offset / sizes / strides
@@ -56,19 +56,19 @@ namespace {
 using tileir::isStaticZero;
 using tileir::signatureChangeIsSafe;
 
-/// If `arg` is an unranked-memref argument whose every use is a `memref.cast`
-/// or `memref.reinterpret_cast` of that exact argument, collect those casts
-/// together with their ranked result types into `casts` and return `true`.
-/// Different casts may reinterpret the argument in incompatible ways (distinct
-/// ranks, offsets or layouts); that is fine, since each cast is rebuilt
-/// independently from the recovered pointer. Returns `false` (leaving `casts`
-/// in an unspecified state) if any use is something other than such a cast, so
-/// that the unranked descriptor is never otherwise observed.
+/// If `arg` is an unranked-memref argument with no uses, or whose every use is
+/// a `memref.cast` or `memref.reinterpret_cast` of that exact argument, collect
+/// those casts together with their ranked result types into `casts` and return
+/// `true`. Different casts may reinterpret the argument in incompatible ways
+/// (distinct ranks, offsets or layouts); that is fine, since each cast is
+/// rebuilt independently from the recovered pointer. Returns `false` (leaving
+/// `casts` in an unspecified state) if any use is something other than such a
+/// cast, so that the unranked descriptor is never otherwise observed.
 static bool collectPromotableCasts(
     BlockArgument arg,
     SmallVectorImpl<std::pair<Operation *, MemRefType>> &casts) {
   auto unranked = dyn_cast<UnrankedMemRefType>(arg.getType());
-  if (!unranked || arg.use_empty())
+  if (!unranked)
     return false;
 
   for (Operation *user : arg.getUsers()) {
@@ -93,7 +93,7 @@ static bool collectPromotableCasts(
       return false;
     casts.emplace_back(user, resTy);
   }
-  return !casts.empty();
+  return true;
 }
 
 /// Materializes `ofr` as a descriptor index-typed (`i64`) value. Static folds
