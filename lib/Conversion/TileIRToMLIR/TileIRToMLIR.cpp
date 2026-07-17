@@ -2390,7 +2390,9 @@ using ConvertIToF = ConvertFromToSignednessCastWithRoundingOp<
 /// `tir-dropped-optimization-hints`.
 struct ConvertLoadViewTko
     : public OpConversionPattern<cuda_tile::LoadViewTkoOp> {
-  using OpConversionPattern::OpConversionPattern;
+  ConvertLoadViewTko(const TypeConverter &tc, MLIRContext *ctx,
+                     bool assumeInBounds)
+      : OpConversionPattern(tc, ctx), assumeInBounds(assumeInBounds) {}
 
   LogicalResult
   matchAndRewrite(cuda_tile::LoadViewTkoOp op, OpAdaptor adaptor,
@@ -2439,15 +2441,21 @@ struct ConvertLoadViewTko
       padding = arith::ConstantIntOp::create(rewriter, loc,
                                              vecTy->getElementType(), 0);
     }
+    SmallVector<bool> inBounds(vecTy->getRank(), assumeInBounds);
+    if (!assumeInBounds)
+      inBounds = plan->inBounds;
+
     auto readOp = vector::TransferReadOp::create(
         rewriter, loc, *vecTy, plan->viewInfo.memref, plan->memrefIndices,
         AffineMapAttr::get(plan->permutationMap), padding,
-        /*mask=*/Value(), rewriter.getBoolArrayAttr(plan->inBounds));
+        /*mask=*/Value(), rewriter.getBoolArrayAttr(inBounds));
     preserveDroppedOptHints(op, readOp);
 
     rewriter.replaceOp(op, {readOp.getResult(), Value()});
     return success();
   }
+
+  bool assumeInBounds;
 };
 
 using ConvertLog = ConvertUnarySourceOp<cuda_tile::LogOp, math::LogOp>;
@@ -3711,7 +3719,9 @@ using ConvertSqrt = ConvertUnaryApproxMathOp<cuda_tile::SqrtOp, math::SqrtOp,
 /// `tir-dropped-optimization-hints`.
 struct ConvertStoreViewTko
     : public OpConversionPattern<cuda_tile::StoreViewTkoOp> {
-  using OpConversionPattern::OpConversionPattern;
+  ConvertStoreViewTko(const TypeConverter &tc, MLIRContext *ctx,
+                      bool assumeInBounds)
+      : OpConversionPattern(tc, ctx), assumeInBounds(assumeInBounds) {}
 
   LogicalResult
   matchAndRewrite(cuda_tile::StoreViewTkoOp op, OpAdaptor adaptor,
@@ -3732,16 +3742,22 @@ struct ConvertStoreViewTko
     if (failed(plan))
       return failure();
 
+    SmallVector<bool> inBounds(vecTy->getRank(), assumeInBounds);
+    if (!assumeInBounds)
+      inBounds = plan->inBounds;
+
     auto writeOp = vector::TransferWriteOp::create(
         rewriter, loc, /*resultTypes=*/TypeRange{}, adaptor.getTile(),
         plan->viewInfo.memref, plan->memrefIndices,
         AffineMapAttr::get(plan->permutationMap),
-        /*mask=*/Value(), rewriter.getBoolArrayAttr(plan->inBounds));
+        /*mask=*/Value(), rewriter.getBoolArrayAttr(inBounds));
     preserveDroppedOptHints(op, writeOp);
 
     rewriter.eraseOp(op);
     return success();
   }
+
+  bool assumeInBounds;
 };
 
 using ConvertSubF = ConvertBinaryFloatOp<cuda_tile::SubFOp, arith::SubFOp>;
@@ -3876,11 +3892,9 @@ static void populateTileIRToMLIRTypeConverter(TypeConverter &converter,
 }
 
 /// Register all cuda_tile -> gpu/vector conversion patterns.
-static void populateTileIRToMLIRConversionPatterns(TypeConverter &converter,
-                                                   RewritePatternSet &patterns,
-                                                   TileIRTarget target,
-                                                   bool appendGridArgs,
-                                                   bool dropRoundingModes) {
+static void populateTileIRToMLIRConversionPatterns(
+    TypeConverter &converter, RewritePatternSet &patterns, TileIRTarget target,
+    bool appendGridArgs, bool dropRoundingModes, bool assumeInBounds) {
   MLIRContext *ctx = patterns.getContext();
   // Target-dependent patterns select gpu vs func ops (module / entry / return)
   // and gpu dim-query ops vs leading function arguments (block id / grid dim).
@@ -3891,6 +3905,8 @@ static void populateTileIRToMLIRConversionPatterns(TypeConverter &converter,
   patterns.add<ConvertAddF, ConvertSubF, ConvertMulF, ConvertDivF, ConvertDivI,
                ConvertFToF, ConvertFToI, ConvertIToF, ConvertSqrt, ConvertTanH>(
       converter, ctx, dropRoundingModes);
+  patterns.add<ConvertLoadViewTko, ConvertStoreViewTko>(converter, ctx,
+                                                        assumeInBounds);
   patterns.add<
       ConvertAbsF, ConvertAbsI, ConvertAddI, ConvertAlloca, ConvertAndI,
       ConvertAssume, ConvertAtan2, ConvertBitcast, ConvertBroadcast, ConvertCat,
@@ -3899,18 +3915,18 @@ static void populateTileIRToMLIRConversionPatterns(TypeConverter &converter,
       ConvertExtI, ConvertExtract, ConvertFloor, ConvertFma, ConvertFor,
       ConvertGetGlobal, ConvertGetIndexSpaceShape, ConvertGetTensorShape,
       ConvertGlobal, ConvertIf, ConvertIota, ConvertJoinTokens,
-      ConvertLoadPtrTkoRanked, ConvertLoadPtrTkoScalar, ConvertLoadViewTko,
-      ConvertLog, ConvertLog2, ConvertMakeGatherScatterView,
-      ConvertMakePartitionView, ConvertMakeStridedView, ConvertMakeTensorView,
-      ConvertMakeToken, ConvertMaxF, ConvertMaxI, ConvertMinF, ConvertMinI,
-      ConvertMmaF, ConvertMmaI, ConvertMulhiI, ConvertMulI, ConvertOffsetRanked,
+      ConvertLoadPtrTkoRanked, ConvertLoadPtrTkoScalar, ConvertLog, ConvertLog2,
+      ConvertMakeGatherScatterView, ConvertMakePartitionView,
+      ConvertMakeStridedView, ConvertMakeTensorView, ConvertMakeToken,
+      ConvertMaxF, ConvertMaxI, ConvertMinF, ConvertMinI, ConvertMmaF,
+      ConvertMmaI, ConvertMulhiI, ConvertMulI, ConvertOffsetRanked,
       ConvertOffsetScalarPtr, ConvertNegF, ConvertNegI, ConvertOrI, ConvertPack,
       ConvertPermute, ConvertPow, ConvertPtrToPtrCastOrFail, ConvertReduce,
       ConvertRemF, ConvertRemI, ConvertReshape, ConvertRsqrt, ConvertScan,
       ConvertSelect, ConvertShLI, ConvertShRI, ConvertSin, ConvertSinH,
-      ConvertStorePtrTkoRanked, ConvertStorePtrTkoScalar, ConvertStoreViewTko,
-      ConvertSubI, ConvertTan, ConvertTruncI, ConvertUnpack, ConvertXOrI,
-      ConvertYield>(converter, ctx);
+      ConvertStorePtrTkoRanked, ConvertStorePtrTkoScalar, ConvertSubI,
+      ConvertTan, ConvertTruncI, ConvertUnpack, ConvertXOrI, ConvertYield>(
+      converter, ctx);
 }
 
 //===----------------------------------------------------------------------===//
@@ -4065,7 +4081,8 @@ struct ConvertTileIRToMLIRPass
 
     RewritePatternSet patterns(ctx);
     populateTileIRToMLIRConversionPatterns(typeConverter, patterns, target,
-                                           appendGridArgs, dropRoundingModes);
+                                           appendGridArgs, dropRoundingModes,
+                                           assumeInBounds);
 
     ConversionTarget conversionTarget(*ctx);
 
