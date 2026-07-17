@@ -106,6 +106,66 @@ module {
       return
     }
 
+    // The per-dim bound is computed by comparing a *1-D* index and only then
+    // reshaping the i1 *result* into tile space (the reshape sits between the
+    // broadcast and the cmpi).  This is the canonical Triton 2-D mask; the
+    // dimension each comparison constrains is carried by that result reshape,
+    // not by the (dimensionless) comparison operand.  Recovering it lets the
+    // access lower to a contiguous 2-D transfer instead of a scalarized gather.
+    // CHECK-LABEL: entry @load_2d_mask_result_reshape
+    // CHECK-GPU-LABEL: gpu.func @load_2d_mask_result_reshape
+    entry @load_2d_mask_result_reshape(%arg0: tile<ptr<bf16>>, %arg1: tile<i32>, %arg2: tile<i32>, %arg3: tile<i32>) {
+      %cst_32 = constant <i32: 32> : tile<i32>
+      %pad = constant <bf16: 0.000000e+00> : tile<32x32xbf16>
+      %block_id_x, %block_id_y, %block_id_z = get_tile_block_id : tile<i32>
+      %row_start = muli %block_id_x, %cst_32 : tile<i32>
+      %col_start = muli %block_id_y, %cst_32 : tile<i32>
+      %row_lane = iota : tile<32xi32>
+      %col_lane = iota : tile<32xi32>
+      %row_start_1d = reshape %row_start : tile<i32> -> tile<1xi32>
+      %row_start_bc = broadcast %row_start_1d : tile<1xi32> -> tile<32xi32>
+      %rows = addi %row_start_bc, %row_lane : tile<32xi32>
+      %col_start_1d = reshape %col_start : tile<i32> -> tile<1xi32>
+      %col_start_bc = broadcast %col_start_1d : tile<1xi32> -> tile<32xi32>
+      %cols = addi %col_start_bc, %col_lane : tile<32xi32>
+      // Masks compare 1-D indices, then reshape the i1 result to tile space.
+      %shape_m_1d = reshape %arg1 : tile<i32> -> tile<1xi32>
+      %shape_m_bc = broadcast %shape_m_1d : tile<1xi32> -> tile<32xi32>
+      %row_mask = cmpi less_than %rows, %shape_m_bc, signed : tile<32xi32> -> tile<32xi1>
+      %shape_n_1d = reshape %arg2 : tile<i32> -> tile<1xi32>
+      %shape_n_bc = broadcast %shape_n_1d : tile<1xi32> -> tile<32xi32>
+      %col_mask = cmpi less_than %cols, %shape_n_bc, signed : tile<32xi32> -> tile<32xi1>
+      %row_mask_2d = reshape %row_mask : tile<32xi1> -> tile<32x1xi1>
+      %col_mask_2d = reshape %col_mask : tile<32xi1> -> tile<1x32xi1>
+      %row_mask_bc = broadcast %row_mask_2d : tile<32x1xi1> -> tile<32x32xi1>
+      %col_mask_bc = broadcast %col_mask_2d : tile<1x32xi1> -> tile<32x32xi1>
+      %row_mask_i16 = exti %row_mask_bc signed : tile<32x32xi1> -> tile<32x32xi16>
+      %col_mask_i16 = exti %col_mask_bc signed : tile<32x32xi1> -> tile<32x32xi16>
+      %mask_i16 = andi %row_mask_i16, %col_mask_i16 : tile<32x32xi16>
+      %mask = trunci %mask_i16 : tile<32x32xi16> -> tile<32x32xi1>
+      // Row-major pointers: rows carry the runtime stride, cols are contiguous.
+      %rows_2d = reshape %rows : tile<32xi32> -> tile<32x1xi32>
+      %cols_2d = reshape %cols : tile<32xi32> -> tile<1x32xi32>
+      %stride_2d = reshape %arg3 : tile<i32> -> tile<1x1xi32>
+      %stride_bc = broadcast %stride_2d : tile<1x1xi32> -> tile<32x1xi32>
+      %linear_rows = muli %rows_2d, %stride_bc : tile<32x1xi32>
+      %base_2d = reshape %arg0 : tile<ptr<bf16>> -> tile<1x1xptr<bf16>>
+      %base_row_bc = broadcast %base_2d : tile<1x1xptr<bf16>> -> tile<32x1xptr<bf16>>
+      %row_ptr = offset %base_row_bc, %linear_rows : tile<32x1xptr<bf16>>, tile<32x1xi32> -> tile<32x1xptr<bf16>>
+      %base_col_bc = broadcast %row_ptr : tile<32x1xptr<bf16>> -> tile<32x32xptr<bf16>>
+      %col_bc = broadcast %cols_2d : tile<1x32xi32> -> tile<32x32xi32>
+      %ptr = offset %base_col_bc, %col_bc : tile<32x32xptr<bf16>>, tile<32x32xi32> -> tile<32x32xptr<bf16>>
+      // CHECK: %[[TV2R:.*]] = make_tensor_view %arg0, shape = [%arg1, %arg2], strides = [%arg3, 1] : tile<i32> -> tensor_view<?x?xbf16, strides=[?,1]>
+      // CHECK: %[[PV2R:.*]] = make_partition_view %[[TV2R]] : partition_view<tile=(32x32), padding_value = zero, tensor_view<?x?xbf16, strides=[?,1]>>
+      // CHECK: %[[LD2R:.*]], %[[TOK2R:.*]] = load_view_tko weak %[[PV2R]][%{{.*}}, %{{.*}}] : partition_view<tile=(32x32), padding_value = zero, tensor_view<?x?xbf16, strides=[?,1]>>, tile<i32> -> tile<32x32xbf16>, token
+      // CHECK-NOT: load_ptr_tko
+      // CHECK-GPU: %[[LOAD2DR_VIEW:.*]] = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%{{.*}}, %{{.*}}], strides: [%{{.*}}, 1] : memref<*xbf16> to memref<?x?xbf16, strided<[?, 1], offset: ?>>
+      // CHECK-GPU: %[[LOAD2DR_TILE:.*]] = vector.transfer_read %[[LOAD2DR_VIEW]][%{{.*}}, %{{.*}}], %{{.*}} : memref<?x?xbf16, strided<[?, 1], offset: ?>>, vector<32x32xbf16>
+      // CHECK-GPU-NOT: vector.gather
+      %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<32x32xptr<bf16>>, tile<32x32xi1>, tile<32x32xbf16> -> tile<32x32xbf16>, !cuda_tile.token
+      return
+    }
+
     // CHECK-LABEL: entry @k_zero
     entry @k_zero(%arg0: tile<ptr<f32>>, %arg1: tile<i32>) {
       %cst_1024 = constant <i32: 1024> : tile<i32>

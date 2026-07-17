@@ -475,29 +475,59 @@ static bool analyzeMask(Value mask, unsigned rank,
                         SmallVectorImpl<Value> &dimSize) {
   dimSize.assign(rank, Value());
   bool ok = true;
-  SmallVector<Value> work;
-  work.push_back(mask);
+  // Each work item carries the value plus a `dimHint`: the tile dimension a
+  // reshape encountered above it has already established, or -1 if none. The
+  // canonical 2-D mask compares a *1-D* index (`offs_d < size_d`) and then
+  // lifts the i1 result into tile space with a `reshape` whose single non-1
+  // result dim identifies the constrained dimension (e.g. `<Nxi1> -> <Nx1xi1>`
+  // is dim 0). That reshape sits between the `broadcast` and the `cmpi`, so the
+  // leaf comparison itself is dimensionless; the hint carries the dimension
+  // down to it.
+  SmallVector<std::pair<Value, int>> work;
+  work.push_back({mask, -1});
   while (!work.empty()) {
-    Value v = lookThroughAssume(work.pop_back_val());
+    auto [rawV, dimHint] = work.pop_back_val();
+    Value v = lookThroughAssume(rawV);
     if (!v) {
       ok = false;
       continue;
     }
     if (auto a = v.getDefiningOp<AndIOp>()) {
-      work.push_back(a.getLhs());
-      work.push_back(a.getRhs());
+      work.push_back({a.getLhs(), dimHint});
+      work.push_back({a.getRhs(), dimHint});
       continue;
     }
     if (auto e = v.getDefiningOp<ExtIOp>()) {
-      work.push_back(e.getFrom());
+      work.push_back({e.getFrom(), dimHint});
       continue;
     }
     if (auto t = v.getDefiningOp<TruncIOp>()) {
-      work.push_back(t.getFrom());
+      work.push_back({t.getFrom(), dimHint});
       continue;
     }
     if (auto b = v.getDefiningOp<BroadcastOp>()) {
-      work.push_back(b.getSource());
+      work.push_back({b.getSource(), dimHint});
+      continue;
+    }
+    if (auto rs = v.getDefiningOp<ReshapeOp>()) {
+      // A reshape that lifts a lower-rank comparison into tile space encodes
+      // the constrained dimension via its single non-1 result dim. Only derive
+      // a new hint when the result rank matches the tile rank and exactly one
+      // dimension is non-1; otherwise keep the incoming hint.
+      int derived = -1;
+      auto shape = cast<TileType>(rs.getResult().getType()).getShape();
+      if (shape.size() == rank) {
+        for (int i = 0, e = shape.size(); i < e; ++i) {
+          if (shape[i] == 1)
+            continue;
+          if (derived != -1) {
+            derived = -1; // more than one non-1 dim: ambiguous
+            break;
+          }
+          derived = i;
+        }
+      }
+      work.push_back({rs.getSource(), derived >= 0 ? derived : dimHint});
       continue;
     }
     if (auto cmp = v.getDefiningOp<CmpIOp>()) {
@@ -507,7 +537,12 @@ static bool analyzeMask(Value mask, unsigned rank,
         ok = false;
         continue;
       }
+      // Prefer a dimension recovered from the comparison's index operand (the
+      // reshape may live inside it); fall back to the reshape-derived hint when
+      // the operand is a raw 1-D index that cannot identify the dimension.
       int dim = findDimFromIndexValue(cmp.getLhs(), rank);
+      if (dim < 0)
+        dim = dimHint;
       Value size =
           dim < 0 ? Value() : matchScalarBroadcastReshape(cmp.getRhs());
       if (dim < 0 || !size) {
