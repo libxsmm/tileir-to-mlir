@@ -191,6 +191,12 @@ struct AssumeForwarder {
         auto a = dyn_cast<AssumeOp>(user);
         if (!a || a.getValue() != v)
           continue;
+        // Only forward a predicate that is actually established before the
+        // access.  A source `assume` that does not dominate `anchor` (e.g. one
+        // sitting on a sibling branch) asserts nothing here, so re-materialising
+        // it would inject an unjustified assumption.
+        if (!dom.dominates(a.getResult(), anchor))
+          continue;
         AssumePredicateAttrInterface p = a.getPredicateAttr();
         if (!llvm::is_contained(preds, p))
           preds.push_back(p);
@@ -208,8 +214,11 @@ private:
   Value getOrCreate(Value base, AssumePredicateAttrInterface pred,
                     Operation *anchor) {
     std::pair<Value, Attribute> key{base, pred};
+    // A cached value is only reusable if it still dominates this anchor; a
+    // reused *source* assume may dominate one access but not another.
     if (Value cached = cache.lookup(key))
-      return cached;
+      if (dom.dominates(cached, anchor))
+        return cached;
 
     // Prefer reusing an existing source `assume` op carrying this predicate.
     for (Operation *user : base.getUsers()) {
@@ -222,7 +231,9 @@ private:
       return a.getResult();
     }
 
-    // Otherwise create one fresh assume right after the def of `base`.
+    // Otherwise create one fresh assume right after the def of `base`.  Placed
+    // immediately after the def, it dominates every use of `base`, so it is
+    // always safe to cache and reuse for any anchor.
     OpBuilder b(base.getContext());
     if (auto barg = dyn_cast<BlockArgument>(base))
       b.setInsertionPointToStart(barg.getOwner());
@@ -459,21 +470,71 @@ static int findDimFromIndexValue(Value val, unsigned rank) {
   return -1;
 }
 
-/// Recover the per-dim global sizes encoded in `mask` and report whether the
-/// whole mask was understood.
+/// Recover the `start` scalar of a mask comparison index written in the
+/// canonical `start + iota` form (or pure `iota`, in which case `start` is left
+/// null, meaning start == 0).  Strips transparent broadcast/reshape/assume
+/// wrappers.  Returns `false` when the index is not of this shape (e.g. it adds
+/// a non-scalar constant, or is an unrelated expression), so the caller refuses
+/// to treat the comparison as a faithful per-dim bound.
+static bool recoverMaskIndexStart(Value idx, Value &start) {
+  start = Value();
+  Value cur = lookThroughAssume(idx);
+  while (cur) {
+    if (auto b = cur.getDefiningOp<BroadcastOp>()) {
+      cur = lookThroughAssume(b.getSource());
+      continue;
+    }
+    if (auto r = cur.getDefiningOp<ReshapeOp>()) {
+      cur = lookThroughAssume(r.getSource());
+      continue;
+    }
+    break;
+  }
+  if (!cur)
+    return false;
+  if (cur.getDefiningOp<IotaOp>())
+    return true; // pure iota => start == 0
+  if (auto add = cur.getDefiningOp<AddIOp>()) {
+    Value lhs = add.getLhs();
+    Value rhs = add.getRhs();
+    for (auto [a, b] : {std::pair<Value, Value>(lhs, rhs),
+                        std::pair<Value, Value>(rhs, lhs)}) {
+      if (lookThroughAssume(a).getDefiningOp<IotaOp>()) {
+        if (Value s = matchScalarBroadcastReshape(b)) {
+          start = s;
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/// Recover, per tile dimension, the global size and the compared-index start
+/// encoded in `mask`, and report whether the whole mask was understood.
 ///
-/// Walks the `andi`/`exti`/`trunci`/`broadcast` tree down to `cmpi less_than`
-/// leaves; each leaf compares a `reshape(iota...)` (the per-tile index along
-/// one dimension) against a broadcast-of-reshape-of-scalar size, which is
-/// recorded for that dimension.
+/// Walks the `andi`/`exti`/`trunci`/`broadcast`/`reshape` tree down to
+/// `cmpi less_than` leaves; each leaf compares a per-dim index (of the
+/// canonical `start + iota` form) against a broadcast-of-reshape-of-scalar
+/// size.  The size is recorded in `dimSize[dim]` and the index start in
+/// `dimStart[dim]` (null for a pure-iota index).  The bounded dimension is
+/// taken from the comparison operand when it is itself rank-annotated, or
+/// otherwise from a `reshape` above the leaf that lifts a 1-D comparison result
+/// into tile space (its single non-1 result dim, whose extent must match the
+/// tile extent).
 ///
 /// Returns `true` only when every op encountered was one of the recognised
 /// shapes (so any dimension left without a size is *provably* unbounded by the
-/// mask).  Returns `false` as soon as an unrecognised op or comparison is seen,
-/// in which case the caller must not treat missing sizes as "unmasked".
-static bool analyzeMask(Value mask, unsigned rank,
-                        SmallVectorImpl<Value> &dimSize) {
+/// mask).  Returns `false` as soon as an unrecognised op, predicate, index
+/// shape, or an ambiguous/conflicting bound is seen, in which case the caller
+/// must not treat the mask as understood.
+static bool analyzeMask(Value mask, ArrayRef<int64_t> tileShape,
+                        SmallVectorImpl<Value> &dimSize,
+                        SmallVectorImpl<Value> &dimStart) {
+  unsigned rank = tileShape.size();
   dimSize.assign(rank, Value());
+  dimStart.assign(rank, Value());
+  SmallVector<bool> bounded(rank, false);
   bool ok = true;
   // Each work item carries the value plus a `dimHint`: the tile dimension a
   // reshape encountered above it has already established, or -1 if none. The
@@ -510,15 +571,18 @@ static bool analyzeMask(Value mask, unsigned rank,
       continue;
     }
     if (auto rs = v.getDefiningOp<ReshapeOp>()) {
-      // A reshape that lifts a lower-rank comparison into tile space encodes
+      // A reshape that lifts a 1-D comparison result into tile space encodes
       // the constrained dimension via its single non-1 result dim. Only derive
-      // a new hint when the result rank matches the tile rank and exactly one
-      // dimension is non-1; otherwise keep the incoming hint.
+      // a hint from a genuine singleton expansion of a (<=1-D) source whose
+      // single non-1 extent matches the tile extent for that dimension;
+      // otherwise keep the incoming hint.
       int derived = -1;
-      auto shape = cast<TileType>(rs.getResult().getType()).getShape();
-      if (shape.size() == rank) {
-        for (int i = 0, e = shape.size(); i < e; ++i) {
-          if (shape[i] == 1)
+      auto resShape = cast<TileType>(rs.getResult().getType()).getShape();
+      auto srcTy = dyn_cast<TileType>(rs.getSource().getType());
+      unsigned srcRank = srcTy ? srcTy.getShape().size() : ~0u;
+      if (resShape.size() == rank && srcRank <= 1) {
+        for (int i = 0, e = resShape.size(); i < e; ++i) {
+          if (resShape[i] == 1)
             continue;
           if (derived != -1) {
             derived = -1; // more than one non-1 dim: ambiguous
@@ -526,7 +590,13 @@ static bool analyzeMask(Value mask, unsigned rank,
           }
           derived = i;
         }
+        if (derived >= 0 && resShape[derived] != tileShape[derived])
+          derived = -1; // extent does not match the tile dimension
       }
+      // A reshape that establishes a different dimension than an outer reshape
+      // already did is ambiguous; refuse to recognise the mask.
+      if (derived >= 0 && dimHint >= 0 && derived != dimHint)
+        ok = false;
       work.push_back({rs.getSource(), derived >= 0 ? derived : dimHint});
       continue;
     }
@@ -545,14 +615,23 @@ static bool analyzeMask(Value mask, unsigned rank,
         dim = dimHint;
       Value size =
           dim < 0 ? Value() : matchScalarBroadcastReshape(cmp.getRhs());
-      if (dim < 0 || !size) {
+      // The compared index must be the canonical `start + iota`; recovering its
+      // start lets the caller confirm it matches the pointer's index for this
+      // dimension (otherwise the view's implied masking would differ).
+      Value start;
+      bool startOk = recoverMaskIndexStart(cmp.getLhs(), start);
+      if (dim < 0 || !size || !startOk) {
         ok = false;
         continue;
       }
-      if (!dimSize[dim])
+      if (!bounded[dim]) {
         dimSize[dim] = size;
-      else if (dimSize[dim] != size)
+        dimStart[dim] = start;
+        bounded[dim] = true;
+      } else if (dimSize[dim] != size ||
+                 lookThroughAssume(dimStart[dim]) != lookThroughAssume(start)) {
         ok = false; // conflicting bounds for the same dimension
+      }
       continue;
     }
     // Any other op in the mask tree means we did not fully understand it.
@@ -630,21 +709,12 @@ static LogicalResult analyzePtr(Value ptr, ArrayRef<int64_t> tileShape,
             break;
           }
           if (covered[dim]) {
-            // Duplicate dim: strides must match to combine them safely.
-            // (Strict equality on compiler-created SSA values from
-            // decomposeAddend).
-            if (out.dims[dim].stride != info.stride) {
-              handledAll = false;
-              break;
-            }
-            // Merge starts if possible.
-            if (info.start && !out.dims[dim].start)
-              out.dims[dim].start = info.start;
-            else if (info.start && out.dims[dim].start) {
-              handledAll = false;
-              break;
-            }
-            continue;
+            // A dimension fed by more than one iota-based addend cannot be
+            // modelled as a single partition-view index without proving the
+            // combined affine sum; bail rather than silently drop or merge a
+            // contribution (which would compute the wrong address).
+            handledAll = false;
+            break;
           }
           out.dims[dim].start = info.start;
           out.dims[dim].stride = info.stride;
@@ -721,6 +791,13 @@ static LogicalResult analyzePtr(Value ptr, ArrayRef<int64_t> tileShape,
   // Base must be a scalar ptr tile.
   if (!cur || !isScalarTile(cur.getType()))
     return failure();
+  // Every tile dimension must be indexed by exactly one iota-based addend.  A
+  // dimension with no contribution would be a pure broadcast (every lane along
+  // it shares one address), which a contiguous partition-view tile cannot
+  // model; bail so the access stays a gather/scatter.
+  for (bool c : covered)
+    if (!c)
+      return failure();
   out.base = cur;
   return success();
 }
@@ -913,10 +990,21 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
           auto *parentOp = blockArg.getOwner()->getParentOp();
           if (auto forOp = dyn_cast_or_null<ForOp>(parentOp);
               forOp && blockArg == forOp.getInductionVar()) {
-            DenseIntElementsAttr stepAttr;
+            // `iv / tileSize` only recovers the tile index exactly when every
+            // iteration value `iv = lb + k*step` is a multiple of tileSize.
+            // Require step == tileSize and a non-negative, tile-aligned lower
+            // bound (so `lb + k*tileSize` is always a tileSize multiple and
+            // unsigned division is exact); otherwise the recovered index would
+            // be wrong (e.g. lb=1 gives 1/32 == 0, dropping the offset).
+            DenseIntElementsAttr stepAttr, lbAttr;
             if (matchPattern(forOp.getStep(), m_Constant(&stepAttr)) &&
                 stepAttr.isSplat() &&
-                stepAttr.getSplatValue<APInt>().getSExtValue() == di.tileSize) {
+                stepAttr.getSplatValue<APInt>().getSExtValue() == di.tileSize &&
+                matchPattern(forOp.getLowerBound(), m_Constant(&lbAttr)) &&
+                lbAttr.isSplat() &&
+                lbAttr.getSplatValue<APInt>().getSExtValue() >= 0 &&
+                (lbAttr.getSplatValue<APInt>().getSExtValue() % di.tileSize) ==
+                    0) {
               auto i32 = b.getI32Type();
               auto tileTy = TileType::get(b.getContext(), {}, i32);
               auto cst = DenseElementsAttr::get(tileTy, APInt(32, di.tileSize));
@@ -1061,11 +1149,24 @@ static LogicalResult lowerAccess(OpBuilder &b, Location loc, Value ptr,
   if (failed(analyzePtr(ptr, tileShape, access)))
     return failure();
 
-  // Recover per-dim global sizes from the mask.
-  SmallVector<Value> dimSizes;
-  access.maskFullyRecognized = analyzeMask(mask, tileShape.size(), dimSizes);
-  for (unsigned d = 0; d < tileShape.size(); ++d)
+  // Recover per-dim global sizes and compared-index starts from the mask.
+  // Refuse partially-understood masks outright: an unrecognised predicate
+  // (e.g. an extra `!=` term) would otherwise be silently dropped, changing
+  // which elements are accessed.
+  SmallVector<Value> dimSizes, dimStarts;
+  if (!analyzeMask(mask, tileShape, dimSizes, dimStarts))
+    return failure();
+  access.maskFullyRecognized = true;
+  for (unsigned d = 0; d < tileShape.size(); ++d) {
     access.dims[d].size = dimSizes[d];
+    // The mask's per-dim index must match the pointer's index for that
+    // dimension (same start); otherwise the partition view's implied bound
+    // (`idx*tileSize + lane < size`) would mask different lanes than the
+    // source did.
+    if (dimSizes[d] && lookThroughAssume(dimStarts[d]) !=
+                           lookThroughAssume(access.dims[d].start))
+      return failure();
+  }
 
   BuiltViews bv;
   if (failed(buildViews(b, loc, access, elemTy, padding, bv)))
@@ -1135,11 +1236,15 @@ static LogicalResult rewriteLoad(LoadPtrTkoOp op, AssumeForwarder &fwd) {
     return failure();
   }
 
-  auto moAttr = MemoryOrderingSemanticsAttr::get(op.getContext(),
-                                                 MemoryOrderingSemantics::WEAK);
+  // Preserve the source ordering/scope rather than forcing `weak`: silently
+  // weakening acquire/release (or dropping the scope) would change the
+  // program's memory semantics.  load_view_tko accepts the same ordering
+  // variants as load_ptr_tko, so this stays type-valid; an ordering the final
+  // conversion cannot model is then rejected there rather than miscompiled.
   auto newOp = LoadViewTkoOp::create(
-      b, loc, resultTy, op.getResultToken().getType(), moAttr,
-      /*memory_scope=*/nullptr, view, indices,
+      b, loc, resultTy, op.getResultToken().getType(),
+      op.getMemoryOrderingSemanticsAttr(), op.getMemoryScopeAttr(), view,
+      indices,
       /*token=*/op.getToken(), op.getOptimizationHintsAttr());
   op.getResult().replaceAllUsesWith(newOp.getTile());
   op.getResultToken().replaceAllUsesWith(newOp.getResultToken());
@@ -1177,10 +1282,12 @@ static LogicalResult rewriteStore(StorePtrTkoOp op, AssumeForwarder &fwd) {
     return failure();
   }
 
-  auto moAttr = MemoryOrderingSemanticsAttr::get(op.getContext(),
-                                                 MemoryOrderingSemantics::WEAK);
+  // Preserve the source ordering/scope (see rewriteLoad): store_view_tko
+  // accepts the same ordering variants as store_ptr_tko, so forwarding keeps
+  // the memory semantics intact rather than silently weakening them.
   auto newOp = StoreViewTkoOp::create(
-      b, loc, op.getResultToken().getType(), moAttr, /*memory_scope=*/nullptr,
+      b, loc, op.getResultToken().getType(),
+      op.getMemoryOrderingSemanticsAttr(), op.getMemoryScopeAttr(),
       op.getValue(), view, indices, /*token=*/op.getToken(),
       op.getOptimizationHintsAttr());
   op.getResultToken().replaceAllUsesWith(newOp.getResultToken());
@@ -1215,10 +1322,29 @@ struct TileIRPtrToViewPass
     // or erase blocks), so a single instance stays valid across the phase.
     DominanceInfo domInfo(mod);
     AssumeForwarder fwd(domInfo);
-    for (auto l : loads)
-      (void)rewriteLoad(l, fwd);
-    for (auto s : stores)
-      (void)rewriteStore(s, fwd);
+    // Track the `for` loops that actually had an access rewritten, so the
+    // dead-iter-arg cleanup below only touches loops this pass modified (and
+    // leaves unrelated loops, and their attributes, exactly as-is).
+    DenseSet<Operation *> affectedForOps;
+    for (auto l : loads) {
+      // Capture the ancestor loops before a successful rewrite erases `l`.
+      SmallVector<Operation *> ancestors;
+      for (Operation *p = l->getParentOp(); p; p = p->getParentOp())
+        if (isa<ForOp>(p))
+          ancestors.push_back(p);
+      if (succeeded(rewriteLoad(l, fwd)))
+        for (Operation *f : ancestors)
+          affectedForOps.insert(f);
+    }
+    for (auto s : stores) {
+      SmallVector<Operation *> ancestors;
+      for (Operation *p = s->getParentOp(); p; p = p->getParentOp())
+        if (isa<ForOp>(p))
+          ancestors.push_back(p);
+      if (succeeded(rewriteStore(s, fwd)))
+        for (Operation *f : ancestors)
+          affectedForOps.insert(f);
+    }
 
     // Remove dead iter_args from for loops. After loads/stores are rewritten
     // the ptr-typed results become unused; rebuild the loop without them.
@@ -1229,6 +1355,10 @@ struct TileIRPtrToViewPass
     SmallVector<ForOp> forOps;
     mod.walk([&](ForOp op) { forOps.push_back(op); });
     for (ForOp forOp : forOps) {
+      // Only reshape loops this pass actually rewrote an access in; unrelated
+      // loops (and any dead iter_args the user wrote) must be left untouched.
+      if (!affectedForOps.contains(forOp.getOperation()))
+        continue;
       unsigned numIter = forOp.getNumResults();
       if (numIter == 0)
         continue;
@@ -1337,7 +1467,12 @@ struct TileIRPtrToViewPass
 
       auto newFor =
           ForOp::create(builder, forOp.getLoc(), forOp.getLowerBound(),
-                        forOp.getUpperBound(), forOp.getStep(), newInits);
+                        forOp.getUpperBound(), forOp.getStep(), newInits,
+                        /*bodyBuilder=*/nullptr, forOp.getUnsignedCmp());
+      // Preserve discardable attributes (e.g. `tir-dropped-*`) that the rebuilt
+      // loop would otherwise lose.  `unsignedCmp` is an inherent attribute and
+      // is carried by the builder argument above.
+      newFor->setDiscardableAttrs(forOp->getDiscardableAttrDictionary());
 
       // Map old block args → new block args.
       Block *newBody = newFor.getBody();
