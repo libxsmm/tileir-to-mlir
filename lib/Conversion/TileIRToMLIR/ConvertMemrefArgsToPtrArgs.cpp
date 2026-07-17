@@ -6,7 +6,8 @@
 // `memref<*xT>` and recovers their rank/layout inside the body with a
 // `memref.cast` or `memref.reinterpret_cast`. When every use of such an
 // argument is one of these casts -- or when the argument has no uses -- the
-// argument is really just an opaque pointer. This pass rewrites the signature to take a bare
+// argument is really just an opaque pointer. This pass rewrites the signature
+// to take a bare
 // `!llvm.ptr` and, in place of each redundant cast, builds a standard LLVM
 // memref descriptor struct from that pointer -- using the argument pointer as
 // the descriptor's base buffer and storing the cast's offset / sizes / strides
