@@ -37,6 +37,10 @@
 // The start values are expected to be of the form `muli(%idx_d, tile_size_d)`,
 // allowing the per-dimension partition index %idx_d to be recovered.
 //
+// Index expressions may additionally be widened by `exti` (frontends commonly
+// compute addresses in i64); the widening is transparent and the narrow scalars
+// are what the view ops get.
+//
 // The rewrite is conservative: it leaves the original
 // load_ptr_tko/store_ptr_tko untouched whenever it cannot fully recover the
 // access, rather than fabricating a shape/stride. In particular it requires:
@@ -115,10 +119,37 @@ static Value lookThroughAssume(Value v) {
   return v;
 }
 
+/// Walk through `assume` ops and integer widenings, returning the underlying
+/// value.  Frontends routinely widen index arithmetic to i64 before applying it
+/// to a pointer; the narrow value denotes the same index, and it is the one the
+/// view ops are given.
+///
+/// Both `exti signed` and `exti unsigned` are stripped: they agree on
+/// non-negative values, and recovering `start + iota` from `ext(start + iota)`
+/// already requires the narrow arithmetic to be non-negative and non-wrapping
+/// (a wrapping or negative index cannot be expressed as `tile_index *
+/// tile_size + lane` either).  `trunci` is never stripped, as it is lossy.
+static Value lookThroughIndexCast(Value v) {
+  while (Value cur = lookThroughAssume(v)) {
+    auto e = cur.getDefiningOp<ExtIOp>();
+    if (!e)
+      return cur;
+    v = e.getFrom();
+  }
+  return v;
+}
+
 /// Returns `true` iff `tt` is a TileType with empty shape (scalar tile).
 static bool isScalarTile(Type t) {
   auto tt = dyn_cast<TileType>(t);
   return tt && tt.getShape().empty();
+}
+
+/// Returns `true` iff `t` is a `tile<i32>`, the index/shape/stride scalar type
+/// of the view ops.
+static bool isScalarI32Tile(Type t) {
+  auto tt = dyn_cast<TileType>(t);
+  return tt && tt.getShape().empty() && tt.getElementType().isInteger(32);
 }
 
 /// The "definition point" operation for `v`: its defining op, or the first op
@@ -246,11 +277,12 @@ private:
 };
 
 /// Strip a chain of `broadcast` and `reshape` ops applied to a scalar tile,
-/// returning the scalar tile value.  Assume ops are also transparent.
+/// returning the scalar tile value.  Assume ops and signed widenings are also
+/// transparent.
 /// Returns null if `v` does not bottom out in a scalar tile through those ops.
 static Value matchScalarBroadcastReshape(Value v) {
   while (v) {
-    v = lookThroughAssume(v);
+    v = lookThroughIndexCast(v);
     if (!v)
       return nullptr;
     if (isScalarTile(v.getType()))
@@ -329,11 +361,10 @@ static LogicalResult decomposeAddend(Value addend, ArrayRef<int64_t> tileShape,
                                      int &dim, DimInfo &info) {
   // Strip outer broadcasts that just replicate this 1-D pattern across
   // orthogonal dimensions of the tile.
-  Value cur = lookThroughAssume(addend);
+  Value cur = lookThroughIndexCast(addend);
   while (cur) {
     if (auto bcast = cur.getDefiningOp<BroadcastOp>()) {
-      cur = bcast.getSource();
-      cur = lookThroughAssume(cur);
+      cur = lookThroughIndexCast(bcast.getSource());
       continue;
     }
     break;
@@ -356,13 +387,12 @@ static LogicalResult decomposeAddend(Value addend, ArrayRef<int64_t> tileShape,
     }
     if (!info.stride)
       return failure();
-    cur = lookThroughAssume(cur);
+    cur = lookThroughIndexCast(cur);
     // Strip broadcasts again (the index side of the mul may itself be a
     // broadcast).
     while (cur) {
       if (auto bcast = cur.getDefiningOp<BroadcastOp>()) {
-        cur = bcast.getSource();
-        cur = lookThroughAssume(cur);
+        cur = lookThroughIndexCast(bcast.getSource());
         continue;
       }
       break;
@@ -396,7 +426,7 @@ static LogicalResult decomposeAddend(Value addend, ArrayRef<int64_t> tileShape,
       return failure();
     dim = 0;
   }
-  oneD = lookThroughAssume(oneD);
+  oneD = lookThroughIndexCast(oneD);
   auto oneDTy = dyn_cast<TileType>(oneD.getType());
   if (!oneDTy || oneDTy.getShape().size() != 1)
     return failure();
@@ -413,7 +443,7 @@ static LogicalResult decomposeAddend(Value addend, ArrayRef<int64_t> tileShape,
     Value rhs = add.getRhs();
     for (auto [a, b] : {std::pair<Value, Value>(lhs, rhs),
                         std::pair<Value, Value>(rhs, lhs)}) {
-      if (lookThroughAssume(a).getDefiningOp<IotaOp>()) {
+      if (lookThroughIndexCast(a).getDefiningOp<IotaOp>()) {
         if (Value scalar = matchScalarBroadcastReshape(b)) {
           info.start = scalar;
           return success();
@@ -432,7 +462,7 @@ static LogicalResult decomposeAddend(Value addend, ArrayRef<int64_t> tileShape,
 /// and addi's to find the dimension index.
 static int findDimFromIndexValue(Value val, unsigned rank) {
   while (val) {
-    val = lookThroughAssume(val);
+    val = lookThroughIndexCast(val);
     if (!val)
       return -1;
     if (auto rs = val.getDefiningOp<ReshapeOp>()) {
@@ -478,14 +508,14 @@ static int findDimFromIndexValue(Value val, unsigned rank) {
 /// to treat the comparison as a faithful per-dim bound.
 static bool recoverMaskIndexStart(Value idx, Value &start) {
   start = Value();
-  Value cur = lookThroughAssume(idx);
+  Value cur = lookThroughIndexCast(idx);
   while (cur) {
     if (auto b = cur.getDefiningOp<BroadcastOp>()) {
-      cur = lookThroughAssume(b.getSource());
+      cur = lookThroughIndexCast(b.getSource());
       continue;
     }
     if (auto r = cur.getDefiningOp<ReshapeOp>()) {
-      cur = lookThroughAssume(r.getSource());
+      cur = lookThroughIndexCast(r.getSource());
       continue;
     }
     break;
@@ -499,7 +529,7 @@ static bool recoverMaskIndexStart(Value idx, Value &start) {
     Value rhs = add.getRhs();
     for (auto [a, b] : {std::pair<Value, Value>(lhs, rhs),
                         std::pair<Value, Value>(rhs, lhs)}) {
-      if (lookThroughAssume(a).getDefiningOp<IotaOp>()) {
+      if (lookThroughIndexCast(a).getDefiningOp<IotaOp>()) {
         if (Value s = matchScalarBroadcastReshape(b)) {
           start = s;
           return true;
@@ -628,8 +658,8 @@ static bool analyzeMask(Value mask, ArrayRef<int64_t> tileShape,
         dimSize[dim] = size;
         dimStart[dim] = start;
         bounded[dim] = true;
-      } else if (dimSize[dim] != size ||
-                 lookThroughAssume(dimStart[dim]) != lookThroughAssume(start)) {
+      } else if (dimSize[dim] != size || lookThroughIndexCast(dimStart[dim]) !=
+                                             lookThroughIndexCast(start)) {
         ok = false; // conflicting bounds for the same dimension
       }
       continue;
@@ -646,7 +676,7 @@ static bool analyzeMask(Value mask, ArrayRef<int64_t> tileShape,
 /// decomposeAddend needs to see whole.
 static void flattenOffset(Value val, ArrayRef<int64_t> tileShape,
                           SmallVectorImpl<Value> &addends) {
-  val = lookThroughAssume(val);
+  val = lookThroughIndexCast(val);
   if (!val)
     return;
   // If the whole expression decomposes, keep it as one addend.
@@ -803,27 +833,36 @@ static LogicalResult analyzePtr(Value ptr, ArrayRef<int64_t> tileShape,
 }
 
 /// Match a `cuda_tile.constant` splat that encodes one of the supported
-/// padding values.  Returns null when no match.
+/// padding values.  The splat may be spelled directly on the tile type or built
+/// from a scalar constant via reshape/broadcast.  Returns null when no match.
 static PaddingValueAttr matchPadding(MLIRContext *ctx, Value v) {
   v = lookThroughAssume(v);
+  if (Value scalar = matchScalarBroadcastReshape(v))
+    v = scalar;
   DenseFPElementsAttr fp;
-  if (!matchPattern(v, m_Constant(&fp)) || !fp.isSplat())
-    return nullptr;
-  APFloat val = fp.getSplatValue<APFloat>();
-  PaddingValue pv;
-  if (val.isNaN())
-    pv = PaddingValue::nan;
-  else if (val.isInfinity() && val.isNegative())
-    pv = PaddingValue::neg_inf;
-  else if (val.isInfinity())
-    pv = PaddingValue::pos_inf;
-  else if (val.isZero() && val.isNegative())
-    pv = PaddingValue::neg_zero;
-  else if (val.isZero())
-    pv = PaddingValue::zero;
-  else
-    return nullptr;
-  return PaddingValueAttr::get(ctx, pv);
+  if (matchPattern(v, m_Constant(&fp)) && fp.isSplat()) {
+    APFloat val = fp.getSplatValue<APFloat>();
+    PaddingValue pv;
+    if (val.isNaN())
+      pv = PaddingValue::nan;
+    else if (val.isInfinity() && val.isNegative())
+      pv = PaddingValue::neg_inf;
+    else if (val.isInfinity())
+      pv = PaddingValue::pos_inf;
+    else if (val.isZero() && val.isNegative())
+      pv = PaddingValue::neg_zero;
+    else if (val.isZero())
+      pv = PaddingValue::zero;
+    else
+      return nullptr;
+    return PaddingValueAttr::get(ctx, pv);
+  }
+  // Integer padding: only 0 has a `PaddingValue` encoding.
+  DenseIntElementsAttr ints;
+  if (matchPattern(v, m_Constant(&ints)) && ints.isSplat() &&
+      ints.getSplatValue<APInt>().isZero())
+    return PaddingValueAttr::get(ctx, PaddingValue::zero);
+  return nullptr;
 }
 
 /// Build the (TensorViewType, PartitionViewType, dynamic-shape, dynamic-stride,
@@ -842,17 +881,17 @@ struct BuiltViews {
 static Value extractTileMultiplier(Value start, int64_t tileSize) {
   if (!start)
     return nullptr;
-  start = lookThroughAssume(start);
+  start = lookThroughIndexCast(start);
   auto mul = start.getDefiningOp<MulIOp>();
   if (!mul)
     return nullptr;
   for (auto [a, b] : {std::pair<Value, Value>(mul.getLhs(), mul.getRhs()),
                       std::pair<Value, Value>(mul.getRhs(), mul.getLhs())}) {
-    Value cstSide = lookThroughAssume(a);
+    Value cstSide = lookThroughIndexCast(a);
     DenseIntElementsAttr ints;
     if (matchPattern(cstSide, m_Constant(&ints)) && ints.isSplat() &&
         ints.getSplatValue<APInt>().getSExtValue() == tileSize)
-      return b;
+      return lookThroughIndexCast(b);
   }
   return nullptr;
 }
@@ -860,7 +899,7 @@ static Value extractTileMultiplier(Value start, int64_t tileSize) {
 /// Returns `true` iff `v` is a splat integer constant equal to `c`.
 static bool isSplatIntEqual(Value v, int64_t c) {
   DenseIntElementsAttr ints;
-  return matchPattern(lookThroughAssume(v), m_Constant(&ints)) &&
+  return matchPattern(lookThroughIndexCast(v), m_Constant(&ints)) &&
          ints.isSplat() && ints.getSplatValue<APInt>().getSExtValue() == c;
 }
 
@@ -877,7 +916,7 @@ static bool loopAdvanceIsOneTile(Value advance, int64_t stepTimesTile,
                                  Value stride) {
   // The advance is a tile-shaped value; reduce it to its uniform scalar.
   if (Value scalar = matchScalarBroadcastReshape(advance)) {
-    scalar = lookThroughAssume(scalar);
+    scalar = lookThroughIndexCast(scalar);
     if (!stride)
       return isSplatIntEqual(scalar, stepTimesTile);
     // Expect `stride * stepTimesTile` (operands in either order).
@@ -886,7 +925,7 @@ static bool loopAdvanceIsOneTile(Value advance, int64_t stepTimesTile,
       return false;
     for (auto [a, b] : {std::pair<Value, Value>(mul.getLhs(), mul.getRhs()),
                         std::pair<Value, Value>(mul.getRhs(), mul.getLhs())})
-      if (lookThroughAssume(a) == stride && isSplatIntEqual(b, stepTimesTile))
+      if (lookThroughIndexCast(a) == stride && isSplatIntEqual(b, stepTimesTile))
         return true;
     return false;
   }
@@ -905,19 +944,19 @@ static bool loopAdvanceIsOneTile(Value advance, int64_t stepTimesTile,
 /// is returned so the caller bails (strict).
 static Value recoverAbsoluteAdvancingSize(Value size, Value inductionVar,
                                           int64_t tileSize) {
-  Value s = lookThroughAssume(size);
+  Value s = lookThroughIndexCast(size);
   auto sub = s.getDefiningOp<SubIOp>();
   if (!sub)
     return size; // already absolute
   Value k = sub.getLhs();
-  Value residual = lookThroughAssume(sub.getRhs());
+  Value residual = lookThroughIndexCast(sub.getRhs());
   auto mul = residual.getDefiningOp<MulIOp>();
   if (!mul)
     return nullptr;
   for (auto [a, b] : {std::pair<Value, Value>(mul.getLhs(), mul.getRhs()),
                       std::pair<Value, Value>(mul.getRhs(), mul.getLhs())})
-    if (lookThroughAssume(a) == inductionVar && isSplatIntEqual(b, tileSize))
-      return lookThroughAssume(k);
+    if (lookThroughIndexCast(a) == inductionVar && isSplatIntEqual(b, tileSize))
+      return lookThroughIndexCast(k);
   return nullptr;
 }
 
@@ -941,6 +980,15 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
                                 PaddingValueAttr padding, BuiltViews &out) {
   MLIRContext *ctx = b.getContext();
   unsigned rank = access.dims.size();
+
+  // Every recovered scalar must be an `i32` scalar tile: the constants and the
+  // index arithmetic materialised below are i32, and the view ops carry a
+  // single common index type.  Anything else (e.g. an index expression that
+  // stays widened to i64) is rejected rather than mixed into the new ops.
+  for (const DimInfo &di : access.dims)
+    for (Value v : {di.start, di.stride, di.size})
+      if (v && !isScalarI32Tile(v.getType()))
+        return failure();
 
   // When the access advances through a loop iter_arg, exactly one tile
   // dimension must lack a `start` (that is the dimension the loop advances).
@@ -985,7 +1033,7 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
         // Fallback: if start is a for-loop induction variable whose constant
         // step equals tileSize, emit loopIdx / tileSize to recover the
         // tile-level partition index.
-        Value s = lookThroughAssume(di.start);
+        Value s = lookThroughIndexCast(di.start);
         if (auto blockArg = dyn_cast<BlockArgument>(s)) {
           auto *parentOp = blockArg.getOwner()->getParentOp();
           if (auto forOp = dyn_cast_or_null<ForOp>(parentOp);
@@ -1163,8 +1211,8 @@ static LogicalResult lowerAccess(OpBuilder &b, Location loc, Value ptr,
     // dimension (same start); otherwise the partition view's implied bound
     // (`idx*tileSize + lane < size`) would mask different lanes than the
     // source did.
-    if (dimSizes[d] && lookThroughAssume(dimStarts[d]) !=
-                           lookThroughAssume(access.dims[d].start))
+    if (dimSizes[d] && lookThroughIndexCast(dimStarts[d]) !=
+                           lookThroughIndexCast(access.dims[d].start))
       return failure();
   }
 

@@ -167,7 +167,8 @@ static void eraseTriviallyDead(SmallVectorImpl<Operation *> &worklist) {
   }
 }
 
-static bool promoteOneFunction(FunctionOpInterface func, bool removeUnused) {
+static bool promoteOneFunction(FunctionOpInterface func,
+                               MemrefArgRemovalMode removeUnused) {
   if (func.getFunctionBody().empty() || !signatureChangeIsSafe(func))
     return false;
 
@@ -237,8 +238,22 @@ static bool promoteOneFunction(FunctionOpInterface func, bool removeUnused) {
   }
 
   llvm::BitVector argsToErase(func.getNumArguments());
+  llvm::BitVector memrefDependentArgs(func.getNumArguments());
+  llvm::BitVector assumedMemrefDependentArgs(func.getNumArguments());
+
+  for (const PtrPromotionPlan &plan : ptrPlans) {
+    unsigned firstAssumedArg = plan.argIndex + 1;
+    unsigned numAssumedArgs = 2 * plan.rankedType.getRank();
+    if (firstAssumedArg > func.getNumArguments() ||
+        numAssumedArgs > func.getNumArguments() - firstAssumedArg)
+      continue;
+    for (unsigned argIdx = firstAssumedArg;
+         argIdx < firstAssumedArg + numAssumedArgs; ++argIdx)
+      assumedMemrefDependentArgs.set(argIdx);
+  }
 
   for (auto [argIdx, recipe] : scalarRecipes) {
+    memrefDependentArgs.set(argIdx);
     if (conflictingScalarArgs.contains(argIdx))
       continue;
 
@@ -265,11 +280,33 @@ static bool promoteOneFunction(FunctionOpInterface func, bool removeUnused) {
     }
   }
 
-  // Drop any argument left without uses once removal is requested.
-  if (removeUnused)
-    for (BlockArgument arg : func.getArguments())
-      if (arg.use_empty())
-        argsToErase.set(arg.getArgNumber());
+  for (BlockArgument arg : func.getArguments()) {
+    if (!arg.use_empty())
+      continue;
+
+    bool isMemrefDependent = memrefDependentArgs.test(arg.getArgNumber());
+  bool isAssumedMemrefDependent =
+    assumedMemrefDependentArgs.test(arg.getArgNumber());
+    bool shouldErase = false;
+    switch (removeUnused) {
+    case MemrefArgRemovalMode::All:
+      shouldErase = true;
+      break;
+    case MemrefArgRemovalMode::None:
+      break;
+    case MemrefArgRemovalMode::MemrefDependent:
+      shouldErase = isMemrefDependent;
+      break;
+    case MemrefArgRemovalMode::AssumedMemrefDependent:
+      shouldErase = isMemrefDependent || isAssumedMemrefDependent;
+      break;
+    case MemrefArgRemovalMode::Other:
+      shouldErase = !isMemrefDependent;
+      break;
+    }
+    if (shouldErase)
+      argsToErase.set(arg.getArgNumber());
+  }
 
   if (argsToErase.any()) {
     if (failed(func.eraseArguments(argsToErase)))

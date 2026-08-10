@@ -1,24 +1,42 @@
 // RUN: tileir-to-mlir --convert-memref-args-to-ranked-memref %s | FileCheck %s
-// RUN: tileir-to-mlir --convert-memref-args-to-ranked-memref=remove-unused=false %s | FileCheck %s --check-prefix=KEEP
+// RUN: tileir-to-mlir --convert-memref-args-to-ranked-memref=remove-unused=memref-dependent %s | FileCheck %s --check-prefix=MEMREF
+// RUN: tileir-to-mlir --convert-memref-args-to-ranked-memref=remove-unused=assumed-memref-dependent %s | FileCheck %s --check-prefix=ASSUMED
+// RUN: tileir-to-mlir --convert-memref-args-to-ranked-memref=remove-unused=other %s | FileCheck %s --check-prefix=OTHER
+// RUN: tileir-to-mlir --convert-memref-args-to-ranked-memref=remove-unused=all %s | FileCheck %s --check-prefix=ALL
+// RUN: tileir-to-mlir --convert-memref-args-to-ranked-memref=remove-unused=none %s | FileCheck %s --check-prefix=NONE
 
 // Verifies that unranked memref kernel arguments that are always reinterpreted
 // the same way are promoted to ranked memref arguments, and scalar shape/stride
 // arguments are replaced with memref.dim / extract_strided_metadata-derived
-// values and removed from the function signature.
+// values. The default memref-dependent mode removes only those arguments, not
+// unrelated unused arguments.
 //
-// With remove-unused=false the now-unused shape/stride scalar arguments are
-// kept in the signature.
+// The assumed-memref-dependent mode additionally removes the unused final
+// stride slot of the rank-2 calling convention, even though the cast hardcodes
+// its stride to 1. Explicit mode checks cover all five removal policies.
 
 module attributes {gpu.container_module} {
   gpu.module @m {
     // CHECK-LABEL: gpu.func @kernel(
     // CHECK-SAME: %[[A:[^:]+]]: memref<?x64xf16, strided<[?, 1], offset: ?>>,
-    // CHECK-SAME: %[[N:[^:]+]]: i32)
+    // CHECK-SAME: %[[N:[^:]+]]: i32, %{{[^:]+}}: i32)
     // CHECK-NOT: memref.reinterpret_cast
-    // KEEP-LABEL: gpu.func @kernel(
-    // KEEP-SAME: %{{[^:]+}}: memref<?x64xf16, strided<[?, 1], offset: ?>>, %{{[^:]+}}: i32, %{{[^:]+}}: i32, %{{[^:]+}}: i32)
-    // KEEP-NOT: memref.reinterpret_cast
-    gpu.func @kernel(%arg0: memref<*xf16>, %arg1: i32, %arg2: i32, %arg3: i32) kernel {
+    // MEMREF-LABEL: gpu.func @kernel(
+    // MEMREF-SAME: %{{[^:]+}}: memref<?x64xf16, strided<[?, 1], offset: ?>>, %{{[^:]+}}: i32, %{{[^:]+}}: i32)
+    // MEMREF-NOT: memref.reinterpret_cast
+    // ASSUMED-LABEL: gpu.func @kernel(
+    // ASSUMED-SAME: %{{[^:]+}}: memref<?x64xf16, strided<[?, 1], offset: ?>>, %{{[^:]+}}: i32)
+    // ASSUMED-NOT: memref.reinterpret_cast
+    // OTHER-LABEL: gpu.func @kernel(
+    // OTHER-SAME: %{{[^:]+}}: memref<?x64xf16, strided<[?, 1], offset: ?>>, %{{[^:]+}}: i32, %{{[^:]+}}: i32, %{{[^:]+}}: i32)
+    // OTHER-NOT: memref.reinterpret_cast
+    // ALL-LABEL: gpu.func @kernel(
+    // ALL-SAME: %{{[^:]+}}: memref<?x64xf16, strided<[?, 1], offset: ?>>, %{{[^:]+}}: i32)
+    // ALL-NOT: memref.reinterpret_cast
+    // NONE-LABEL: gpu.func @kernel(
+    // NONE-SAME: %{{[^:]+}}: memref<?x64xf16, strided<[?, 1], offset: ?>>, %{{[^:]+}}: i32, %{{[^:]+}}: i32, %{{[^:]+}}: i32, %{{[^:]+}}: i32)
+    // NONE-NOT: memref.reinterpret_cast
+    gpu.func @kernel(%arg0: memref<*xf16>, %arg1: i32, %arg2: i32, %arg3: i32, %arg4: i32) kernel {
       %c0 = arith.constant 0 : index
       %m = arith.index_cast %arg1 : i32 to index
       %s = arith.index_cast %arg2 : i32 to index

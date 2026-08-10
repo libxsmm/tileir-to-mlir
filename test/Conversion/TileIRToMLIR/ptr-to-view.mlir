@@ -859,5 +859,76 @@ module {
       }
       return
     }
+
+    // -----------------------------------------------------------------------
+    // cutile widens index arithmetic to i64 with `exti signed` before applying
+    // it to the pointer, and spells the padding tile as a broadcast of a scalar
+    // integer constant.  Signed widening is value-preserving, so the narrow
+    // (i32) scalars are recovered and fed to the view ops unchanged; the
+    // integer zero padding maps onto `padding_value = zero`.
+    // -----------------------------------------------------------------------
+    // CHECK-LABEL: entry @load_1d_widened_index
+    // CHECK-GPU-LABEL: gpu.func @load_1d_widened_index
+    entry @load_1d_widened_index(%arg0: tile<ptr<i32>>, %arg1: tile<i32>) {
+      %cst_0 = constant <i32: 0> : tile<i32>
+      %cst_128 = constant <i32: 128> : tile<i32>
+      %block_id_x, %block_id_y, %block_id_z = get_tile_block_id : tile<i32>
+      %start = muli %block_id_x, %cst_128 : tile<i32>
+      %lane = iota : tile<128xi32>
+      %start_1d = reshape %start : tile<i32> -> tile<1xi32>
+      %start_bc = broadcast %start_1d : tile<1xi32> -> tile<128xi32>
+      %index = addi %start_bc, %lane : tile<128xi32>
+      %index_i64 = exti %index signed : tile<128xi32> -> tile<128xi64>
+      %shape_i64 = exti %arg1 signed : tile<i32> -> tile<i64>
+      %shape_1d = reshape %shape_i64 : tile<i64> -> tile<1xi64>
+      %shape_bc = broadcast %shape_1d : tile<1xi64> -> tile<128xi64>
+      %mask = cmpi less_than %index_i64, %shape_bc, unsigned : tile<128xi64> -> tile<128xi1>
+      %base_1d = reshape %arg0 : tile<ptr<i32>> -> tile<1xptr<i32>>
+      %base_bc = broadcast %base_1d : tile<1xptr<i32>> -> tile<128xptr<i32>>
+      %ptr = offset %base_bc, %index_i64 : tile<128xptr<i32>>, tile<128xi64> -> tile<128xptr<i32>>
+      %pad_1d = reshape %cst_0 : tile<i32> -> tile<1xi32>
+      %pad = broadcast %pad_1d : tile<1xi32> -> tile<128xi32>
+      // CHECK: %[[TVW:.*]] = make_tensor_view %arg0, shape = [%arg1], strides = [1] : tile<i32> -> tensor_view<?xi32, strides=[1]>
+      // CHECK: %[[PVW:.*]] = make_partition_view %[[TVW]] : partition_view<tile=(128), padding_value = zero, tensor_view<?xi32, strides=[1]>>
+      // CHECK: load_view_tko weak %[[PVW]][%{{.*}}]
+      // CHECK-NOT: load_ptr_tko
+      // CHECK-GPU: %[[WVIEW:.*]] = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%{{.*}}], strides: [1] : memref<*xi32> to memref<?xi32, strided<[1], offset: ?>>
+      // CHECK-GPU: vector.transfer_read %[[WVIEW]][%{{.*}}], %{{.*}} : memref<?xi32, strided<[1], offset: ?>>, vector<128xi32>
+      // CHECK-GPU-NOT: vector.gather
+      %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<128xptr<i32>>, tile<128xi1>, tile<128xi32> -> tile<128xi32>, !cuda_tile.token
+      return
+    }
+
+    // Same canonical access, but widened with `exti unsigned` and compared
+    // unsigned.  Zero- and sign-extension agree on the non-negative,
+    // non-wrapping index arithmetic this pattern already presupposes, so the
+    // access lifts exactly like the signed-widened one above.
+    // CHECK-LABEL: entry @load_1d_widened_index_unsigned
+    // CHECK-GPU-LABEL: gpu.func @load_1d_widened_index_unsigned
+    entry @load_1d_widened_index_unsigned(%arg0: tile<ptr<f32>>, %arg1: tile<i32>) {
+      %cst_128 = constant <i32: 128> : tile<i32>
+      %block_id_x, %block_id_y, %block_id_z = get_tile_block_id : tile<i32>
+      %start = muli %block_id_x, %cst_128 : tile<i32>
+      %lane = iota : tile<128xi32>
+      %start_1d = reshape %start : tile<i32> -> tile<1xi32>
+      %start_bc = broadcast %start_1d : tile<1xi32> -> tile<128xi32>
+      %index = addi %start_bc, %lane : tile<128xi32>
+      %index_i64 = exti %index unsigned : tile<128xi32> -> tile<128xi64>
+      %shape_i64 = exti %arg1 unsigned : tile<i32> -> tile<i64>
+      %shape_1d = reshape %shape_i64 : tile<i64> -> tile<1xi64>
+      %shape_bc = broadcast %shape_1d : tile<1xi64> -> tile<128xi64>
+      %mask = cmpi less_than %index_i64, %shape_bc, unsigned : tile<128xi64> -> tile<128xi1>
+      %base_1d = reshape %arg0 : tile<ptr<f32>> -> tile<1xptr<f32>>
+      %base_bc = broadcast %base_1d : tile<1xptr<f32>> -> tile<128xptr<f32>>
+      %ptr = offset %base_bc, %index_i64 : tile<128xptr<f32>>, tile<128xi64> -> tile<128xptr<f32>>
+      // CHECK: %[[TVU:.*]] = make_tensor_view %arg0, shape = [%arg1], strides = [1] : tile<i32> -> tensor_view<?xf32, strides=[1]>
+      // CHECK: %[[PVU:.*]] = make_partition_view %[[TVU]] : partition_view<tile=(128), padding_value = zero, tensor_view<?xf32, strides=[1]>>
+      // CHECK: load_view_tko weak %[[PVU]][%{{.*}}]
+      // CHECK-NOT: load_ptr_tko
+      // CHECK-GPU: vector.transfer_read
+      // CHECK-GPU-NOT: vector.gather
+      %tile, %token = load_ptr_tko weak %ptr, %mask : tile<128xptr<f32>>, tile<128xi1> -> tile<128xf32>, !cuda_tile.token
+      return
+    }
   }
 }

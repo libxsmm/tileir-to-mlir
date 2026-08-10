@@ -62,8 +62,8 @@ int main(int argc, char **argv) {
   });
 
   // Composed pipeline covering the common path: raise Triton-style pointer
-  // arithmetic to view ops, then lower Tile IR to MLIR. The target and
-  // append-grid-args options are forwarded to the core conversion pass. The
+  // arithmetic to view ops, then lower Tile IR to MLIR. All options of the
+  // core conversion pass are forwarded (--tileir-ptr-to-view has none). The
   // arg-promotion passes are intentionally left out because they are a
   // situational, mutually-exclusive ABI-shaping choice the caller adds
   // explicitly.
@@ -82,6 +82,21 @@ int main(int argc, char **argv) {
         llvm::cl::desc("Append six launch-coordinate i32 args to lowered entry "
                        "signatures and source dim queries from them"),
         llvm::cl::init(false)};
+    Option<bool> dropRoundingModes{
+        *this, "drop-rounding-modes",
+        llvm::cl::desc("Always drop source rounding-mode semantics and "
+                       "preserve them only as tir-dropped-rounding "
+                       "annotations"),
+        llvm::cl::init(false)};
+    Option<bool> assumeInBounds{
+        *this, "assume-in-bounds",
+        llvm::cl::desc("Assume all load and store ops are in bounds."),
+        llvm::cl::init(false)};
+    ListOption<int32_t> knownBlockSize{
+        *this, "known-block-size",
+        llvm::cl::desc("Block size (x, y, z) to set as the known_block_size "
+                       "attribute on generated gpu.func ops; must be empty or "
+                       "exactly three values")};
   };
   mlir::PassPipelineRegistration<TileIRToMLIRPipelineOptions>(
       "tileir-to-mlir-pipeline",
@@ -92,6 +107,10 @@ int main(int argc, char **argv) {
         mlir::ConvertTileIRToMLIRPassOptions passOpts;
         passOpts.target = opts.target;
         passOpts.appendGridArgs = opts.appendGridArgs;
+        passOpts.dropRoundingModes = opts.dropRoundingModes;
+        passOpts.assumeInBounds = opts.assumeInBounds;
+        passOpts.knownBlockSize.assign(opts.knownBlockSize.begin(),
+                                       opts.knownBlockSize.end());
         pm.addPass(mlir::createConvertTileIRToMLIRPass(passOpts));
       });
 

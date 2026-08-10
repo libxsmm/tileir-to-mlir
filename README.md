@@ -6,7 +6,8 @@ A conversion pass and tooling to lower Tile IR to MLIR dialects, including GPU, 
   * `append-grid-args={true|false}` (default: `false`): If `true`, appends six `i32` launch-coordinate arguments (block-id x/y/z, grid-dim x/y/z) to entry functions and sources dimension queries from them. Required on the `cpu` target when dimension queries are present.
   * `drop-rounding-modes={true|false}`(default: `false`): If true, always drop source rounding-mode semantics and preserve them only as tir-dropped-rounding annotations.
   * `assume-in-bounds={true|false}`(default: `false`): If true, assume all load and store ops are in bounds.
-* **`--tileir-to-mlir-pipeline`**: A convenience pipeline that runs `--tileir-ptr-to-view` followed by `--convert-tileir-to-mlir`. It forwards the `target` and `append-grid-args` options.
+  * `known-block-size=x,y,z` (default: unset): If given exactly three values, sets the `known_block_size` attribute on the generated `gpu.func` ops; if omitted, the attribute is not set.
+* **`--tileir-to-mlir-pipeline`**: A convenience pipeline that runs `--tileir-ptr-to-view` followed by `--convert-tileir-to-mlir`. It forwards all options of `--convert-tileir-to-mlir` (`target`, `append-grid-args`, `drop-rounding-modes`, `assume-in-bounds`, `known-block-size`).
 * **`--tileir-ptr-to-view`**: Recognizes Triton-style pointer arithmetic (iota, reshape, broadcast, offset) feeding `load_ptr_tko` or `store_ptr_tko` and lifts them into higher-level "view" operations for more efficient lowering.
 * **`--convert-memref-args-to-ptr-args`**: Promotes unranked memref arguments (`memref<*xT>`) to bare `!llvm.ptr` when all uses are identical `reinterpret_cast` operations. Intended for use after the core conversion.
 * **`--convert-memref-args-to-ranked-memref`**: Promotes unranked memref kernel arguments and their associated scalar shape/stride arguments into ranked memref arguments. Intended for use after the core conversion.

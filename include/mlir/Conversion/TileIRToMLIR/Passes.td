@@ -24,6 +24,9 @@ def ConvertTileIRToMLIRPass : Pass<"convert-tileir-to-mlir", "ModuleOp"> {
     only as discardable `tir-dropped-rounding` attributes.
     `assume-in-bounds` forces all generated vector.transfer_read and
     vector.transfer_write ops to carry fully in-bounds flags.
+    `known-block-size`, when given three values, sets the `known_block_size`
+    attribute (x, y, z) on the generated `gpu.func` ops; when omitted the
+    attribute is not set.
   }];
   let dependentDialects = [
     "cuda_tile::CudaTileDialect",
@@ -46,15 +49,17 @@ def ConvertTileIRToMLIRPass : Pass<"convert-tileir-to-mlir", "ModuleOp"> {
               clEnumValN(::mlir::TileIRTarget::CPU, "cpu",
                          "Lower without the GPU container-module marker"))}]>,
     Option<"appendGridArgs", "append-grid-args", "bool",
-          /*default=*/"false",
-          "Append six launch-coordinate i32 args to lowered entry signatures and source dim queries from them (required on non-GPU targets when dim-query ops are used)">,
+           /*default=*/"false",
+           "Append six launch-coordinate i32 args to lowered entry signatures and source dim queries from them (required on non-GPU targets when dim-query ops are used)">,
     Option<"dropRoundingModes", "drop-rounding-modes",
-          "bool", /*default=*/"false",
-          "Always drop source rounding-mode semantics and preserve them only as tir-dropped-rounding annotations">,
+           "bool", /*default=*/"false",
+           "Always drop source rounding-mode semantics and preserve them only as tir-dropped-rounding annotations">,
     Option<"assumeInBounds", "assume-in-bounds",
-          "bool", /*default=*/"false",
-          "Assume all load and store ops are in bounds.">
-  ];
+           "bool", /*default=*/"false",
+           "Assume all load and store ops are in bounds.">,
+    ListOption<"knownBlockSize", "known-block-size", "int32_t",
+               "Block size (x, y, z) to set as the known_block_size attribute on generated gpu.func ops; must be empty or exactly three values">
+  ]; 
 }
 
 def ConvertMemrefArgsToPtrArgsPass : Pass<"convert-memref-args-to-ptr-args", "ModuleOp"> {
@@ -103,15 +108,37 @@ def ConvertMemrefArgsToRankedMemrefPass : Pass<"convert-memref-args-to-ranked-me
     cast's dynamic sizes/strides are rewritten to equivalent memref queries:
       * dynamic shape -> `memref.dim`
       * dynamic stride -> `memref.extract_strided_metadata`
-    Once all uses are rewritten, such scalar arguments are removed from the
-    signature.
+
+    The `remove-unused` option controls removal of unused signature arguments:
+      * `memref-dependent` (the default) removes only arguments that supplied
+        dynamic sizes or strides for converted memrefs,
+      * `assumed-memref-dependent` also removes unused arguments in the
+        assumed `(memref, size0, ..., sizeN-1, stride0, ..., strideN-1)`
+        calling-convention slots after each converted rank-N memref,
+      * `other` removes only other unused arguments,
+      * `all` removes every unused argument, and
+      * `none` preserves all unused arguments.
 
     The rewrite is conservative and skips any function where changing the
     signature would invalidate in-module symbol users.
   }];
   let options = [
-    Option<"removeUnused", "remove-unused", "bool", "true",
-           "Remove arguments that have no uses after the conversion">,
+    Option<"removeUnused", "remove-unused", "::mlir::MemrefArgRemovalMode",
+           /*default=*/"::mlir::MemrefArgRemovalMode::MemrefDependent",
+          "Unused argument removal mode ('all', 'none', 'memref-dependent', 'assumed-memref-dependent', or 'other')",
+           [{::llvm::cl::values(
+              clEnumValN(::mlir::MemrefArgRemovalMode::All, "all",
+                         "Remove all unused arguments"),
+              clEnumValN(::mlir::MemrefArgRemovalMode::None, "none",
+                         "Preserve all unused arguments"),
+              clEnumValN(::mlir::MemrefArgRemovalMode::MemrefDependent,
+                         "memref-dependent",
+                         "Remove only unused memref-dependent arguments"),
+              clEnumValN(::mlir::MemrefArgRemovalMode::AssumedMemrefDependent,
+                         "assumed-memref-dependent",
+                         "Also remove unused assumed size and stride arguments"),
+              clEnumValN(::mlir::MemrefArgRemovalMode::Other, "other",
+                         "Remove only unused non-memref-dependent arguments"))}]>,
   ];
   let dependentDialects = [
     "memref::MemRefDialect",

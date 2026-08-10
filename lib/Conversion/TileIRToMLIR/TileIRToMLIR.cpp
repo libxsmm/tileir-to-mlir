@@ -1539,11 +1539,15 @@ struct ConvertDivI : public OpConversionPattern<cuda_tile::DivIOp> {
 ///
 /// `optimization_hints`, when present, is preserved on the produced function as
 /// the discardable attribute `tir-dropped-optimization-hints`.
+///
+/// When `known-block-size` provides three values, the produced gpu.func carries
+/// them as the `known_block_size` attribute.
 struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
   ConvertEntry(const TypeConverter &tc, MLIRContext *ctx, TileIRTarget target,
-               bool appendGridArgs)
+               bool appendGridArgs, ArrayRef<int32_t> knownBlockSize)
       : OpConversionPattern(tc, ctx), target(target),
-        appendGridArgs(appendGridArgs) {}
+        appendGridArgs(appendGridArgs),
+        knownBlockSize(knownBlockSize.begin(), knownBlockSize.end()) {}
 
   LogicalResult
   matchAndRewrite(cuda_tile::EntryOp entryOp, OpAdaptor adaptor,
@@ -1596,6 +1600,9 @@ struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
           gpu::GPUFuncOp::create(rewriter, loc, entryOp.getSymName(), funcType);
       gpuFunc->setAttr(gpu::GPUDialect::getKernelFuncAttrName(),
                        rewriter.getUnitAttr());
+      if (!knownBlockSize.empty())
+        gpuFunc.setKnownBlockSizeAttr(
+            rewriter.getDenseI32ArrayAttr(knownBlockSize));
       preserveDroppedOptHints(entryOp, gpuFunc);
       Block *gpuBlock = &gpuFunc.getBody().front();
       rewriter.mergeBlocks(*convertedBlock, gpuBlock, gpuBlock->getArguments());
@@ -1613,6 +1620,7 @@ struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
 
   TileIRTarget target;
   bool appendGridArgs;
+  SmallVector<int32_t, 3> knownBlockSize;
 };
 
 using ConvertExp = ConvertUnarySourceOp<cuda_tile::ExpOp, math::ExpOp>;
@@ -3894,11 +3902,13 @@ static void populateTileIRToMLIRTypeConverter(TypeConverter &converter,
 /// Register all cuda_tile -> gpu/vector conversion patterns.
 static void populateTileIRToMLIRConversionPatterns(
     TypeConverter &converter, RewritePatternSet &patterns, TileIRTarget target,
-    bool appendGridArgs, bool dropRoundingModes, bool assumeInBounds) {
+    bool appendGridArgs, bool dropRoundingModes, bool assumeInBounds,
+    ArrayRef<int32_t> knownBlockSize) {
   MLIRContext *ctx = patterns.getContext();
   // Target-dependent patterns select gpu vs func ops (module / entry / return)
   // and gpu dim-query ops vs leading function arguments (block id / grid dim).
-  patterns.add<ConvertEntry>(converter, ctx, target, appendGridArgs);
+  patterns.add<ConvertEntry>(converter, ctx, target, appendGridArgs,
+                             knownBlockSize);
   patterns.add<ConvertGetNumTileBlocks, ConvertGetTileBlockId>(
       converter, ctx, target, appendGridArgs);
   patterns.add<ConvertModule, ConvertReturn>(converter, ctx, target);
@@ -4070,6 +4080,11 @@ struct ConvertTileIRToMLIRPass
     MLIRContext *ctx = &getContext();
     ModuleOp module = getOperation();
 
+    if (!knownBlockSize.empty() && knownBlockSize.size() != 3) {
+      module.emitError("'known-block-size' expects exactly three values");
+      return signalPassFailure();
+    }
+
     // Strip loop-carried tokens before conversion: the target dialects cannot
     // represent `!cuda_tile.token` scf.for iter args, and the token ordering is
     // subsumed by program order among the lowered side-effecting ops.
@@ -4082,7 +4097,7 @@ struct ConvertTileIRToMLIRPass
     RewritePatternSet patterns(ctx);
     populateTileIRToMLIRConversionPatterns(typeConverter, patterns, target,
                                            appendGridArgs, dropRoundingModes,
-                                           assumeInBounds);
+                                           assumeInBounds, knownBlockSize);
 
     ConversionTarget conversionTarget(*ctx);
 

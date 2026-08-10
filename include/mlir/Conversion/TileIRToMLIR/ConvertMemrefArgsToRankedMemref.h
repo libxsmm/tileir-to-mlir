@@ -13,8 +13,18 @@
 namespace mlir {
 class ModuleOp;
 
+/// Selects which unused arguments are removed after memref promotion.
+enum class MemrefArgRemovalMode {
+	All,
+	None,
+	MemrefDependent,
+	AssumedMemrefDependent,
+	Other,
+};
+
 /// Generated pass declarations (createConvertMemrefArgsToRankedMemrefPass
-/// factory).
+/// factory). The MemrefArgRemovalMode enum above must be defined before this
+/// include, as it is referenced by the generated code.
 #define GEN_PASS_DECL_CONVERTMEMREFARGSTORANKEDMEMREFPASS
 #include "mlir/Conversion/TileIRToMLIR/Passes.h.inc"
 
