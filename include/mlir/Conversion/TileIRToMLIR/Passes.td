@@ -65,22 +65,19 @@ def ConvertTileIRToMLIRPass : Pass<"convert-tileir-to-mlir", "ModuleOp"> {
 def ConvertMemrefArgsToPtrArgsPass : Pass<"convert-memref-args-to-ptr-args", "ModuleOp"> {
   let summary = "Promote unranked-memref function arguments to !llvm.ptr";
   let description = [{
-    Detects function arguments of unranked-memref type (`memref<*xT>`) whose
-    every use is an identical `memref.reinterpret_cast` that pins down a concrete
-    ranked layout, and rewrites the function signature to take a bare `!llvm.ptr`
-    instead. The ranked `memref` is recovered once at the top of the body with an
-    `unrealized_conversion_cast` from that pointer, and the now-redundant
-    `reinterpret_cast` ops (and any address-computation ops that solely fed them)
-    are erased.
+    Rewrites eligible unranked-memref arguments (`memref<*xT>`) to bare
+    `!llvm.ptr` arguments. An argument is eligible when it has no uses, or when
+    every use is a `memref.cast` or `memref.reinterpret_cast` whose source is
+    that exact argument and whose result is a ranked memref with the same
+    element type. Matching casts need not have the same rank or layout. Each is
+    replaced independently by a memref descriptor materialized from the pointer
+    and wrapped in an `unrealized_conversion_cast` to its original ranked type.
 
     The rewrite is conservative. An argument is promoted only when:
-      * it is of unranked-memref type and has at least one use,
-      * every use is a `memref.reinterpret_cast` whose source is that argument,
-      * all those casts are mutually identical (same ranked result type and the
-        same offset / size / stride operands), so the promoted type is
-        unambiguous, and
-      * the function is not referenced (called / launched) from within the
-        module, so no in-module call site is invalidated.
+      * it is an unranked-memref argument,
+      * every use satisfies the cast constraint above, and
+      * the containing function is a symbol with no references in its nearest
+        symbol table, so no in-module call site is invalidated.
     When any of these conditions fails the argument is left untouched.
   }];
   let dependentDialects = [
@@ -92,35 +89,37 @@ def ConvertMemrefArgsToPtrArgsPass : Pass<"convert-memref-args-to-ptr-args", "Mo
 }
 
 def ConvertMemrefArgsToRankedMemrefPass : Pass<"convert-memref-args-to-ranked-memref", "ModuleOp"> {
-  let summary = "Promote unranked memref kernel args to ranked memrefs";
+  let summary = "Promote unranked memref function args to ranked memrefs";
   let description = [{
-    Rewrites function-like kernel signatures produced by
-    `--convert-tileir-to-mlir` from unranked memref pointer arguments plus
-    scalar shape/stride arguments into ranked memref arguments.
+    Rewrites function-like signatures produced by `--convert-tileir-to-mlir`
+    from unranked memref pointer arguments plus scalar shape/stride arguments
+    into ranked memref arguments.
 
     For each unranked memref argument (`memref<*xT>`), the pass matches the
-    canonical pattern where every use is an identical
+    canonical pattern where every use is an identical, zero-offset
     `memref.reinterpret_cast` to the same ranked result type. The argument type
-    is updated to that ranked memref type and the redundant reinterpret casts
-    are erased.
+    is updated to that ranked memref type and the redundant casts are erased.
 
     Scalar arguments that were originally used to materialize the matched
-    cast's dynamic sizes/strides are rewritten to equivalent memref queries:
+    cast's dynamic sizes/strides are rewritten to equivalent memref queries
+    when they have an unambiguous replacement recipe:
       * dynamic shape -> `memref.dim`
       * dynamic stride -> `memref.extract_strided_metadata`
 
     The `remove-unused` option controls removal of unused signature arguments:
-      * `memref-dependent` (the default) removes only arguments that supplied
-        dynamic sizes or strides for converted memrefs,
-      * `assumed-memref-dependent` also removes unused arguments in the
-        assumed `(memref, size0, ..., sizeN-1, stride0, ..., strideN-1)`
-        calling-convention slots after each converted rank-N memref,
-      * `other` removes only other unused arguments,
+      * `memref-dependent` (the default) removes only arguments explicitly
+        used for dynamic sizes or strides of converted memrefs,
+      * `assumed-memref-dependent` additionally removes unused arguments in a
+        complete `(memref, size0, ..., sizeN-1, stride0, ..., strideN-1)`
+        calling-convention sequence after each converted rank-N memref,
+      * `other` removes only unused arguments that are not explicitly
+        memref-dependent,
       * `all` removes every unused argument, and
       * `none` preserves all unused arguments.
 
-    The rewrite is conservative and skips any function where changing the
-    signature would invalidate in-module symbol users.
+    The rewrite is conservative and skips a function unless it is a symbol with
+    no references in its nearest symbol table, so changing its signature cannot
+    invalidate in-module symbol users.
   }];
   let options = [
     Option<"removeUnused", "remove-unused", "::mlir::MemrefArgRemovalMode",
