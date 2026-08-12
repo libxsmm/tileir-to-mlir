@@ -65,7 +65,8 @@ def ConvertTileIRToMLIRPass : Pass<"convert-tileir-to-mlir", "ModuleOp"> {
 def ConvertMemrefArgsToPtrArgsPass : Pass<"convert-memref-args-to-ptr-args", "ModuleOp"> {
   let summary = "Promote unranked-memref function arguments to !llvm.ptr";
   let description = [{
-    Rewrites eligible unranked-memref arguments (`memref<*xT>`) to bare
+    Rewrites function-like signatures produced by `--convert-tileir-to-mlir` from
+    eligible unranked-memref arguments (`memref<*xT>`) to bare
     `!llvm.ptr` arguments. An argument is eligible when it has no uses, or when
     every use is a `memref.cast` or `memref.reinterpret_cast` whose source is
     that exact argument and whose result is a ranked memref with the same
