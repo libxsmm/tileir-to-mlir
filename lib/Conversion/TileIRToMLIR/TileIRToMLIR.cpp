@@ -1421,7 +1421,6 @@ struct ConvertConstant : public OpConversionPattern<cuda_tile::ConstantOp> {
       return failure();
 
     auto denseVal = op.getValue();
-    Location loc = op.getLoc();
 
     if (tileType.getShape().empty()) {
       // Scalar tile -> scalar constant

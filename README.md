@@ -55,7 +55,6 @@ cmake -S llvm -B build -G Ninja \
   -DLLVM_EXTERNAL_TILEIR_TO_MLIR_SOURCE_DIR=../tileir-to-mlir \
   -DLLVM_USE_LINKER=lld \
   -DLLVM_TARGETS_TO_BUILD=host
-
 cmake --build build --target tileir-to-mlir
 ```
 
