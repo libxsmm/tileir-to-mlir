@@ -3,9 +3,9 @@
 config.llvm_tools_dir = "@LLVM_TOOLS_DIR@"
 config.llvm_shlib_ext = "@CMAKE_SHARED_LIBRARY_SUFFIX@"
 
-config.tileir_to_mlir_obj_root = "@CMAKE_BINARY_DIR@"
-config.tileir_to_mlir_tool_dir = "@CMAKE_BINARY_DIR@/tools"
-config.tileir_to_mlir_source_root = "@CMAKE_SOURCE_DIR@/test"
+config.tileir_to_mlir_obj_root = "@PROJECT_BINARY_DIR@"
+config.tileir_to_mlir_tool_dir = "@TILEIR_TO_MLIR_TOOL_DIR@"
+config.tileir_to_mlir_source_root = "@PROJECT_SOURCE_DIR@/test"
 
 import lit.llvm
 lit.llvm.initialize(lit_config, config)

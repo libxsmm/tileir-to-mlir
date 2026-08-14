@@ -1,5 +1,5 @@
 // RUN: tileir-to-mlir --convert-tileir-to-mlir %s | FileCheck %s
-// RUN: tileir-to-mlir --convert-tileir-to-mlir %s | mlir-opt --loop-invariant-code-motion -canonicalize -cse > /dev/null
+// RUN: tileir-to-mlir --convert-tileir-to-mlir --loop-invariant-code-motion -canonicalize -cse %s > /dev/null
 
 // CHECK: #map = affine_map<(d0, d1) -> (d1, d0)>
 // CHECK: #map1 = affine_map<(d0, d1, d2) -> (d0, d2)>

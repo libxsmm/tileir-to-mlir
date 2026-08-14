@@ -6,7 +6,7 @@ import lit.formats
 from lit.llvm import llvm_config
 
 config.name = "TILEIR_TO_MLIR"
-config.test_format = lit.formats.ShTest(not llvm_config.use_lit_shell)
+config.test_format = lit.formats.ShTest(execute_external=False)
 config.suffixes = [".mlir"]
 config.excludes = ["lit.cfg.py", "lit.site.cfg.py", "CMakeLists.txt"]
 
@@ -26,7 +26,6 @@ tool_dirs = [
 tools = [
     "tileir-to-mlir",
     "FileCheck",
-    "mlir-opt",
     "not",
 ]
 

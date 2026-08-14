@@ -1,5 +1,5 @@
 // RUN: tileir-to-mlir --convert-tileir-to-mlir %s | FileCheck %s
-// RUN: tileir-to-mlir --convert-tileir-to-mlir %s | mlir-opt --loop-invariant-code-motion -canonicalize -cse > /dev/null
+// RUN: tileir-to-mlir --convert-tileir-to-mlir --loop-invariant-code-motion -canonicalize -cse %s > /dev/null
 
 // Additional tests that complement cuda_tile_ir_ops.mlir.
 // Focuses on: 2D array constants, vector iter_args, assume chaining,

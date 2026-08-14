@@ -8,7 +8,7 @@ configure_lit_site_cfg(
 
 set(TILEIR_TO_MLIR_TEST_DEPENDS
   FileCheck
-  mlir-opt
+  not
   tileir-to-mlir
 )
 

@@ -6,6 +6,9 @@ add_library(TileIRToMLIR STATIC
 )
 
 add_dependencies(TileIRToMLIR MLIRTileIRToMLIRConversionPassIncGen)
+if(TILEIR_TO_MLIR_EXTERNAL_PROJECT_BUILD)
+  add_dependencies(TileIRToMLIR CudaTileIncGen)
+endif()
 
 target_link_libraries(TileIRToMLIR
   PRIVATE
