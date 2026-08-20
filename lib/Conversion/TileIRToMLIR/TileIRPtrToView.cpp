@@ -1,5 +1,10 @@
 //===- TileIRPtrToView.cpp - ptr-arith -> TileIR view ops ---------------===//
 //
+// Part of the tileir-to-mlir project, under the Apache License v2.0 with LLVM
+// Exceptions. See https://llvm.org/LICENSE.txt for license information.
+//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
 // Pre-conversion pass that recognises the canonical
 // iota+reshape+broadcast+offset pointer-arithmetic feeding a
 // cuda_tile.load_ptr_tko/store_ptr_tko and rewrites it into the higher-level

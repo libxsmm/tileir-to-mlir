@@ -1,5 +1,10 @@
 //===- TileIRPtrToView.h - Triton ptr-arith -> TileIR view ops *- C++ -*-===//
 //
+// Part of the tileir-to-mlir project, under the Apache License v2.0 with LLVM
+// Exceptions. See https://llvm.org/LICENSE.txt for license information.
+//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
 // Preprocessing pass that rewrites the canonical Triton-emitted
 // iota+reshape+broadcast+offset pointer-arithmetic chain feeding a
 // `cuda_tile.load_ptr_tko` / `cuda_tile.store_ptr_tko` into the higher-level

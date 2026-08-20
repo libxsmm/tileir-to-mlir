@@ -1,5 +1,10 @@
 //===- ConvertMemrefArgsToPtrArgs.h - memref->ptr args ---------*- C++ -*-===//
 //
+// Part of the tileir-to-mlir project, under the Apache License v2.0 with LLVM
+// Exceptions. See https://llvm.org/LICENSE.txt for license information.
+//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
 // Pass that promotes unranked-memref function arguments to `!llvm.ptr` when
 // every use of the argument is an identical `memref.reinterpret_cast` that pins
 // down a concrete ranked layout, dropping the otherwise-redundant casts.
