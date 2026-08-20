@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    env:
+      LLVM_REVISION: 16ca9a2e1a5b6f687adee1ec980bbc40c448b760
+      LLVM_SOURCE_DIR: ${{ github.workspace }}/llvm-project
+      BUILD_DIR: ${{ github.workspace }}/llvm-project/build
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y lld ninja-build
+
+      - name: Check out LLVM
+        uses: actions/checkout@v5
+        with:
+          repository: llvm/llvm-project
+          ref: ${{ env.LLVM_REVISION }}
+          path: llvm-project
+          fetch-depth: 1
+
+      - name: Configure LLVM, MLIR, and TileIRToMLIR
+        run: |
+          cmake -S "$LLVM_SOURCE_DIR/llvm" -B "$BUILD_DIR" -G Ninja \
+            -DLLVM_ENABLE_PROJECTS=mlir \
+            -DLLVM_EXTERNAL_PROJECTS=tileir-to-mlir \
+            -DLLVM_EXTERNAL_TILEIR_TO_MLIR_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DLLVM_USE_LINKER=lld \
+            -DLLVM_TARGETS_TO_BUILD=host
+
+      - name: Run tests
+        run: cmake --build "$BUILD_DIR" --target test
