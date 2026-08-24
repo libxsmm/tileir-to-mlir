@@ -13,7 +13,6 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     env:
-      LLVM_REVISION: 16ca9a2e1a5b6f687adee1ec980bbc40c448b760
       LLVM_SOURCE_DIR: ${{ github.workspace }}/llvm-project
       BUILD_DIR: ${{ github.workspace }}/llvm-project/build
 
@@ -22,6 +21,10 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Read LLVM revision
+        id: llvm-revision
+        run: echo "revision=$(<llvm-revision.txt)" >> "$GITHUB_OUTPUT"
+
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y lld ninja-build
 
@@ -29,7 +32,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: llvm/llvm-project
-          ref: ${{ env.LLVM_REVISION }}
+          ref: ${{ steps.llvm-revision.outputs.revision }}
           path: llvm-project
           fetch-depth: 1
 

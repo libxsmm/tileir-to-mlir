@@ -25,7 +25,7 @@ The tool accepts textual and binary TileIR as input.
 * **CMake 3.20+**
 * **C++17 compiler**
 * **Ninja** (recommended)
-* **LLVM/MLIR revision `16ca9a2e1a5b6f687adee1ec980bbc40c448b760`** (see below).
+* **LLVM/MLIR revision as in llvm-revision.txt** (see below).
 * **CUDA Tile** is included as the `third_party/cuda-tile` submodule at
   `v13.3.3` (`af2417041cc939b87ef56d92cfdcf61737c5457e`).
 
@@ -37,10 +37,10 @@ LLVM revision:
 ```bash
 mkdir tileir-to-mlir
 cd tileir-to-mlir
-git clone --recurse-submodules https://github.com/intel-sandbox/users.fschlimb.CudaTileToGPU tileir-to-mlir
+git clone --recurse-submodules https://github.com/libxsmm/tileir-to-mlir tileir-to-mlir
 git clone --single-branch --branch main https://github.com/llvm/llvm-project
 cd llvm-project
-git checkout 16ca9a2e1a5b6f687adee1ec980bbc40c448b760
+git checkout $(cat ../tileir-to-mlir/llvm-revision.txt)
 ```
 
 Configure LLVM/MLIR and this project in one build tree. `TileIRToMLIR` adds its
@@ -59,7 +59,7 @@ cmake --build build --target tileir-to-mlir
 ```
 
 The external-project configure might fail unless the LLVM source checkout is
-at `16ca9a2e1a5b6f687adee1ec980bbc40c448b760`.
+at llvm-revision.txt.
 
 ## Option2: Building with existing cude-tile andLLVM/MLIR builds
 

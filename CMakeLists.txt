@@ -93,10 +93,22 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 else()
   set(TILEIR_TO_MLIR_EXTERNAL_PROJECT_BUILD TRUE)
 
-  # This project is validated only against this LLVM revision. Requiring the
-  # exact checkout keeps the in-tree CUDA Tile and conversion APIs aligned.
-  set(TILEIR_TO_MLIR_REQUIRED_LLVM_REVISION
-      "16ca9a2e1a5b6f687adee1ec980bbc40c448b760")
+  # Use an explicit revision override when supplied; otherwise, use the pin
+  # shared with the build scripts and CI. Requiring the exact checkout keeps
+  # the in-tree CUDA Tile and conversion APIs aligned.
+  if(DEFINED USE_LLVM_REVISION)
+    set(TILEIR_TO_MLIR_REQUIRED_LLVM_REVISION "${USE_LLVM_REVISION}")
+  else()
+    set(TILEIR_TO_MLIR_LLVM_REVISION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../llvm-revision.txt")
+    if(NOT EXISTS "${TILEIR_TO_MLIR_LLVM_REVISION_FILE}")
+      message(FATAL_ERROR "Missing pinned LLVM revision file: ${TILEIR_TO_MLIR_LLVM_REVISION_FILE}")
+    endif()
+    # Re-configure whenever the pin changes.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${TILEIR_TO_MLIR_LLVM_REVISION_FILE}")
+    file(STRINGS "${TILEIR_TO_MLIR_LLVM_REVISION_FILE}" TILEIR_TO_MLIR_REQUIRED_LLVM_REVISION LIMIT_COUNT 1)
+    string(STRIP "${TILEIR_TO_MLIR_REQUIRED_LLVM_REVISION}" TILEIR_TO_MLIR_REQUIRED_LLVM_REVISION)
+  endif()
+
   find_program(_tileir_to_mlir_git_executable git REQUIRED)
   execute_process(
     COMMAND "${_tileir_to_mlir_git_executable}" -C "${LLVM_MAIN_SRC_DIR}" rev-parse HEAD
