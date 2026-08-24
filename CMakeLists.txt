@@ -93,20 +93,14 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 else()
   set(TILEIR_TO_MLIR_EXTERNAL_PROJECT_BUILD TRUE)
 
-  # Use an explicit revision override when supplied; otherwise, use the pin
-  # shared with the build scripts and CI. Requiring the exact checkout keeps
-  # the in-tree CUDA Tile and conversion APIs aligned.
-  if(DEFINED USE_LLVM_REVISION)
-    set(TILEIR_TO_MLIR_REQUIRED_LLVM_REVISION "${USE_LLVM_REVISION}")
-  else()
-    set(TILEIR_TO_MLIR_LLVM_REVISION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../llvm-revision.txt")
-    if(NOT EXISTS "${TILEIR_TO_MLIR_LLVM_REVISION_FILE}")
-      message(FATAL_ERROR "Missing pinned LLVM revision file: ${TILEIR_TO_MLIR_LLVM_REVISION_FILE}")
-    endif()
-    # Re-configure whenever the pin changes.
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${TILEIR_TO_MLIR_LLVM_REVISION_FILE}")
-    file(STRINGS "${TILEIR_TO_MLIR_LLVM_REVISION_FILE}" TILEIR_TO_MLIR_REQUIRED_LLVM_REVISION LIMIT_COUNT 1)
-    string(STRIP "${TILEIR_TO_MLIR_REQUIRED_LLVM_REVISION}" TILEIR_TO_MLIR_REQUIRED_LLVM_REVISION)
+  # Requiring the exact checkout keeps the in-tree CUDA Tile and conversion
+  # APIs aligned; -DUSE_LLVM_REVISION overrides the pin in llvm-revision.txt.
+  if(NOT USE_LLVM_REVISION)
+    set(_tileir_to_mlir_llvm_pin "${CMAKE_CURRENT_LIST_DIR}/llvm-revision.txt")
+    # A bumped pin must re-run configure, not just rebuild.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_tileir_to_mlir_llvm_pin}")
+    file(STRINGS "${_tileir_to_mlir_llvm_pin}" USE_LLVM_REVISION LIMIT_COUNT 1)
+    unset(_tileir_to_mlir_llvm_pin)
   endif()
 
   find_program(_tileir_to_mlir_git_executable git REQUIRED)
@@ -119,13 +113,12 @@ else()
   if(NOT _tileir_to_mlir_llvm_revision_result EQUAL 0)
     message(FATAL_ERROR
       "TileIRToMLIR requires an LLVM Git checkout at "
-      "${TILEIR_TO_MLIR_REQUIRED_LLVM_REVISION}.")
+      "${USE_LLVM_REVISION}.")
   endif()
-  if(NOT _tileir_to_mlir_llvm_revision STREQUAL
-         TILEIR_TO_MLIR_REQUIRED_LLVM_REVISION)
+  if(NOT _tileir_to_mlir_llvm_revision STREQUAL USE_LLVM_REVISION)
     message(FATAL_ERROR
       "TileIRToMLIR requires LLVM revision "
-      "${TILEIR_TO_MLIR_REQUIRED_LLVM_REVISION}, but found "
+      "${USE_LLVM_REVISION}, but found "
       "${_tileir_to_mlir_llvm_revision}.")
   endif()
   unset(_tileir_to_mlir_git_executable)
