@@ -290,8 +290,8 @@ static bool promoteOneFunction(FunctionOpInterface func,
       continue;
 
     bool isMemrefDependent = memrefDependentArgs.test(arg.getArgNumber());
-  bool isAssumedMemrefDependent =
-    assumedMemrefDependentArgs.test(arg.getArgNumber());
+    bool isAssumedMemrefDependent =
+        assumedMemrefDependentArgs.test(arg.getArgNumber());
     bool shouldErase = false;
     switch (removeUnused) {
     case MemrefArgRemovalMode::All:

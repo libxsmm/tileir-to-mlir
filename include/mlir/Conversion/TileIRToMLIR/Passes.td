@@ -59,7 +59,7 @@ def ConvertTileIRToMLIRPass : Pass<"convert-tileir-to-mlir", "ModuleOp"> {
            "Assume all load and store ops are in bounds.">,
     ListOption<"knownBlockSize", "known-block-size", "int32_t",
                "Block size (x, y, z) to set as the known_block_size attribute on generated gpu.func ops; must be empty or exactly three values">
-  ]; 
+  ];
 }
 
 def ConvertMemrefArgsToPtrArgsPass : Pass<"convert-memref-args-to-ptr-args", "ModuleOp"> {
@@ -125,7 +125,7 @@ def ConvertMemrefArgsToRankedMemrefPass : Pass<"convert-memref-args-to-ranked-me
   let options = [
     Option<"removeUnused", "remove-unused", "::mlir::MemrefArgRemovalMode",
            /*default=*/"::mlir::MemrefArgRemovalMode::MemrefDependent",
-          "Unused argument removal mode ('all', 'none', 'memref-dependent', 'assumed-memref-dependent', or 'other')",
+           "Unused argument removal mode ('all', 'none', 'memref-dependent', 'assumed-memref-dependent', or 'other')",
            [{::llvm::cl::values(
               clEnumValN(::mlir::MemrefArgRemovalMode::All, "all",
                          "Remove all unused arguments"),
