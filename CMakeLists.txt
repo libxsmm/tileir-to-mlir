@@ -159,6 +159,8 @@ set(TILEIR_TO_MLIR_CUDA_TILE_SOURCE_DIR
 # The detected locations can always be overridden explicitly on the command line.
 set(CUDA_TILE_DIR "" CACHE PATH
     "Root directory of the cuda-tile project (source/build root or install dir)")
+option(TILEIR_TO_MLIR_BUILD_CUDA_TILE
+  "Build the pinned CUDA Tile sources as part of a standalone build" ON)
 
 set(CUDA_TILE_PUBLIC_INCLUDE_DIR "" CACHE PATH
     "Directory containing cuda-tile public headers (cuda_tile/Dialect/...)")
@@ -167,10 +169,10 @@ set(CUDA_TILE_GEN_INCLUDE_DIR "" CACHE PATH
 set(CUDA_TILE_LIB_DIR "" CACHE PATH
     "Directory containing libCudaTileDialect.a and friends")
 
-if(TILEIR_TO_MLIR_EXTERNAL_PROJECT_BUILD)
+if(TILEIR_TO_MLIR_EXTERNAL_PROJECT_BUILD OR TILEIR_TO_MLIR_BUILD_CUDA_TILE)
   if(NOT EXISTS "${TILEIR_TO_MLIR_CUDA_TILE_SOURCE_DIR}/CMakeLists.txt")
     message(FATAL_ERROR
-      "CUDA Tile sources are required for an LLVM external-project build.\n"
+      "CUDA Tile sources are required for an in-tree CUDA Tile build.\n"
       "Initialize the third_party/cuda-tile submodule or pass "
       "-DTILEIR_TO_MLIR_CUDA_TILE_SOURCE_DIR=<cuda-tile-source-dir>.")
   endif()
@@ -186,13 +188,16 @@ if(TILEIR_TO_MLIR_EXTERNAL_PROJECT_BUILD)
   set(CUDA_TILE_ENABLE_BINDINGS_PYTHON OFF CACHE BOOL
       "Disable CUDA Tile Python bindings for TileIRToMLIR's in-tree dependency" FORCE)
 
+  set(_tileir_to_mlir_runtime_output_dir "${LLVM_RUNTIME_OUTPUT_INTDIR}")
+  set(_tileir_to_mlir_library_output_dir "${LLVM_LIBRARY_OUTPUT_INTDIR}")
   add_subdirectory("${TILEIR_TO_MLIR_CUDA_TILE_SOURCE_DIR}"
                    "${CMAKE_CURRENT_BINARY_DIR}/cuda-tile" EXCLUDE_FROM_ALL)
 
   # CUDA Tile changes these shared output variables for its own targets.
-  set(LLVM_RUNTIME_OUTPUT_INTDIR "${CMAKE_BINARY_DIR}/bin")
-  set(LLVM_LIBRARY_OUTPUT_INTDIR
-      "${CMAKE_BINARY_DIR}/tools/TileIRToMLIR/lib")
+  set(LLVM_RUNTIME_OUTPUT_INTDIR "${_tileir_to_mlir_runtime_output_dir}")
+  set(LLVM_LIBRARY_OUTPUT_INTDIR "${_tileir_to_mlir_library_output_dir}")
+  unset(_tileir_to_mlir_runtime_output_dir)
+  unset(_tileir_to_mlir_library_output_dir)
 
   set(CUDA_TILE_PUBLIC_INCLUDE_DIR
       "${TILEIR_TO_MLIR_CUDA_TILE_SOURCE_DIR}/include")
@@ -243,6 +248,7 @@ if(NOT EXISTS "${CUDA_TILE_PUBLIC_INCLUDE_DIR}/cuda_tile/Dialect/CudaTile/IR/Dia
     "'${CUDA_TILE_PUBLIC_INCLUDE_DIR}'")
 endif()
 if(NOT TILEIR_TO_MLIR_EXTERNAL_PROJECT_BUILD AND
+  NOT TILEIR_TO_MLIR_BUILD_CUDA_TILE AND
    NOT EXISTS "${CUDA_TILE_GEN_INCLUDE_DIR}/cuda_tile/Dialect/CudaTile/IR/Ops.h.inc")
   message(FATAL_ERROR
     "cuda-tile generated headers (*.h.inc) not found in CUDA_TILE_GEN_INCLUDE_DIR="
@@ -253,7 +259,7 @@ endif()
 
 message(STATUS "cuda-tile public includes:    ${CUDA_TILE_PUBLIC_INCLUDE_DIR}")
 message(STATUS "cuda-tile generated includes: ${CUDA_TILE_GEN_INCLUDE_DIR}")
-if(TILEIR_TO_MLIR_EXTERNAL_PROJECT_BUILD)
+if(TILEIR_TO_MLIR_EXTERNAL_PROJECT_BUILD OR TILEIR_TO_MLIR_BUILD_CUDA_TILE)
   message(STATUS "cuda-tile libraries:          in-tree targets")
 else()
   message(STATUS "cuda-tile libraries:          ${CUDA_TILE_LIB_DIR}")
@@ -261,7 +267,8 @@ endif()
 
 include_directories(${CUDA_TILE_PUBLIC_INCLUDE_DIR})
 include_directories(${CUDA_TILE_GEN_INCLUDE_DIR})
-if(NOT TILEIR_TO_MLIR_EXTERNAL_PROJECT_BUILD)
+if(NOT TILEIR_TO_MLIR_EXTERNAL_PROJECT_BUILD AND
+   NOT TILEIR_TO_MLIR_BUILD_CUDA_TILE)
   link_directories(${CUDA_TILE_LIB_DIR})
 endif()
 
