@@ -31,13 +31,12 @@ inline bool isStaticZero(OpFoldResult ofr) {
 }
 
 /// Returns `true` iff changing `func`'s signature is safe, i.e. the function is
-/// not referenced (called / launched) from within its nearest symbol table.
-/// In-module references would be invalidated by a signature change, so such
-/// functions are left untouched. A non-`SymbolOpInterface` or an unresolved
-/// use set is treated conservatively as "unsafe".
+/// private and not referenced (called / launched) from within its nearest
+/// symbol table. A non-`SymbolOpInterface` or an unresolved use set is treated
+/// conservatively as "unsafe".
 inline bool signatureChangeIsSafe(FunctionOpInterface func) {
   auto symbol = dyn_cast<SymbolOpInterface>(func.getOperation());
-  if (!symbol)
+  if (!symbol || symbol.getVisibility() != SymbolTable::Visibility::Private)
     return false;
   Operation *symbolTableOp = func->getParentWithTrait<OpTrait::SymbolTable>();
   if (!symbolTableOp)

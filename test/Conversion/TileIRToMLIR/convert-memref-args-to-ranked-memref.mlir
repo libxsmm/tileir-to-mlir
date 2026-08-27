@@ -36,7 +36,7 @@ module attributes {gpu.container_module} {
     // NONE-LABEL: gpu.func @kernel(
     // NONE-SAME: %{{[^:]+}}: memref<?x64xf16, strided<[?, 1], offset: ?>>, %{{[^:]+}}: i32, %{{[^:]+}}: i32, %{{[^:]+}}: i32, %{{[^:]+}}: i32)
     // NONE-NOT: memref.reinterpret_cast
-    gpu.func @kernel(%arg0: memref<*xf16>, %arg1: i32, %arg2: i32, %arg3: i32, %arg4: i32) kernel {
+    gpu.func @kernel(%arg0: memref<*xf16>, %arg1: i32, %arg2: i32, %arg3: i32, %arg4: i32) attributes {sym_visibility = "private"} {
       %c0 = arith.constant 0 : index
       %m = arith.index_cast %arg1 : i32 to index
       %s = arith.index_cast %arg2 : i32 to index

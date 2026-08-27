@@ -11,7 +11,7 @@ cuda_tile.module @ops_module {
   // --- global / get_global ---
   // Derived from cuda_tile.global and cuda_tile.get_global mlirExamples in
   // Ops.td.
-  // CHECK: memref.global @val : memref<4xf32> = dense<[1.000000e-01, 2.000000e-01, 3.000000e-01, 4.000000e-01]> {alignment = 128 : i64}
+  // CHECK: memref.global @val : memref<4xf32> = dense<[1.000000e-01, 2.000000e-01, 3.000000e-01, 4.000000e-01]> alignment = 128
   global @val alignment = 128 <f32: [0.1, 0.2, 0.3, 0.4]> : tile<4xf32>
 
   // CHECK-LABEL: gpu.func @test_get_global
@@ -68,7 +68,7 @@ cuda_tile.module @ops_module {
   // is exercised separately as a negative test in cudatile-alloca-negative.mlir.
   // CHECK-LABEL: gpu.func @test_alloca
   entry @test_alloca() {
-    // CHECK: %[[A:.*]] = memref.alloca() {alignment = 128 : i64} : memref<64xf32>
+    // CHECK: %[[A:.*]] = memref.alloca() alignment = 128 : memref<64xf32>
     // CHECK: %[[P:.*]] = memref.cast %[[A]] : memref<64xf32> to memref<*xf32>
     %0 = alloca num_elem = 64, alignment = 128 : tile<ptr<f32>>
     return
@@ -592,7 +592,7 @@ cuda_tile.module @ops_module {
     // CHECK: %[[SCAN_IN:.*]] = arith.constant dense<0.000000e+00> : vector<8x16xf32>
     %input = constant <f32: 0.0> : tile<8x16xf32>
     // CHECK: %[[SCAN_INIT:.*]] = arith.constant dense<1.000000e+00> : vector<8xf32>
-    // CHECK: %[[SCAN_R:.*]], %{{.*}} = vector.scan <mul>, %[[SCAN_IN]], %[[SCAN_INIT]] {inclusive = true, reduction_dim = 1 : i64} : vector<8x16xf32>, vector<8xf32>
+    // CHECK: %[[SCAN_R:.*]], %{{.*}} = vector.scan <mul>, %[[SCAN_IN]], %[[SCAN_INIT]] reduction_dim = 1, inclusive = true : vector<8x16xf32>, vector<8xf32>
     %result = scan %input dim=1 reverse=false identities=[1.0 : f32] : tile<8x16xf32> -> tile<8x16xf32>
       (%acc: tile<f32>, %elem: tile<f32>) {
         %prod = mulf %acc, %elem rounding<nearest_even>: tile<f32>
@@ -658,14 +658,14 @@ cuda_tile.module @ops_module {
 
     // cat along dim=1: tile<2x4> ++ tile<2x4> -> tile<2x8>
     // CHECK: %[[CAT1_P:.*]] = ub.poison : vector<2x8xf32>
-    // CHECK: %[[CAT1_L:.*]] = vector.insert_strided_slice %[[CAT_LHS]], %[[CAT1_P]] {offsets = [0, 0], strides = [1, 1]} : vector<2x4xf32> into vector<2x8xf32>
-    // CHECK: %[[CAT1_R:.*]] = vector.insert_strided_slice %[[CAT_RHS]], %[[CAT1_L]] {offsets = [0, 4], strides = [1, 1]} : vector<2x4xf32> into vector<2x8xf32>
+    // CHECK: %[[CAT1_L:.*]] = vector.insert_strided_slice %[[CAT_LHS]], %[[CAT1_P]] offsets = [0, 0], strides = [1, 1] : vector<2x4xf32> into vector<2x8xf32>
+    // CHECK: %[[CAT1_R:.*]] = vector.insert_strided_slice %[[CAT_RHS]], %[[CAT1_L]] offsets = [0, 4], strides = [1, 1] : vector<2x4xf32> into vector<2x8xf32>
     %0 = cat %arg0, %arg1 dim = 1 : tile<2x4xf32>, tile<2x4xf32> -> tile<2x8xf32>
 
     // cat along dim=0: tile<2x4> ++ tile<2x4> -> tile<4x4>
     // CHECK: %[[CAT0_P:.*]] = ub.poison : vector<4x4xf32>
-    // CHECK: %[[CAT0_L:.*]] = vector.insert_strided_slice %[[CAT_LHS]], %[[CAT0_P]] {offsets = [0, 0], strides = [1, 1]} : vector<2x4xf32> into vector<4x4xf32>
-    // CHECK: %[[CAT0_R:.*]] = vector.insert_strided_slice %[[CAT_RHS]], %[[CAT0_L]] {offsets = [2, 0], strides = [1, 1]} : vector<2x4xf32> into vector<4x4xf32>
+    // CHECK: %[[CAT0_L:.*]] = vector.insert_strided_slice %[[CAT_LHS]], %[[CAT0_P]] offsets = [0, 0], strides = [1, 1] : vector<2x4xf32> into vector<4x4xf32>
+    // CHECK: %[[CAT0_R:.*]] = vector.insert_strided_slice %[[CAT_RHS]], %[[CAT0_L]] offsets = [2, 0], strides = [1, 1] : vector<2x4xf32> into vector<4x4xf32>
     %1 = cat %arg0, %arg1 dim = 0 : tile<2x4xf32>, tile<2x4xf32> -> tile<4x4xf32>
     return
   }

@@ -30,6 +30,7 @@
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -161,13 +162,20 @@ static Value castIndexToType(OpBuilder &builder, Location loc, Value indexVal,
 
 /// Erase operations that became trivially dead after cast rewrites.
 static void eraseTriviallyDead(SmallVectorImpl<Operation *> &worklist) {
-  while (!worklist.empty()) {
-    Operation *op = worklist.pop_back_val();
+  llvm::SmallPtrSet<Operation *, 16> seen;
+  SmallVector<Operation *> deduplicatedWorklist;
+  for (Operation *op : worklist)
+    if (seen.insert(op).second)
+      deduplicatedWorklist.push_back(op);
+
+  while (!deduplicatedWorklist.empty()) {
+    Operation *op = deduplicatedWorklist.pop_back_val();
     if (!op || !isOpTriviallyDead(op))
       continue;
     for (Value operand : op->getOperands())
       if (Operation *def = operand.getDefiningOp())
-        worklist.push_back(def);
+        if (seen.insert(def).second)
+          deduplicatedWorklist.push_back(def);
     op->erase();
   }
 }

@@ -7,7 +7,7 @@
 // the recovered ranked memref. The pass is generic over FunctionOpInterface, so
 // it covers both func.func and gpu.func.
 
-// CHECK-LABEL: func.func @add_kernel(
+// CHECK-LABEL: func.func private @add_kernel(
 //   All three pointer inputs become !llvm.ptr; the scalar i32 args are untouched.
 // CHECK-SAME:    %[[A0:[^:]+]]: !llvm.ptr, %[[A1:[^:]+]]: !llvm.ptr, %[[A2:[^:]+]]: !llvm.ptr,
 // CHECK-SAME:    %{{[^:]+}}: i32, %{{[^:]+}}: i32)
@@ -24,7 +24,7 @@
 // CHECK:         %[[SUM:.*]] = arith.addf %[[R0]], %[[R1]]
 // CHECK:         vector.transfer_write %[[SUM]], %[[M2]]
 // CHECK:         return
-func.func @add_kernel(%arg0: memref<*xf32>, %arg1: memref<*xf32>, %arg2: memref<*xf32>, %arg3: i32, %arg4: i32) {
+func.func private @add_kernel(%arg0: memref<*xf32>, %arg1: memref<*xf32>, %arg2: memref<*xf32>, %arg3: i32, %arg4: i32) {
   %cst = arith.constant 0.000000e+00 : f32
   %c4096 = arith.constant 4096 : index
   // %0 only feeds the reinterpret_casts, so it must be cleaned up with them.
@@ -44,13 +44,13 @@ func.func @add_kernel(%arg0: memref<*xf32>, %arg1: memref<*xf32>, %arg2: memref<
 // A single argument promoted to a 2-D strided memref: shows the pass is not
 // limited to rank-1 and preserves a non-trivial recovered layout. Here the
 // dynamic index operand (%0) is still used by the load.
-// CHECK-LABEL: func.func @rank2(
+// CHECK-LABEL: func.func private @rank2(
 // CHECK-SAME:    %[[B0:[^:]+]]: !llvm.ptr, %{{[^:]+}}: i32)
 // CHECK-NOT:     memref.reinterpret_cast
 // CHECK:         llvm.insertvalue %[[B0]]
 // CHECK:         %[[M:.*]] = builtin.unrealized_conversion_cast %{{.*}} to memref<?x?xf32, strided<[?, 1]>>
 // CHECK:         vector.transfer_read %[[M]]
-func.func @rank2(%arg0: memref<*xf32>, %arg1: i32) {
+func.func private @rank2(%arg0: memref<*xf32>, %arg1: i32) {
   %cst = arith.constant 0.000000e+00 : f32
   %0 = arith.index_cast %arg1 : i32 to index
   %rc = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%0, %0], strides: [%0, 1] : memref<*xf32> to memref<?x?xf32, strided<[?, 1]>>
@@ -69,7 +69,7 @@ func.func @rank2(%arg0: memref<*xf32>, %arg1: i32) {
 // CHECK:         gpu.return
 module attributes {gpu.container_module} {
   gpu.module @m {
-    gpu.func @gpu_kernel(%arg0: memref<*xf32>, %arg1: i32) kernel {
+    gpu.func @gpu_kernel(%arg0: memref<*xf32>, %arg1: i32) attributes {sym_visibility = "private"} {
       %cst = arith.constant 0.000000e+00 : f32
       %0 = arith.index_cast %arg1 : i32 to index
       %rc = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%0], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1]>>
@@ -82,14 +82,14 @@ module attributes {gpu.container_module} {
 // An argument reinterpreted several different ways is still promoted: each cast
 // is rebuilt independently from the recovered pointer, so divergent ranks /
 // layouts are fine.
-// CHECK-LABEL: func.func @divergent(
+// CHECK-LABEL: func.func private @divergent(
 // CHECK-SAME:    %[[D0:[^:]+]]: !llvm.ptr, %{{[^:]+}}: i32)
 // CHECK-NOT:     memref.reinterpret_cast
 // CHECK:         %[[DA:.*]] = builtin.unrealized_conversion_cast %{{.*}} to memref<?xf32, strided<[1]>>
 // CHECK:         %[[DB:.*]] = builtin.unrealized_conversion_cast %{{.*}} to memref<?x?xf32, strided<[?, 1]>>
 // CHECK:         vector.transfer_read %[[DA]]
 // CHECK:         vector.transfer_read %[[DB]]
-func.func @divergent(%arg0: memref<*xf32>, %arg1: i32) {
+func.func private @divergent(%arg0: memref<*xf32>, %arg1: i32) {
   %cst = arith.constant 0.000000e+00 : f32
   %0 = arith.index_cast %arg1 : i32 to index
   %a = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%0], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1]>>
@@ -104,7 +104,7 @@ func.func @divergent(%arg0: memref<*xf32>, %arg1: i32) {
 // reinterpret_cast of the same argument. Because the offset is kept in the
 // descriptor's offset field (not folded into the pointer), the metadata still
 // recovers the original offset, so the second view keeps its correct address.
-// CHECK-LABEL: func.func @coupled_offset(
+// CHECK-LABEL: func.func private @coupled_offset(
 // CHECK-SAME:    %[[C0:[^:]+]]: !llvm.ptr, %{{[^:]+}}: i32, %{{[^:]+}}: i32)
 // CHECK-NOT:     memref.reinterpret_cast
 //   First cast: the absolute offset lands in the descriptor's offset field (index 2),
@@ -118,7 +118,7 @@ func.func @divergent(%arg0: memref<*xf32>, %arg1: i32) {
 // CHECK:         %{{.*}}, %[[ROFF:.*]], %{{.*}}, %{{.*}} = memref.extract_strided_metadata %[[M1]]
 // CHECK:         %[[M2:.*]] = builtin.unrealized_conversion_cast %{{.*}} to memref<?xf32, strided<[1], offset: ?>>
 // CHECK:         vector.transfer_read %[[M2]]
-func.func @coupled_offset(%arg0: memref<*xf32>, %arg1: i32, %arg2: i32) {
+func.func private @coupled_offset(%arg0: memref<*xf32>, %arg1: i32, %arg2: i32) {
   %cst = arith.constant 0.000000e+00 : f32
   %c0 = arith.constant 0 : index
   %off = arith.index_cast %arg1 : i32 to index
@@ -133,8 +133,8 @@ func.func @coupled_offset(%arg0: memref<*xf32>, %arg1: i32, %arg2: i32) {
 // Unused pointer arguments still need signature conversion. Otherwise they
 // remain as unranked memrefs and prevent the subsequent func-to-LLVM lowering
 // from converting the enclosing function.
-// CHECK-LABEL: func.func @unused_pointer_args(
+// CHECK-LABEL: func.func private @unused_pointer_args(
 // CHECK-SAME:    %{{[^:]+}}: !llvm.ptr, %{{[^:]+}}: !llvm.ptr, %{{[^:]+}}: !llvm.ptr, %{{[^:]+}}: i32)
-func.func @unused_pointer_args(%arg0: memref<*xbf16>, %arg1: memref<*xbf16>, %arg2: memref<*xi32>, %arg3: i32) {
+func.func private @unused_pointer_args(%arg0: memref<*xbf16>, %arg1: memref<*xbf16>, %arg2: memref<*xi32>, %arg3: i32) {
   return
 }

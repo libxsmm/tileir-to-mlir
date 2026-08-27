@@ -9,7 +9,7 @@
 cuda_tile.module @m {
 
   // --- global/get_global edge cases ---
-  // CHECK: memref.global @g_f32_aligned : memref<4xf32> = dense<[1.000000e+00, 2.000000e+00, 3.000000e+00, 4.000000e+00]> {alignment = 256 : i64}
+  // CHECK: memref.global @g_f32_aligned : memref<4xf32> = dense<[1.000000e+00, 2.000000e+00, 3.000000e+00, 4.000000e+00]> alignment = 256
   global @g_f32_aligned alignment = 256 <f32: [1.0, 2.0, 3.0, 4.0]> : tile<4xf32>
 
   // CHECK: memref.global @g_i32_single : memref<1xi32> = dense<7>
@@ -33,15 +33,15 @@ cuda_tile.module @m {
   // zero-length allocation.
   // CHECK-LABEL: gpu.func @test_alloca_edges
   entry @test_alloca_edges() {
-    // CHECK: %[[A1:.*]] = memref.alloca() {alignment = 2 : i64} : memref<1xf16>
+    // CHECK: %[[A1:.*]] = memref.alloca() alignment = 2 : memref<1xf16>
     // CHECK: %[[P1:.*]] = memref.cast %[[A1]] : memref<1xf16> to memref<*xf16>
     %single = alloca num_elem = 1, alignment = 2 : tile<ptr<f16>>
 
-    // CHECK: %[[A2:.*]] = memref.alloca() {alignment = 256 : i64} : memref<1024xi32>
+    // CHECK: %[[A2:.*]] = memref.alloca() alignment = 256 : memref<1024xi32>
     // CHECK: %[[P2:.*]] = memref.cast %[[A2]] : memref<1024xi32> to memref<*xi32>
     %wide = alloca num_elem = 1024, alignment = 256 : tile<ptr<i32>>
 
-    // CHECK: %[[A3:.*]] = memref.alloca() {alignment = 8 : i64} : memref<0xf64>
+    // CHECK: %[[A3:.*]] = memref.alloca() alignment = 8 : memref<0xf64>
     // CHECK: %[[P3:.*]] = memref.cast %[[A3]] : memref<0xf64> to memref<*xf64>
     %empty = alloca num_elem = 0, alignment = 8 : tile<ptr<f64>>
     return
@@ -445,7 +445,7 @@ cuda_tile.module @m {
     // CHECK: %[[SADD1_IN:.*]] = arith.constant dense<0.000000e+00> : vector<8xf32>
     %input = constant <f32: 0.0> : tile<8xf32>
     // CHECK: %[[SADD1_INIT:.*]] = arith.constant dense<0.000000e+00> : vector<f32>
-    // CHECK: %[[SADD1_R:.*]], %{{.*}} = vector.scan <add>, %[[SADD1_IN]], %[[SADD1_INIT]] {inclusive = true, reduction_dim = 0 : i64} : vector<8xf32>, vector<f32>
+    // CHECK: %[[SADD1_R:.*]], %{{.*}} = vector.scan <add>, %[[SADD1_IN]], %[[SADD1_INIT]] reduction_dim = 0, inclusive = true : vector<8xf32>, vector<f32>
     %0 = scan %input dim=0 reverse=false identities=[0.000000e+00 : f32] : tile<8xf32> -> tile<8xf32>
       (%a: tile<f32>, %b: tile<f32>) {
         %s = addf %a, %b : tile<f32>
@@ -460,7 +460,7 @@ cuda_tile.module @m {
     // CHECK: %[[SADD2_IN:.*]] = arith.constant dense<0.000000e+00> : vector<8x16xf32>
     %input = constant <f32: 0.0> : tile<8x16xf32>
     // CHECK: %[[SADD2_INIT:.*]] = arith.constant dense<0.000000e+00> : vector<16xf32>
-    // CHECK: %[[SADD2_R:.*]], %{{.*}} = vector.scan <add>, %[[SADD2_IN]], %[[SADD2_INIT]] {inclusive = true, reduction_dim = 0 : i64} : vector<8x16xf32>, vector<16xf32>
+    // CHECK: %[[SADD2_R:.*]], %{{.*}} = vector.scan <add>, %[[SADD2_IN]], %[[SADD2_INIT]] reduction_dim = 0, inclusive = true : vector<8x16xf32>, vector<16xf32>
     %0 = scan %input dim=0 reverse=false identities=[0.000000e+00 : f32] : tile<8x16xf32> -> tile<8x16xf32>
       (%a: tile<f32>, %b: tile<f32>) {
         %s = addf %a, %b : tile<f32>
@@ -475,7 +475,7 @@ cuda_tile.module @m {
     // CHECK: %[[SADDI_IN:.*]] = arith.constant dense<0> : vector<8xi32>
     %input = constant <i32: 0> : tile<8xi32>
     // CHECK: %[[SADDI_INIT:.*]] = arith.constant dense<0> : vector<i32>
-    // CHECK: %[[SADDI_R:.*]], %{{.*}} = vector.scan <add>, %[[SADDI_IN]], %[[SADDI_INIT]] {inclusive = true, reduction_dim = 0 : i64} : vector<8xi32>, vector<i32>
+    // CHECK: %[[SADDI_R:.*]], %{{.*}} = vector.scan <add>, %[[SADDI_IN]], %[[SADDI_INIT]] reduction_dim = 0, inclusive = true : vector<8xi32>, vector<i32>
     %0 = scan %input dim=0 reverse=false identities=[0 : i32] : tile<8xi32> -> tile<8xi32>
       (%a: tile<i32>, %b: tile<i32>) {
         %s = addi %a, %b : tile<i32>
@@ -490,7 +490,7 @@ cuda_tile.module @m {
     // CHECK: %[[SMAX_IN:.*]] = arith.constant dense<0.000000e+00> : vector<4x8xf32>
     %input = constant <f32: 0.0> : tile<4x8xf32>
     // CHECK: %[[SMAX_INIT:.*]] = arith.constant dense<0xFF800000> : vector<4xf32>
-    // CHECK: %[[SMAX_R:.*]], %{{.*}} = vector.scan <maximumf>, %[[SMAX_IN]], %[[SMAX_INIT]] {inclusive = true, reduction_dim = 1 : i64} : vector<4x8xf32>, vector<4xf32>
+    // CHECK: %[[SMAX_R:.*]], %{{.*}} = vector.scan <maximumf>, %[[SMAX_IN]], %[[SMAX_INIT]] reduction_dim = 1, inclusive = true : vector<4x8xf32>, vector<4xf32>
     %0 = scan %input dim=1 reverse=false identities=[0xFF800000 : f32] : tile<4x8xf32> -> tile<4x8xf32>
       (%a: tile<f32>, %b: tile<f32>) {
         %s = maxf %a, %b propagate_nan : tile<f32>
@@ -505,7 +505,7 @@ cuda_tile.module @m {
     // CHECK: %[[SMINSI_IN:.*]] = arith.constant dense<0> : vector<8xi32>
     %input = constant <i32: 0> : tile<8xi32>
     // CHECK: %[[SMINSI_INIT:.*]] = arith.constant dense<2147483647> : vector<i32>
-    // CHECK: %[[SMINSI_R:.*]], %{{.*}} = vector.scan <minsi>, %[[SMINSI_IN]], %[[SMINSI_INIT]] {inclusive = true, reduction_dim = 0 : i64} : vector<8xi32>, vector<i32>
+    // CHECK: %[[SMINSI_R:.*]], %{{.*}} = vector.scan <minsi>, %[[SMINSI_IN]], %[[SMINSI_INIT]] reduction_dim = 0, inclusive = true : vector<8xi32>, vector<i32>
     %0 = scan %input dim=0 reverse=false identities=[2147483647 : i32] : tile<8xi32> -> tile<8xi32>
       (%a: tile<i32>, %b: tile<i32>) {
         %s = mini %a, %b signed : tile<i32>
@@ -1204,8 +1204,8 @@ cuda_tile.module @m {
     %r = constant <f32: 2.0> : tile<4xf32>
     // dim=0, lhs.shape[0]=4, result = <8xf32>
     // CHECK: %[[C1D_P:.*]] = ub.poison : vector<8xf32>
-    // CHECK: %[[C1D_INS0:.*]] = vector.insert_strided_slice %[[C1D_L]], %[[C1D_P]] {offsets = [0], strides = [1]} : vector<4xf32> into vector<8xf32>
-    // CHECK: %[[C1D_INS1:.*]] = vector.insert_strided_slice %[[C1D_R]], %[[C1D_INS0]] {offsets = [4], strides = [1]} : vector<4xf32> into vector<8xf32>
+    // CHECK: %[[C1D_INS0:.*]] = vector.insert_strided_slice %[[C1D_L]], %[[C1D_P]] offsets = [0], strides = [1] : vector<4xf32> into vector<8xf32>
+    // CHECK: %[[C1D_INS1:.*]] = vector.insert_strided_slice %[[C1D_R]], %[[C1D_INS0]] offsets = [4], strides = [1] : vector<4xf32> into vector<8xf32>
     %0 = cat %l, %r dim = 0 : tile<4xf32>, tile<4xf32> -> tile<8xf32>
     return
   }
@@ -1219,8 +1219,8 @@ cuda_tile.module @m {
     %r = constant <i16: 1> : tile<2x8xi16>
     // result = <4x8xi16>
     // CHECK: %[[C2D0_P:.*]] = ub.poison : vector<4x8xi16>
-    // CHECK: %[[C2D0_INS0:.*]] = vector.insert_strided_slice %[[C2D0_L]], %[[C2D0_P]] {offsets = [0, 0], strides = [1, 1]} : vector<2x8xi16> into vector<4x8xi16>
-    // CHECK: %[[C2D0_INS1:.*]] = vector.insert_strided_slice %[[C2D0_R]], %[[C2D0_INS0]] {offsets = [2, 0], strides = [1, 1]} : vector<2x8xi16> into vector<4x8xi16>
+    // CHECK: %[[C2D0_INS0:.*]] = vector.insert_strided_slice %[[C2D0_L]], %[[C2D0_P]] offsets = [0, 0], strides = [1, 1] : vector<2x8xi16> into vector<4x8xi16>
+    // CHECK: %[[C2D0_INS1:.*]] = vector.insert_strided_slice %[[C2D0_R]], %[[C2D0_INS0]] offsets = [2, 0], strides = [1, 1] : vector<2x8xi16> into vector<4x8xi16>
     %0 = cat %l, %r dim = 0 : tile<2x8xi16>, tile<2x8xi16> -> tile<4x8xi16>
     return
   }
@@ -1234,8 +1234,8 @@ cuda_tile.module @m {
     %r = constant <f16: 0.0> : tile<2x4x8xf16>
     // result = <2x8x8xf16>
     // CHECK: %[[C3D_P:.*]] = ub.poison : vector<2x8x8xf16>
-    // CHECK: %[[C3D_INS0:.*]] = vector.insert_strided_slice %[[C3D_L]], %[[C3D_P]] {offsets = [0, 0, 0], strides = [1, 1, 1]} : vector<2x4x8xf16> into vector<2x8x8xf16>
-    // CHECK: %[[C3D_INS1:.*]] = vector.insert_strided_slice %[[C3D_R]], %[[C3D_INS0]] {offsets = [0, 4, 0], strides = [1, 1, 1]} : vector<2x4x8xf16> into vector<2x8x8xf16>
+    // CHECK: %[[C3D_INS0:.*]] = vector.insert_strided_slice %[[C3D_L]], %[[C3D_P]] offsets = [0, 0, 0], strides = [1, 1, 1] : vector<2x4x8xf16> into vector<2x8x8xf16>
+    // CHECK: %[[C3D_INS1:.*]] = vector.insert_strided_slice %[[C3D_R]], %[[C3D_INS0]] offsets = [0, 4, 0], strides = [1, 1, 1] : vector<2x4x8xf16> into vector<2x8x8xf16>
     %0 = cat %l, %r dim = 1 : tile<2x4x8xf16>, tile<2x4x8xf16> -> tile<2x8x8xf16>
     return
   }
@@ -1249,8 +1249,8 @@ cuda_tile.module @m {
     %r = constant <i32: 0> : tile<4x2xi32>
     // result = <4x4xi32>
     // CHECK: %[[CI_P:.*]] = ub.poison : vector<4x4xi32>
-    // CHECK: %[[CI_INS0:.*]] = vector.insert_strided_slice %[[CI_L]], %[[CI_P]] {offsets = [0, 0], strides = [1, 1]} : vector<4x2xi32> into vector<4x4xi32>
-    // CHECK: %[[CI_INS1:.*]] = vector.insert_strided_slice %[[CI_R]], %[[CI_INS0]] {offsets = [0, 2], strides = [1, 1]} : vector<4x2xi32> into vector<4x4xi32>
+    // CHECK: %[[CI_INS0:.*]] = vector.insert_strided_slice %[[CI_L]], %[[CI_P]] offsets = [0, 0], strides = [1, 1] : vector<4x2xi32> into vector<4x4xi32>
+    // CHECK: %[[CI_INS1:.*]] = vector.insert_strided_slice %[[CI_R]], %[[CI_INS0]] offsets = [0, 2], strides = [1, 1] : vector<4x2xi32> into vector<4x4xi32>
     %0 = cat %l, %r dim = 1 : tile<4x2xi32>, tile<4x2xi32> -> tile<4x4xi32>
     return
   }

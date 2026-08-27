@@ -6,29 +6,40 @@
 // 3) shared scalar shape args with conflicting memref sources are not removed.
 // 4) non-zero reinterpret offsets are not folded into the ranked argument.
 
-// CHECK-LABEL: func.func @callee(
+// CHECK-LABEL: func.func private @callee(
 // CHECK-SAME: %[[P:[^:]+]]: memref<*xf32>, %[[N:[^:]+]]: i32)
 // CHECK: memref.reinterpret_cast %[[P]]
-func.func @callee(%arg0: memref<*xf32>, %arg1: i32) {
+func.func private @callee(%arg0: memref<*xf32>, %arg1: i32) {
   %n = arith.index_cast %arg1 : i32 to index
   %v = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%n], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1], offset: ?>>
   return
 }
 
-// CHECK-LABEL: func.func @caller(
+// CHECK-LABEL: func.func private @caller(
 // CHECK: call @callee
-func.func @caller(%arg0: memref<*xf32>, %arg1: i32) {
+func.func private @caller(%arg0: memref<*xf32>, %arg1: i32) {
   call @callee(%arg0, %arg1) : (memref<*xf32>, i32) -> ()
   return
 }
 
 module attributes {gpu.container_module} {
   gpu.module @m {
+    // A default-public kernel may be launched externally, so its ABI and cast
+    // are preserved even when it has no in-module uses.
+    // CHECK-LABEL: gpu.func @public_kernel(
+    // CHECK-SAME: memref<*xf32>, %[[PUBLIC_N:[^:]+]]: i32)
+    // CHECK: memref.reinterpret_cast
+    gpu.func @public_kernel(%arg0: memref<*xf32>, %arg1: i32) kernel {
+      %n = arith.index_cast %arg1 : i32 to index
+      %a = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%n], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1], offset: ?>>
+      gpu.return
+    }
+
     // CHECK-LABEL: gpu.func @divergent_cast(
     // CHECK-SAME: memref<*xf32>, %[[N:[^:]+]]: i32)
     // CHECK: memref.reinterpret_cast
     // CHECK: memref.reinterpret_cast
-    gpu.func @divergent_cast(%arg0: memref<*xf32>, %arg1: i32) kernel {
+    gpu.func @divergent_cast(%arg0: memref<*xf32>, %arg1: i32) attributes {sym_visibility = "private"} {
       %n = arith.index_cast %arg1 : i32 to index
       %a = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%n], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1], offset: ?>>
       %b = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%n, %n], strides: [%n, 1] : memref<*xf32> to memref<?x?xf32, strided<[?, 1], offset: ?>>
@@ -43,7 +54,7 @@ module attributes {gpu.container_module} {
     // CHECK-SAME: %[[B:[^:]+]]: memref<?xf16, strided<[1], offset: ?>>,
     // CHECK-SAME: %[[N:[^:]+]]: i32)
     // CHECK-NOT: memref.reinterpret_cast
-    gpu.func @conflicting_scalar(%arg0: memref<*xf16>, %arg1: memref<*xf16>, %arg2: i32) kernel {
+    gpu.func @conflicting_scalar(%arg0: memref<*xf16>, %arg1: memref<*xf16>, %arg2: i32) attributes {sym_visibility = "private"} {
       %n = arith.index_cast %arg2 : i32 to index
       %a = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%n], strides: [1] : memref<*xf16> to memref<?xf16, strided<[1], offset: ?>>
       %b = memref.reinterpret_cast %arg1 to offset: [0], sizes: [%n], strides: [1] : memref<*xf16> to memref<?xf16, strided<[1], offset: ?>>
@@ -56,7 +67,7 @@ module attributes {gpu.container_module} {
     // CHECK-LABEL: gpu.func @nonzero_offset(
     // CHECK-SAME: memref<*xf16>,
     // CHECK: memref.reinterpret_cast
-    gpu.func @nonzero_offset(%arg0: memref<*xf16>, %arg1: i32, %arg2: i32) kernel {
+    gpu.func @nonzero_offset(%arg0: memref<*xf16>, %arg1: i32, %arg2: i32) attributes {sym_visibility = "private"} {
       %n = arith.index_cast %arg1 : i32 to index
       %off = arith.index_cast %arg2 : i32 to index
       %a = memref.reinterpret_cast %arg0 to offset: [%off], sizes: [%n], strides: [1] : memref<*xf16> to memref<?xf16, strided<[1], offset: ?>>

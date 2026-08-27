@@ -4142,6 +4142,8 @@ struct ConvertTileIRToMLIRPass
         auto divOp = v.getDefiningOp<arith::DivUIOp>();
         if (!divOp)
           continue;
+        if (divOp.getLhs().getType() != op.getType())
+          continue;
         if (divOp.getRhs() == otherOperand) {
           mulFolds.emplace_back(op, divOp.getLhs());
           return;

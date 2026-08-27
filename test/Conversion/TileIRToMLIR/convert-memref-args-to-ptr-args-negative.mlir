@@ -5,13 +5,24 @@
 // would break an in-module call site or the unranked type is observed by a
 // non-cast user.
 
+// A default-public function may be called externally, so its ABI and cast are
+// preserved even when it has no in-module uses.
+// CHECK-LABEL: func.func @public_external(
+// CHECK-SAME:    %{{[^:]+}}: memref<*xf32>
+// CHECK:         memref.reinterpret_cast
+func.func @public_external(%arg0: memref<*xf32>, %arg1: i32) {
+  %0 = arith.index_cast %arg1 : i32 to index
+  %a = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%0], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1]>>
+  return
+}
+
 // A non-cast use of the argument (here memref.rank observes the unranked type)
 // blocks the promotion: the argument must stay unranked.
-// CHECK-LABEL: func.func @mixed_use(
+// CHECK-LABEL: func.func private @mixed_use(
 // CHECK-SAME:    %{{[^:]+}}: memref<*xf32>
 // CHECK:         memref.reinterpret_cast
 // CHECK:         memref.rank
-func.func @mixed_use(%arg0: memref<*xf32>, %arg1: i32) {
+func.func private @mixed_use(%arg0: memref<*xf32>, %arg1: i32) {
   %cst = arith.constant 0.000000e+00 : f32
   %0 = arith.index_cast %arg1 : i32 to index
   %a = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%0], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1]>>
@@ -23,10 +34,10 @@ func.func @mixed_use(%arg0: memref<*xf32>, %arg1: i32) {
 // @callee is called from within the module, so changing its signature would
 // break the call. It is left untouched; @caller passes its argument to a
 // non-cast user (the call), so it is not promoted either.
-// CHECK-LABEL: func.func @callee(
+// CHECK-LABEL: func.func private @callee(
 // CHECK-SAME:    %{{[^:]+}}: memref<*xf32>
 // CHECK:         memref.reinterpret_cast
-func.func @callee(%arg0: memref<*xf32>, %arg1: i32) {
+func.func private @callee(%arg0: memref<*xf32>, %arg1: i32) {
   %cst = arith.constant 0.000000e+00 : f32
   %0 = arith.index_cast %arg1 : i32 to index
   %a = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%0], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1]>>
@@ -34,10 +45,10 @@ func.func @callee(%arg0: memref<*xf32>, %arg1: i32) {
   return
 }
 
-// CHECK-LABEL: func.func @caller(
+// CHECK-LABEL: func.func private @caller(
 // CHECK-SAME:    %{{[^:]+}}: memref<*xf32>
 // CHECK:         call @callee
-func.func @caller(%arg0: memref<*xf32>, %arg1: i32) {
+func.func private @caller(%arg0: memref<*xf32>, %arg1: i32) {
   func.call @callee(%arg0, %arg1) : (memref<*xf32>, i32) -> ()
   return
 }
