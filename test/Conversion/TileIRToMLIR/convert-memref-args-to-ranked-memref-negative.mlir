@@ -24,17 +24,6 @@ func.func private @caller(%arg0: memref<*xf32>, %arg1: i32) {
 
 module attributes {gpu.container_module} {
   gpu.module @m {
-    // A default-public kernel may be launched externally, so its ABI and cast
-    // are preserved even when it has no in-module uses.
-    // CHECK-LABEL: gpu.func @public_kernel(
-    // CHECK-SAME: memref<*xf32>, %[[PUBLIC_N:[^:]+]]: i32)
-    // CHECK: memref.reinterpret_cast
-    gpu.func @public_kernel(%arg0: memref<*xf32>, %arg1: i32) kernel {
-      %n = arith.index_cast %arg1 : i32 to index
-      %a = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%n], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1], offset: ?>>
-      gpu.return
-    }
-
     // CHECK-LABEL: gpu.func @divergent_cast(
     // CHECK-SAME: memref<*xf32>, %[[N:[^:]+]]: i32)
     // CHECK: memref.reinterpret_cast

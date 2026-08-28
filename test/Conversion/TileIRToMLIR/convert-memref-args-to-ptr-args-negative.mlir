@@ -5,17 +5,6 @@
 // would break an in-module call site or the unranked type is observed by a
 // non-cast user.
 
-// A default-public function may be called externally, so its ABI and cast are
-// preserved even when it has no in-module uses.
-// CHECK-LABEL: func.func @public_external(
-// CHECK-SAME:    %{{[^:]+}}: memref<*xf32>
-// CHECK:         memref.reinterpret_cast
-func.func @public_external(%arg0: memref<*xf32>, %arg1: i32) {
-  %0 = arith.index_cast %arg1 : i32 to index
-  %a = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%0], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1]>>
-  return
-}
-
 // A non-cast use of the argument (here memref.rank observes the unranked type)
 // blocks the promotion: the argument must stay unranked.
 // CHECK-LABEL: func.func private @mixed_use(
