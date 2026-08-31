@@ -559,6 +559,131 @@ module {
     // 2-D non-affine pointer arithmetic (conv2d-style): PtrToView cannot lift
     // this, so it falls through to the gather/scatter lowering.
     // -----------------------------------------------------------------------
+    // CHECK-LABEL: entry @maskedload_2d_conv
+    // CHECK-NOT: make_tensor_view
+    // CHECK: load_ptr_tko
+    // CHECK-GPU-LABEL: gpu.func @maskedload_2d_conv
+    // CHECK-GPU: vector.maskedload
+    // CHECK-GPU: vector.maskedload
+    // CHECK-GPU-NOT: vector.gather
+    entry @maskedload_2d_conv(%base: tile<ptr<f16>>, %shift: tile<i32>, %stride: tile<i32>) {
+      %zero = constant <i32: 0> : tile<i32>
+      %start = subi %zero, %shift : tile<i32>
+      %rows = iota : tile<2xi32>
+      %start_1d = reshape %start : tile<i32> -> tile<1xi32>
+      %start_bc = broadcast %start_1d : tile<1xi32> -> tile<2xi32>
+      %row_index = addi %start_bc, %rows : tile<2xi32>
+      %row_index_2d = reshape %row_index : tile<2xi32> -> tile<2x1xi32>
+      %stride_2d = reshape %stride : tile<i32> -> tile<1x1xi32>
+      %stride_bc = broadcast %stride_2d : tile<1x1xi32> -> tile<2x1xi32>
+      %row_offset = muli %row_index_2d, %stride_bc : tile<2x1xi32>
+      %row_offset_bc = broadcast %row_offset : tile<2x1xi32> -> tile<2x4xi32>
+      %cols = iota : tile<4xi32>
+      %cols_2d = reshape %cols : tile<4xi32> -> tile<1x4xi32>
+      %cols_bc = broadcast %cols_2d : tile<1x4xi32> -> tile<2x4xi32>
+      %offset = addi %row_offset_bc, %cols_bc : tile<2x4xi32>
+      %base_2d = reshape %base : tile<ptr<f16>> -> tile<1x1xptr<f16>>
+      %base_bc = broadcast %base_2d : tile<1x1xptr<f16>> -> tile<2x4xptr<f16>>
+      %ptr = offset %base_bc, %offset : tile<2x4xptr<f16>>, tile<2x4xi32> -> tile<2x4xptr<f16>>
+
+      %row_zero = constant <i32: 0> : tile<2x1xi32>
+      %row_size = constant <i32: 2> : tile<2x1xi32>
+      %row_ge = cmpi greater_than_or_equal %row_index_2d, %row_zero, signed : tile<2x1xi32> -> tile<2x1xi1>
+      %row_lt = cmpi less_than %row_index_2d, %row_size, signed : tile<2x1xi32> -> tile<2x1xi1>
+      %row_ge_bc = broadcast %row_ge : tile<2x1xi1> -> tile<2x4xi1>
+      %row_lt_bc = broadcast %row_lt : tile<2x1xi1> -> tile<2x4xi1>
+      %row_ge_i16 = exti %row_ge_bc signed : tile<2x4xi1> -> tile<2x4xi16>
+      %row_lt_i16 = exti %row_lt_bc signed : tile<2x4xi1> -> tile<2x4xi16>
+      %mask_i16 = andi %row_ge_i16, %row_lt_i16 : tile<2x4xi16>
+      %mask = trunci %mask_i16 : tile<2x4xi16> -> tile<2x4xi1>
+      %pad = constant <f16: 0.000000e+00> : tile<2x4xf16>
+      %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<2x4xptr<f16>>, tile<2x4xi1>, tile<2x4xf16> -> tile<2x4xf16>, !cuda_tile.token
+      return
+    }
+
+    // CHECK-LABEL: entry @maskedload_3d_conv
+    // CHECK-NOT: make_tensor_view
+    // CHECK: load_ptr_tko
+    // CHECK-GPU-LABEL: gpu.func @maskedload_3d_conv
+    // CHECK-GPU-COUNT-8: vector.maskedload
+    // CHECK-GPU-NOT: vector.gather
+    entry @maskedload_3d_conv(%base: tile<ptr<f32>>) {
+      %cols = iota : tile<4xi32>
+      %cols_3d = reshape %cols : tile<4xi32> -> tile<1x1x4xi32>
+      %offset = broadcast %cols_3d : tile<1x1x4xi32> -> tile<2x4x4xi32>
+      %base_3d = reshape %base : tile<ptr<f32>> -> tile<1x1x1xptr<f32>>
+      %base_bc = broadcast %base_3d : tile<1x1x1xptr<f32>> -> tile<2x4x4xptr<f32>>
+      %ptr = offset %base_bc, %offset : tile<2x4x4xptr<f32>>, tile<2x4x4xi32> -> tile<2x4x4xptr<f32>>
+      %tile, %token = load_ptr_tko weak %ptr : tile<2x4x4xptr<f32>> -> tile<2x4x4xf32>, !cuda_tile.token
+      return
+    }
+
+    // The column shift sits *inside* the broadcast (`broadcast(start + iota)`),
+    // which is how a loop-invariant column base is normally emitted.
+    // CHECK-LABEL: entry @maskedload_shifted_cols
+    // CHECK-NOT: make_tensor_view
+    // CHECK: load_ptr_tko
+    // CHECK-GPU-LABEL: gpu.func @maskedload_shifted_cols
+    // CHECK-GPU-COUNT-2: vector.maskedload
+    // CHECK-GPU-NOT: vector.gather
+    entry @maskedload_shifted_cols(%base: tile<ptr<f16>>, %shift: tile<i32>, %stride: tile<i32>, %col_start: tile<i32>) {
+      %zero = constant <i32: 0> : tile<i32>
+      %start = subi %zero, %shift : tile<i32>
+      %rows = iota : tile<2xi32>
+      %start_1d = reshape %start : tile<i32> -> tile<1xi32>
+      %start_bc = broadcast %start_1d : tile<1xi32> -> tile<2xi32>
+      %row_index = addi %start_bc, %rows : tile<2xi32>
+      %row_index_2d = reshape %row_index : tile<2xi32> -> tile<2x1xi32>
+      %stride_2d = reshape %stride : tile<i32> -> tile<1x1xi32>
+      %stride_bc = broadcast %stride_2d : tile<1x1xi32> -> tile<2x1xi32>
+      %row_offset = muli %row_index_2d, %stride_bc : tile<2x1xi32>
+      %row_offset_bc = broadcast %row_offset : tile<2x1xi32> -> tile<2x4xi32>
+      %cols = iota : tile<4xi32>
+      %col_start_1d = reshape %col_start : tile<i32> -> tile<1xi32>
+      %col_start_bc = broadcast %col_start_1d : tile<1xi32> -> tile<4xi32>
+      %cols_shifted = addi %col_start_bc, %cols : tile<4xi32>
+      %cols_2d = reshape %cols_shifted : tile<4xi32> -> tile<1x4xi32>
+      %cols_bc = broadcast %cols_2d : tile<1x4xi32> -> tile<2x4xi32>
+      %offset = addi %row_offset_bc, %cols_bc : tile<2x4xi32>
+      %base_2d = reshape %base : tile<ptr<f16>> -> tile<1x1xptr<f16>>
+      %base_bc = broadcast %base_2d : tile<1x1xptr<f16>> -> tile<2x4xptr<f16>>
+      %ptr = offset %base_bc, %offset : tile<2x4xptr<f16>>, tile<2x4xi32> -> tile<2x4xptr<f16>>
+
+      %row_zero = constant <i32: 0> : tile<2x1xi32>
+      %row_size = constant <i32: 2> : tile<2x1xi32>
+      %row_ge = cmpi greater_than_or_equal %row_index_2d, %row_zero, signed : tile<2x1xi32> -> tile<2x1xi1>
+      %row_lt = cmpi less_than %row_index_2d, %row_size, signed : tile<2x1xi32> -> tile<2x1xi1>
+      %row_ge_bc = broadcast %row_ge : tile<2x1xi1> -> tile<2x4xi1>
+      %row_lt_bc = broadcast %row_lt : tile<2x1xi1> -> tile<2x4xi1>
+      %row_ge_i16 = exti %row_ge_bc signed : tile<2x4xi1> -> tile<2x4xi16>
+      %row_lt_i16 = exti %row_lt_bc signed : tile<2x4xi1> -> tile<2x4xi16>
+      %mask_i16 = andi %row_ge_i16, %row_lt_i16 : tile<2x4xi16>
+      %mask = trunci %mask_i16 : tile<2x4xi16> -> tile<2x4xi1>
+      %pad = constant <f16: 0.000000e+00> : tile<2x4xf16>
+      %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<2x4xptr<f16>>, tile<2x4xi1>, tile<2x4xf16> -> tile<2x4xf16>, !cuda_tile.token
+      return
+    }
+
+    // Offsets that are constant along the minor dimension address one element
+    // per row, not a contiguous run, so they must stay a gather.
+    // CHECK-LABEL: entry @gather_minor_invariant
+    // CHECK-NOT: make_tensor_view
+    // CHECK: load_ptr_tko
+    // CHECK-GPU-LABEL: gpu.func @gather_minor_invariant
+    // CHECK-GPU: vector.gather
+    // CHECK-GPU-NOT: vector.maskedload
+    entry @gather_minor_invariant(%base: tile<ptr<f32>>) {
+      %rows = iota : tile<4xi32>
+      %rows_2d = reshape %rows : tile<4xi32> -> tile<4x1xi32>
+      %offset = broadcast %rows_2d : tile<4x1xi32> -> tile<4x4xi32>
+      %base_2d = reshape %base : tile<ptr<f32>> -> tile<1x1xptr<f32>>
+      %base_bc = broadcast %base_2d : tile<1x1xptr<f32>> -> tile<4x4xptr<f32>>
+      %ptr = offset %base_bc, %offset : tile<4x4xptr<f32>>, tile<4x4xi32> -> tile<4x4xptr<f32>>
+      %tile, %token = load_ptr_tko weak %ptr : tile<4x4xptr<f32>> -> tile<4x4xf32>, !cuda_tile.token
+      return
+    }
+
+    // -----------------------------------------------------------------------
     // CHECK-LABEL: entry @gather_2d_conv
     // CHECK-NOT: make_tensor_view
     // CHECK-GPU-LABEL: gpu.func @gather_2d_conv
@@ -928,6 +1053,55 @@ module {
       // CHECK-GPU: vector.transfer_read
       // CHECK-GPU-NOT: vector.gather
       %tile, %token = load_ptr_tko weak %ptr, %mask : tile<128xptr<f32>>, tile<128xi1> -> tile<128xf32>, !cuda_tile.token
+      return
+    }
+
+    // CHECK-LABEL: entry @load_static_splat_bounds
+    // CHECK-GPU-LABEL: gpu.func @load_static_splat_bounds
+    entry @load_static_splat_bounds(%arg0: tile<ptr<f16>>) {
+      %rows = iota : tile<4xi32>
+      %cols = iota : tile<8xi32>
+      %rows_i64 = exti %rows signed : tile<4xi32> -> tile<4xi64>
+      %cols_i64 = exti %cols signed : tile<8xi32> -> tile<8xi64>
+      %rows_2d = reshape %rows_i64 : tile<4xi64> -> tile<4x1xi64>
+      %cols_2d = reshape %cols_i64 : tile<8xi64> -> tile<1x8xi64>
+      %stride = constant <i64: 8> : tile<4x1xi64>
+      %row_offset = muli %rows_2d, %stride : tile<4x1xi64>
+      %row_offset_bc = broadcast %row_offset : tile<4x1xi64> -> tile<4x8xi64>
+      %cols_bc = broadcast %cols_2d : tile<1x8xi64> -> tile<4x8xi64>
+      %offset = addi %row_offset_bc, %cols_bc : tile<4x8xi64>
+      %base_2d = reshape %arg0 : tile<ptr<f16>> -> tile<1x1xptr<f16>>
+      %base_bc = broadcast %base_2d : tile<1x1xptr<f16>> -> tile<4x8xptr<f16>>
+      %ptr = offset %base_bc, %offset : tile<4x8xptr<f16>>, tile<4x8xi64> -> tile<4x8xptr<f16>>
+
+      %row_zero = constant <i64: 0> : tile<4x1xi64>
+      %row_size = constant <i64: 4> : tile<4x1xi64>
+      %row_ge = cmpi greater_than_or_equal %rows_2d, %row_zero, signed : tile<4x1xi64> -> tile<4x1xi1>
+      %row_lt = cmpi less_than %rows_2d, %row_size, signed : tile<4x1xi64> -> tile<4x1xi1>
+      %col_zero = constant <i64: 0> : tile<1x8xi64>
+      %col_size = constant <i64: 8> : tile<1x8xi64>
+      %col_ge = cmpi greater_than_or_equal %cols_2d, %col_zero, signed : tile<1x8xi64> -> tile<1x8xi1>
+      %col_lt = cmpi less_than %cols_2d, %col_size, signed : tile<1x8xi64> -> tile<1x8xi1>
+      %row_ge_bc = broadcast %row_ge : tile<4x1xi1> -> tile<4x8xi1>
+      %row_lt_bc = broadcast %row_lt : tile<4x1xi1> -> tile<4x8xi1>
+      %col_ge_bc = broadcast %col_ge : tile<1x8xi1> -> tile<4x8xi1>
+      %col_lt_bc = broadcast %col_lt : tile<1x8xi1> -> tile<4x8xi1>
+      %row_ge_i16 = exti %row_ge_bc signed : tile<4x8xi1> -> tile<4x8xi16>
+      %row_lt_i16 = exti %row_lt_bc signed : tile<4x8xi1> -> tile<4x8xi16>
+      %col_ge_i16 = exti %col_ge_bc signed : tile<4x8xi1> -> tile<4x8xi16>
+      %col_lt_i16 = exti %col_lt_bc signed : tile<4x8xi1> -> tile<4x8xi16>
+      %row_mask_i16 = andi %row_ge_i16, %row_lt_i16 : tile<4x8xi16>
+      %col_mask_i16 = andi %col_ge_i16, %col_lt_i16 : tile<4x8xi16>
+      %mask_i16 = andi %row_mask_i16, %col_mask_i16 : tile<4x8xi16>
+      %mask = trunci %mask_i16 : tile<4x8xi16> -> tile<4x8xi1>
+      %pad = constant <f16: 0.000000e+00> : tile<4x8xf16>
+
+      // CHECK: make_tensor_view %arg0, shape = [4, 8], strides = [8, 1] : tensor_view<4x8xf16, strides=[8,1]>
+      // CHECK: load_view_tko
+      // CHECK-NOT: load_ptr_tko
+      // CHECK-GPU: vector.transfer_read
+      // CHECK-GPU-NOT: vector.gather
+      %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<4x8xptr<f16>>, tile<4x8xi1>, tile<4x8xf16> -> tile<4x8xf16>, !cuda_tile.token
       return
     }
   }

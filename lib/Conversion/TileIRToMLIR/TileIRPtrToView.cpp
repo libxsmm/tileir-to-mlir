@@ -98,6 +98,8 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
 
+#include <array>
+
 using namespace mlir;
 using namespace mlir::cuda_tile;
 
@@ -281,6 +283,42 @@ private:
   }
 };
 
+/// The two operand orders of a commutative binary op, for matchers that have
+/// to try either side.
+static std::array<std::pair<Value, Value>, 2> commutedOperands(Value lhs,
+                                                               Value rhs) {
+  return {std::pair<Value, Value>(lhs, rhs),
+          std::pair<Value, Value>(rhs, lhs)};
+}
+
+/// Strip transparent wrappers and outer `broadcast` ops.  `reshape` is kept:
+/// it identifies which tile dimension an index expression populates.
+static Value stripBroadcasts(Value v) {
+  while (Value cur = lookThroughIndexCast(v)) {
+    auto b = cur.getDefiningOp<BroadcastOp>();
+    if (!b)
+      return cur;
+    v = b.getSource();
+  }
+  return Value();
+}
+
+/// Strip transparent wrappers and outer `broadcast`/`reshape` ops.
+static Value stripBroadcastReshape(Value v) {
+  while (Value cur = lookThroughIndexCast(v)) {
+    if (auto b = cur.getDefiningOp<BroadcastOp>()) {
+      v = b.getSource();
+      continue;
+    }
+    if (auto r = cur.getDefiningOp<ReshapeOp>()) {
+      v = r.getSource();
+      continue;
+    }
+    return cur;
+  }
+  return Value();
+}
+
 /// Strip a chain of `broadcast` and `reshape` ops applied to a scalar tile,
 /// returning the scalar tile value.  Assume ops and signed widenings are also
 /// transparent.
@@ -305,6 +343,18 @@ static Value matchScalarBroadcastReshape(Value v) {
   return nullptr;
 }
 
+/// Match an integer splat through the wrappers used by index expressions.
+static std::optional<int64_t> matchSplatInt64(Value v) {
+  v = stripBroadcastReshape(v);
+  DenseIntElementsAttr ints;
+  if (!v || !matchPattern(v, m_Constant(&ints)) || !ints.isSplat())
+    return std::nullopt;
+  APInt value = ints.getSplatValue<APInt>();
+  if (!value.isSignedIntN(64))
+    return std::nullopt;
+  return value.getSExtValue();
+}
+
 /// Per-dimension information recovered from a ptr-arithmetic chain.
 struct DimInfo {
   /// Tile-side size (= shape of the tile produced by the load/store).
@@ -316,10 +366,14 @@ struct DimInfo {
   /// along this dimension in the global buffer).  May be null, in which case
   /// stride == 1.
   Value stride;
+  /// Static stride recovered from a tile-shaped integer splat.
+  std::optional<int64_t> staticStride;
   /// Scalar `size` value extracted from the corresponding mask (the global
   /// tensor's size along this dimension).  May be null if no comparison was
   /// found for this dimension (we then fall back to the tile size).
   Value size;
+  /// Static size recovered from a tile-shaped integer splat.
+  std::optional<int64_t> staticSize;
 };
 
 /// Information recovered for a complete pointer-arithmetic chain.
@@ -366,42 +420,31 @@ static LogicalResult decomposeAddend(Value addend, ArrayRef<int64_t> tileShape,
                                      int &dim, DimInfo &info) {
   // Strip outer broadcasts that just replicate this 1-D pattern across
   // orthogonal dimensions of the tile.
-  Value cur = lookThroughIndexCast(addend);
-  while (cur) {
-    if (auto bcast = cur.getDefiningOp<BroadcastOp>()) {
-      cur = lookThroughIndexCast(bcast.getSource());
-      continue;
-    }
-    break;
-  }
+  Value cur = stripBroadcasts(addend);
   if (!cur)
     return failure();
 
   // Optional `muli` with one side being a broadcast-of-reshape-of-scalar (the
   // stride).
   if (auto mul = cur.getDefiningOp<MulIOp>()) {
-    Value lhs = mul.getLhs();
-    Value rhs = mul.getRhs();
-    for (auto [a, b] : {std::pair<Value, Value>(lhs, rhs),
-                        std::pair<Value, Value>(rhs, lhs)}) {
+    for (auto [a, b] : commutedOperands(mul.getLhs(), mul.getRhs())) {
+      if (std::optional<int64_t> stride = matchSplatInt64(a);
+          stride && *stride > 0) {
+        info.staticStride = *stride;
+        cur = b;
+        break;
+      }
       if (Value scalar = matchScalarBroadcastReshape(a)) {
         info.stride = scalar;
         cur = b;
         break;
       }
     }
-    if (!info.stride)
+    if (!info.stride && !info.staticStride)
       return failure();
-    cur = lookThroughIndexCast(cur);
     // Strip broadcasts again (the index side of the mul may itself be a
     // broadcast).
-    while (cur) {
-      if (auto bcast = cur.getDefiningOp<BroadcastOp>()) {
-        cur = lookThroughIndexCast(bcast.getSource());
-        continue;
-      }
-      break;
-    }
+    cur = stripBroadcasts(cur);
   }
   if (!cur)
     return failure();
@@ -444,10 +487,7 @@ static LogicalResult decomposeAddend(Value addend, ArrayRef<int64_t> tileShape,
   if (oneD.getDefiningOp<IotaOp>())
     return success();
   if (auto add = oneD.getDefiningOp<AddIOp>()) {
-    Value lhs = add.getLhs();
-    Value rhs = add.getRhs();
-    for (auto [a, b] : {std::pair<Value, Value>(lhs, rhs),
-                        std::pair<Value, Value>(rhs, lhs)}) {
+    for (auto [a, b] : commutedOperands(add.getLhs(), add.getRhs())) {
       if (lookThroughIndexCast(a).getDefiningOp<IotaOp>()) {
         if (Value scalar = matchScalarBroadcastReshape(b)) {
           info.start = scalar;
@@ -513,27 +553,13 @@ static int findDimFromIndexValue(Value val, unsigned rank) {
 /// to treat the comparison as a faithful per-dim bound.
 static bool recoverMaskIndexStart(Value idx, Value &start) {
   start = Value();
-  Value cur = lookThroughIndexCast(idx);
-  while (cur) {
-    if (auto b = cur.getDefiningOp<BroadcastOp>()) {
-      cur = lookThroughIndexCast(b.getSource());
-      continue;
-    }
-    if (auto r = cur.getDefiningOp<ReshapeOp>()) {
-      cur = lookThroughIndexCast(r.getSource());
-      continue;
-    }
-    break;
-  }
+  Value cur = stripBroadcastReshape(idx);
   if (!cur)
     return false;
   if (cur.getDefiningOp<IotaOp>())
     return true; // pure iota => start == 0
   if (auto add = cur.getDefiningOp<AddIOp>()) {
-    Value lhs = add.getLhs();
-    Value rhs = add.getRhs();
-    for (auto [a, b] : {std::pair<Value, Value>(lhs, rhs),
-                        std::pair<Value, Value>(rhs, lhs)}) {
+    for (auto [a, b] : commutedOperands(add.getLhs(), add.getRhs())) {
       if (lookThroughIndexCast(a).getDefiningOp<IotaOp>()) {
         if (Value s = matchScalarBroadcastReshape(b)) {
           start = s;
@@ -545,18 +571,35 @@ static bool recoverMaskIndexStart(Value idx, Value &start) {
   return false;
 }
 
+/// Per-tile-dimension facts recovered from an access mask.
+struct MaskBound {
+  /// Extent the index is compared against. A constant extent is kept in
+  /// `staticSize` so it can be baked into the view type; only a genuinely
+  /// dynamic extent needs the SSA operand `size`. At most one is set.
+  Value size;
+  std::optional<int64_t> staticSize;
+  /// Start of the compared `start + iota` index (null for a pure iota).
+  Value start;
+  /// Start of a redundant `index >= 0` conjunct, if the mask contained one.
+  Value lowerStart;
+  bool bounded = false;
+  bool lowerBounded = false;
+};
+
 /// Recover, per tile dimension, the global size and the compared-index start
 /// encoded in `mask`, and report whether the whole mask was understood.
 ///
-/// Walks the `andi`/`exti`/`trunci`/`broadcast`/`reshape` tree down to
-/// `cmpi less_than` leaves; each leaf compares a per-dim index (of the
-/// canonical `start + iota` form) against a broadcast-of-reshape-of-scalar
-/// size.  The size is recorded in `dimSize[dim]` and the index start in
-/// `dimStart[dim]` (null for a pure-iota index).  The bounded dimension is
-/// taken from the comparison operand when it is itself rank-annotated, or
-/// otherwise from a `reshape` above the leaf that lifts a 1-D comparison result
-/// into tile space (its single non-1 result dim, whose extent must match the
-/// tile extent).
+/// Walks the `andi`/`exti`/`trunci`/`broadcast`/`reshape` tree down to `cmpi`
+/// leaves; each leaf compares a per-dim index (of the canonical `start + iota`
+/// form) against either a broadcast-of-reshape-of-scalar size or a splat
+/// constant. The bounded dimension is taken from the comparison operand when it
+/// is itself rank-annotated, or otherwise from a `reshape` above the leaf that
+/// lifts a 1-D comparison result into tile space (its single non-1 result dim,
+/// whose extent must match the tile extent).
+///
+/// `index < size` establishes a view extent. `index >= 0` carries no extra
+/// information for a view (whose index space starts at zero) and is accepted
+/// only as a redundant conjunct of a dimension that also has an upper bound.
 ///
 /// Returns `true` only when every op encountered was one of the recognised
 /// shapes (so any dimension left without a size is *provably* unbounded by the
@@ -564,12 +607,9 @@ static bool recoverMaskIndexStart(Value idx, Value &start) {
 /// shape, or an ambiguous/conflicting bound is seen, in which case the caller
 /// must not treat the mask as understood.
 static bool analyzeMask(Value mask, ArrayRef<int64_t> tileShape,
-                        SmallVectorImpl<Value> &dimSize,
-                        SmallVectorImpl<Value> &dimStart) {
+                        SmallVectorImpl<MaskBound> &bounds) {
   unsigned rank = tileShape.size();
-  dimSize.assign(rank, Value());
-  dimStart.assign(rank, Value());
-  SmallVector<bool> bounded(rank, false);
+  bounds.assign(rank, MaskBound{});
   bool ok = true;
   // Each work item carries the value plus a `dimHint`: the tile dimension a
   // reshape encountered above it has already established, or -1 if none. The
@@ -636,9 +676,13 @@ static bool analyzeMask(Value mask, ArrayRef<int64_t> tileShape,
       continue;
     }
     if (auto cmp = v.getDefiningOp<CmpIOp>()) {
-      // Only `index < size` bounds a dimension; any other predicate changes the
-      // masking semantics and must not be silently ignored.
-      if (cmp.getComparisonPredicate() != ComparisonPredicate::LESS_THAN) {
+      // Upper bounds define view extents; matching zero lower bounds are redundant.
+      ComparisonPredicate predicate = cmp.getComparisonPredicate();
+      bool isUpperBound = predicate == ComparisonPredicate::LESS_THAN;
+      bool isLowerBound =
+          predicate == ComparisonPredicate::GREATER_THAN_OR_EQUAL &&
+          cmp.getSignedness() == Signedness::Signed;
+      if (!isUpperBound && !isLowerBound) {
         ok = false;
         continue;
       }
@@ -648,30 +692,64 @@ static bool analyzeMask(Value mask, ArrayRef<int64_t> tileShape,
       int dim = findDimFromIndexValue(cmp.getLhs(), rank);
       if (dim < 0)
         dim = dimHint;
-      Value size =
-          dim < 0 ? Value() : matchScalarBroadcastReshape(cmp.getRhs());
       // The compared index must be the canonical `start + iota`; recovering its
       // start lets the caller confirm it matches the pointer's index for this
       // dimension (otherwise the view's implied masking would differ).
       Value start;
       bool startOk = recoverMaskIndexStart(cmp.getLhs(), start);
-      if (dim < 0 || !size || !startOk) {
+      if (dim < 0 || !startOk) {
         ok = false;
         continue;
       }
-      if (!bounded[dim]) {
-        dimSize[dim] = size;
-        dimStart[dim] = start;
-        bounded[dim] = true;
-      } else if (dimSize[dim] != size || lookThroughIndexCast(dimStart[dim]) !=
-                                             lookThroughIndexCast(start)) {
-        ok = false; // conflicting bounds for the same dimension
+      MaskBound &bound = bounds[dim];
+      if (isLowerBound) {
+        // Only `>= 0` is redundant; any other lower bound would really narrow
+        // the access. Keep the start for the pointer-equivalence check in
+        // lowerAccess.
+        std::optional<int64_t> lower = matchSplatInt64(cmp.getRhs());
+        if (!lower || *lower != 0) {
+          ok = false;
+          continue;
+        }
+        if (!bound.lowerBounded) {
+          bound.lowerStart = start;
+          bound.lowerBounded = true;
+        } else if (lookThroughIndexCast(bound.lowerStart) !=
+                   lookThroughIndexCast(start)) {
+          ok = false;
+        }
+        continue;
+      }
+
+      Value size = matchScalarBroadcastReshape(cmp.getRhs());
+      std::optional<int64_t> staticSize = matchSplatInt64(cmp.getRhs());
+      if ((!size && !staticSize) || (staticSize && *staticSize <= 0)) {
+        ok = false;
+        continue;
+      }
+      Value dynamicSize = staticSize ? Value() : size;
+      if (!bound.bounded) {
+        bound.size = dynamicSize;
+        bound.staticSize = staticSize;
+        bound.start = start;
+        bound.bounded = true;
+      } else if (bound.size != dynamicSize ||
+                 bound.staticSize != staticSize ||
+                 lookThroughIndexCast(bound.start) !=
+                     lookThroughIndexCast(start)) {
+        // The same dimension bounded twice with different facts is ambiguous.
+        ok = false;
       }
       continue;
     }
     // Any other op in the mask tree means we did not fully understand it.
     ok = false;
   }
+  // A bare `>= 0` on an otherwise unbounded dimension would leave that
+  // dimension's extent unknown, so the mask is not fully understood.
+  for (const MaskBound &bound : bounds)
+    if (bound.lowerBounded && !bound.bounded)
+      ok = false;
   return ok;
 }
 
@@ -753,6 +831,7 @@ static LogicalResult analyzePtr(Value ptr, ArrayRef<int64_t> tileShape,
           }
           out.dims[dim].start = info.start;
           out.dims[dim].stride = info.stride;
+          out.dims[dim].staticStride = info.staticStride;
           covered[dim] = true;
         } else if (isScalarTile(a.getType())) {
           // Scalar shift — cannot absorb without creating ops.
@@ -890,8 +969,7 @@ static Value extractTileMultiplier(Value start, int64_t tileSize) {
   auto mul = start.getDefiningOp<MulIOp>();
   if (!mul)
     return nullptr;
-  for (auto [a, b] : {std::pair<Value, Value>(mul.getLhs(), mul.getRhs()),
-                      std::pair<Value, Value>(mul.getRhs(), mul.getLhs())}) {
+  for (auto [a, b] : commutedOperands(mul.getLhs(), mul.getRhs())) {
     Value cstSide = lookThroughIndexCast(a);
     DenseIntElementsAttr ints;
     if (matchPattern(cstSide, m_Constant(&ints)) && ints.isSplat() &&
@@ -928,8 +1006,7 @@ static bool loopAdvanceIsOneTile(Value advance, int64_t stepTimesTile,
     auto mul = scalar.getDefiningOp<MulIOp>();
     if (!mul)
       return false;
-    for (auto [a, b] : {std::pair<Value, Value>(mul.getLhs(), mul.getRhs()),
-                        std::pair<Value, Value>(mul.getRhs(), mul.getLhs())})
+    for (auto [a, b] : commutedOperands(mul.getLhs(), mul.getRhs()))
       if (lookThroughIndexCast(a) == stride && isSplatIntEqual(b, stepTimesTile))
         return true;
     return false;
@@ -958,8 +1035,7 @@ static Value recoverAbsoluteAdvancingSize(Value size, Value inductionVar,
   auto mul = residual.getDefiningOp<MulIOp>();
   if (!mul)
     return nullptr;
-  for (auto [a, b] : {std::pair<Value, Value>(mul.getLhs(), mul.getRhs()),
-                      std::pair<Value, Value>(mul.getRhs(), mul.getLhs())})
+  for (auto [a, b] : commutedOperands(mul.getLhs(), mul.getRhs()))
     if (lookThroughIndexCast(a) == inductionVar && isSplatIntEqual(b, tileSize))
       return lookThroughIndexCast(k);
   return nullptr;
@@ -1117,7 +1193,8 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
   //    Layout: only the innermost dimension may be contiguous (unit stride);
   //    every outer dimension must carry an explicitly recovered stride.  This
   //    matches the canonical layout produced by the TileIR frontend.
-  SmallVector<Value> absSize(rank); // null => unmasked (static tile extent)
+  SmallVector<Value> absSize(rank); // null => static or unmasked extent
+  SmallVector<std::optional<int64_t>> staticSize(rank);
   for (unsigned d = 0; d < rank; ++d) {
     const DimInfo &di = access.dims[d];
     Value size = di.size;
@@ -1132,11 +1209,13 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
       return failure(); // cannot prove this dimension is unmasked
     }
     absSize[d] = size;
+    staticSize[d] = di.staticSize;
 
     bool isMinor = (d == rank - 1);
-    if (isMinor && di.stride)
+    if (isMinor &&
+        (di.stride || (di.staticStride && *di.staticStride != 1)))
       return failure(); // innermost dim must be contiguous
-    if (!isMinor && !di.stride)
+    if (!isMinor && !di.stride && !di.staticStride)
       return failure(); // outer dims must have an explicit stride
   }
 
@@ -1150,11 +1229,16 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
   SmallVector<Value> dynShape, dynStride;
   for (unsigned d = 0; d < rank; ++d) {
     const DimInfo &di = access.dims[d];
-    if (absSize[d])
+    // Splat facts live in the type; only unknown facts become operands.
+    if (staticSize[d])
+      shape[d] = *staticSize[d];
+    else if (absSize[d])
       dynShape.push_back(absSize[d]);
     else
       shape[d] = di.tileSize; // static => unchecked (in-bounds) access
-    if (di.stride)
+    if (di.staticStride)
+      strides[d] = *di.staticStride;
+    else if (di.stride)
       dynStride.push_back(di.stride);
     else
       strides[d] = 1;
@@ -1206,18 +1290,23 @@ static LogicalResult lowerAccess(OpBuilder &b, Location loc, Value ptr,
   // Refuse partially-understood masks outright: an unrecognised predicate
   // (e.g. an extra `!=` term) would otherwise be silently dropped, changing
   // which elements are accessed.
-  SmallVector<Value> dimSizes, dimStarts;
-  if (!analyzeMask(mask, tileShape, dimSizes, dimStarts))
+  SmallVector<MaskBound> bounds;
+  if (!analyzeMask(mask, tileShape, bounds))
     return failure();
   access.maskFullyRecognized = true;
   for (unsigned d = 0; d < tileShape.size(); ++d) {
-    access.dims[d].size = dimSizes[d];
+    access.dims[d].size = bounds[d].size;
+    access.dims[d].staticSize = bounds[d].staticSize;
     // The mask's per-dim index must match the pointer's index for that
     // dimension (same start); otherwise the partition view's implied bound
     // (`idx*tileSize + lane < size`) would mask different lanes than the
     // source did.
-    if (dimSizes[d] && lookThroughIndexCast(dimStarts[d]) !=
-                           lookThroughIndexCast(access.dims[d].start))
+    Value ptrStart = lookThroughIndexCast(access.dims[d].start);
+    if (bounds[d].bounded &&
+        lookThroughIndexCast(bounds[d].start) != ptrStart)
+      return failure();
+    if (bounds[d].lowerBounded &&
+        lookThroughIndexCast(bounds[d].lowerStart) != ptrStart)
       return failure();
   }
 
@@ -1379,25 +1468,19 @@ struct TileIRPtrToViewPass
     // dead-iter-arg cleanup below only touches loops this pass modified (and
     // leaves unrelated loops, and their attributes, exactly as-is).
     DenseSet<Operation *> affectedForOps;
-    for (auto l : loads) {
-      // Capture the ancestor loops before a successful rewrite erases `l`.
+    auto rewriteAccess = [&](Operation *access, auto rewrite) {
+      // Capture the ancestor loops before a successful rewrite erases `access`.
       SmallVector<Operation *> ancestors;
-      for (Operation *p = l->getParentOp(); p; p = p->getParentOp())
+      for (Operation *p = access->getParentOp(); p; p = p->getParentOp())
         if (isa<ForOp>(p))
           ancestors.push_back(p);
-      if (succeeded(rewriteLoad(l, fwd)))
-        for (Operation *f : ancestors)
-          affectedForOps.insert(f);
-    }
-    for (auto s : stores) {
-      SmallVector<Operation *> ancestors;
-      for (Operation *p = s->getParentOp(); p; p = p->getParentOp())
-        if (isa<ForOp>(p))
-          ancestors.push_back(p);
-      if (succeeded(rewriteStore(s, fwd)))
-        for (Operation *f : ancestors)
-          affectedForOps.insert(f);
-    }
+      if (succeeded(rewrite()))
+        affectedForOps.insert(ancestors.begin(), ancestors.end());
+    };
+    for (auto l : loads)
+      rewriteAccess(l, [&] { return rewriteLoad(l, fwd); });
+    for (auto s : stores)
+      rewriteAccess(s, [&] { return rewriteStore(s, fwd); });
 
     // Remove dead iter_args from for loops. After loads/stores are rewritten
     // the ptr-typed results become unused; rebuild the loop without them.

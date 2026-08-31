@@ -129,5 +129,34 @@ module {
       %tile, %token = load_ptr_tko weak %ptr, %row_mask, %pad : tile<32x32xptr<bf16>>, tile<32x32xi1>, tile<32x32xbf16> -> tile<32x32xbf16>, !cuda_tile.token
       return
     }
+
+    // CHECK-LABEL: entry @nonzero_lower_bound
+    entry @nonzero_lower_bound(%base: tile<ptr<f32>>) {
+      %index = iota : tile<8xi32>
+      %one = constant <i32: 1> : tile<8xi32>
+      %size = constant <i32: 8> : tile<8xi32>
+      %lower = cmpi greater_than_or_equal %index, %one, signed : tile<8xi32> -> tile<8xi1>
+      %upper = cmpi less_than %index, %size, signed : tile<8xi32> -> tile<8xi1>
+      %lower_i16 = exti %lower signed : tile<8xi1> -> tile<8xi16>
+      %upper_i16 = exti %upper signed : tile<8xi1> -> tile<8xi16>
+      %mask_i16 = andi %lower_i16, %upper_i16 : tile<8xi16>
+      %mask = trunci %mask_i16 : tile<8xi16> -> tile<8xi1>
+      %base_1d = reshape %base : tile<ptr<f32>> -> tile<1xptr<f32>>
+      %base_bc = broadcast %base_1d : tile<1xptr<f32>> -> tile<8xptr<f32>>
+      %ptr = offset %base_bc, %index : tile<8xptr<f32>>, tile<8xi32> -> tile<8xptr<f32>>
+      // CHECK: load_ptr_tko
+      // expected-remark @below {{tileir-ptr-to-view: pointer-arithmetic pattern not recognised; skipping}}
+      %tile, %token = load_ptr_tko weak %ptr, %mask : tile<8xptr<f32>>, tile<8xi1> -> tile<8xf32>, !cuda_tile.token
+
+      %zero = constant <i32: 0> : tile<8xi32>
+      %unsigned_lower = cmpi greater_than_or_equal %index, %zero, unsigned : tile<8xi32> -> tile<8xi1>
+      %unsigned_lower_i16 = exti %unsigned_lower signed : tile<8xi1> -> tile<8xi16>
+      %unsigned_mask_i16 = andi %unsigned_lower_i16, %upper_i16 : tile<8xi16>
+      %unsigned_mask = trunci %unsigned_mask_i16 : tile<8xi16> -> tile<8xi1>
+      // CHECK: load_ptr_tko
+      // expected-remark @below {{tileir-ptr-to-view: pointer-arithmetic pattern not recognised; skipping}}
+      %unsigned_tile, %unsigned_token = load_ptr_tko weak %ptr, %unsigned_mask : tile<8xptr<f32>>, tile<8xi1> -> tile<8xf32>, !cuda_tile.token
+      return
+    }
   }
 }

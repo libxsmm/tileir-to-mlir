@@ -59,7 +59,6 @@ using namespace mlir;
 
 namespace {
 
-using tileir::isStaticZero;
 using tileir::signatureChangeIsSafe;
 
 /// If `arg` is an unranked-memref argument with no uses, or whose every use is
@@ -120,17 +119,15 @@ static Value materializeIndex(OpBuilder &builder, Location loc,
 
 /// Computes the descriptor layout for `cast` -- an unranked->ranked
 /// `memref.cast` or `memref.reinterpret_cast`. `offset` receives the element
-/// offset as an index-typed value, or null when the offset is statically zero
-/// (or, for a plain cast, not recoverable). `sizes` and `strides` receive the
-/// per-dimension extents.
+/// offset as an index-typed value (zero when statically zero or, for a plain
+/// cast, not recoverable). `sizes` and `strides` receive the per-dimension
+/// extents.
 static void getLayout(OpBuilder &builder, Location loc, Operation *cast,
                       MemRefType ranked, Type indexTy, Value &offset,
                       SmallVectorImpl<Value> &sizes,
                       SmallVectorImpl<Value> &strides) {
   if (auto rc = dyn_cast<memref::ReinterpretCastOp>(cast)) {
-    OpFoldResult off = rc.getMixedOffsets()[0];
-    if (!isStaticZero(off))
-      offset = materializeIndex(builder, loc, off, indexTy);
+    offset = materializeIndex(builder, loc, rc.getMixedOffsets()[0], indexTy);
     for (OpFoldResult size : rc.getMixedSizes())
       sizes.push_back(materializeIndex(builder, loc, size, indexTy));
     for (OpFoldResult stride : rc.getMixedStrides())
@@ -154,8 +151,7 @@ static void getLayout(OpBuilder &builder, Location loc, Operation *cast,
     offsetVal = 0;
     strideVals.assign(ranked.getRank(), 1);
   }
-  if (!ShapedType::isDynamic(offsetVal) && offsetVal != 0)
-    offset = constIndex(offsetVal);
+  offset = constIndex(offsetVal);
   for (int64_t size : ranked.getShape())
     sizes.push_back(constIndex(size));
   for (int64_t stride : strideVals)
@@ -210,10 +206,6 @@ static bool promoteFunctionArgs(FunctionOpInterface func) {
       // extract_strided_metadata then recovers the same base pointer and
       // offset. Folding the offset into the pointer instead would move the base
       // buffer and silently change those observations.
-      if (!offset)
-        offset = LLVM::ConstantOp::create(builder, loc, indexTy,
-                                          builder.getIntegerAttr(indexTy, 0));
-
       SmallVector<Value> values;
       values.reserve(3 + 2 * ranked.getRank());
       values.push_back(arg);    // allocated pointer

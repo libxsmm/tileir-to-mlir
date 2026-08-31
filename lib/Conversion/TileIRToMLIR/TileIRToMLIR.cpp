@@ -128,34 +128,28 @@ static FailureOr<ViewInfo> getViewInfo(Operation *op, Value view,
   ViewInfo info;
   info.memref = convertedView;
 
-  auto fillIdentityDimMapIfEmpty = [&]() {
+  // partition_view and strided_view differ only in the per-dim base advance.
+  auto fill = [&](auto viewTy, ArrayRef<int32_t> advance) {
+    ArrayRef<int32_t> tile = viewTy.getTileShape().asArrayRef();
+    info.tileShape.assign(tile.begin(), tile.end());
+    info.viewStrides.assign(advance.begin(), advance.end());
+    info.dimMap.assign(viewTy.getDimMap().begin(), viewTy.getDimMap().end());
     if (info.dimMap.empty())
-      for (unsigned d = 0, e = info.tileShape.size(); d < e; ++d)
+      for (size_t d = 0, e = info.tileShape.size(); d < e; ++d)
         info.dimMap.push_back(static_cast<int32_t>(d));
+    info.tensorViewRank = viewTy.getTensorView().getShape().size();
+    info.paddingValue = viewTy.getPaddingValue();
   };
 
+  // partition_view tiles tile the tensor exactly: advance == tile extent.
   if (auto pvType = dyn_cast<cuda_tile::PartitionViewType>(view.getType())) {
-    for (auto v : pvType.getTileShape().asArrayRef())
-      info.tileShape.push_back(v);
-    // partition_view tiles tile the tensor exactly: advance == tile extent.
-    info.viewStrides.assign(info.tileShape.begin(), info.tileShape.end());
-    info.dimMap.assign(pvType.getDimMap().begin(), pvType.getDimMap().end());
-    fillIdentityDimMapIfEmpty();
-    info.tensorViewRank = pvType.getTensorView().getShape().size();
-    info.paddingValue = pvType.getPaddingValue();
+    fill(pvType, pvType.getTileShape().asArrayRef());
     return info;
   }
 
+  // strided_view advances the tile base by the traversal stride.
   if (auto svType = dyn_cast<cuda_tile::StridedViewType>(view.getType())) {
-    for (auto v : svType.getTileShape().asArrayRef())
-      info.tileShape.push_back(v);
-    // strided_view advances the tile base by the traversal stride.
-    for (auto v : svType.getTraversalStrides().asArrayRef())
-      info.viewStrides.push_back(v);
-    info.dimMap.assign(svType.getDimMap().begin(), svType.getDimMap().end());
-    fillIdentityDimMapIfEmpty();
-    info.tensorViewRank = svType.getTensorView().getShape().size();
-    info.paddingValue = svType.getPaddingValue();
+    fill(svType, svType.getTraversalStrides().asArrayRef());
     return info;
   }
 
@@ -300,6 +294,23 @@ static Value castValueToType(OpBuilder &builder, Location loc, Value value,
       (isa<IntegerType>(value.getType()) && isa<IndexType>(targetType)))
     return arith::IndexCastOp::create(builder, loc, targetType, value);
   return Value();
+}
+
+/// Replace `op` with the signed or unsigned target op selected by `signedness`,
+/// forwarding `args` to the target op builder.
+template <typename SignedDstOp, typename UnsignedDstOp, typename SrcOp,
+          typename... Args>
+static Operation *replaceBySignedness(ConversionPatternRewriter &rewriter,
+                                     SrcOp op, cuda_tile::Signedness signedness,
+                                     Args &&...args) {
+  if (signedness == cuda_tile::Signedness::Unsigned)
+    return rewriter
+        .template replaceOpWithNewOp<UnsignedDstOp>(
+            op, std::forward<Args>(args)...)
+        .getOperation();
+  return rewriter
+      .template replaceOpWithNewOp<SignedDstOp>(op, std::forward<Args>(args)...)
+      .getOperation();
 }
 
 /// Convert the operation result type with the current type converter or emit a
@@ -512,10 +523,12 @@ struct ConvertUnaryApproxMathOp : public OpConversionPattern<SrcOp> {
 ///
 /// On current supported LLVM versions these arith ops do not expose a
 /// rounding-mode attribute, so only the default nearest-even behavior is
-/// represented natively; other rounding modes are preserved as
-/// `tir-dropped-rounding`. `flush_to_zero` has no arith equivalent and is
-/// preserved as `tir-dropped-flush-to-zero`.
-template <typename SrcOp, typename DstOp>
+/// represented natively. `ApproxFlag`, when not `none`, additionally represents
+/// `rounding<approx>` through that FastMath flag (e.g. `arcp` for divf). Any
+/// other rounding mode is preserved as `tir-dropped-rounding`. `flush_to_zero`
+/// has no arith equivalent and is preserved as `tir-dropped-flush-to-zero`.
+template <typename SrcOp, typename DstOp,
+          arith::FastMathFlags ApproxFlag = arith::FastMathFlags::none>
 struct ConvertBinaryFloatOp : public OpConversionPattern<SrcOp> {
   ConvertBinaryFloatOp(const TypeConverter &tc, MLIRContext *ctx,
                        bool dropRoundingModes)
@@ -527,13 +540,18 @@ struct ConvertBinaryFloatOp : public OpConversionPattern<SrcOp> {
                   typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto rounding = op.getRoundingMode();
+    bool ftz = op.getFlushToZero();
+    arith::FastMathFlags fmf = arith::FastMathFlags::none;
     bool roundingRepresented =
         !dropRoundingModes && rounding == cuda_tile::RoundingMode::NEAREST_EVEN;
-    bool ftz = op.getFlushToZero();
-    auto fmAttr = arith::FastMathFlagsAttr::get(rewriter.getContext(),
-                                                arith::FastMathFlags::none);
+    if (!dropRoundingModes && ApproxFlag != arith::FastMathFlags::none &&
+        rounding == cuda_tile::RoundingMode::APPROX) {
+      fmf = ApproxFlag;
+      roundingRepresented = true;
+    }
     auto newOp = rewriter.template replaceOpWithNewOp<DstOp>(
-        op, adaptor.getLhs(), adaptor.getRhs(), fmAttr);
+        op, adaptor.getLhs(), adaptor.getRhs(),
+        arith::FastMathFlagsAttr::get(rewriter.getContext(), fmf));
     preserveDroppedRoundingIfUnsupported(rewriter, rounding,
                                          roundingRepresented, newOp);
     preserveDroppedFlushToZero(rewriter, ftz, newOp);
@@ -581,11 +599,8 @@ struct ConvertBinaryLhsRhsOp : public OpConversionPattern<SrcOp> {
 ///   - cuda_tile.ftoi  -> arith.fptosi / arith.fptoui
 ///   - cuda_tile.itof  -> arith.sitofp / arith.uitofp
 ///
-///   1. Lower to the cast op regardless of source rounding mode.
-///   2. If the source rounding mode differs from `ExpectedRounding`, preserve
-///      it as `tir-dropped-rounding`.
-///   2. Convert the destination tile type (`to`) via the type converter.
-///   3. Dispatch by signedness to the signed/unsigned arith destination op.
+/// The cast is emitted regardless of the source rounding mode; a mode differing
+/// from `ExpectedRounding` is preserved as `tir-dropped-rounding`.
 template <typename SrcOp, typename SignedDstOp, typename UnsignedDstOp,
           cuda_tile::RoundingMode ExpectedRounding>
 struct ConvertFromToSignednessCastWithRoundingOp
@@ -609,18 +624,8 @@ struct ConvertFromToSignednessCastWithRoundingOp
     if (failed(resultTy))
       return failure();
 
-    Operation *newOp = nullptr;
-    if (op.getSignedness() == cuda_tile::Signedness::Unsigned)
-      newOp = rewriter
-                  .template replaceOpWithNewOp<UnsignedDstOp>(
-                      op, resultTy.value(), adaptor.getFrom())
-                  .getOperation();
-    else
-      newOp = rewriter
-                  .template replaceOpWithNewOp<SignedDstOp>(
-                      op, resultTy.value(), adaptor.getFrom())
-                  .getOperation();
-
+    Operation *newOp = replaceBySignedness<SignedDstOp, UnsignedDstOp>(
+        rewriter, op, op.getSignedness(), resultTy.value(), adaptor.getFrom());
     preserveDroppedRoundingIfUnsupported(rewriter, op.getRoundingMode(),
                                          roundingRepresented, newOp);
     return success();
@@ -706,44 +711,28 @@ struct ConvertDimQueryOp : public OpConversionPattern<SrcOp> {
       return rewriter.notifyMatchFailure(op, "cannot convert result type");
 
     // When requested, source launch coordinates from trailing function
-    // arguments (for either func.func or gpu.func).
-    bool useAppendedGridArgs = appendGridArgs;
-    unsigned numFuncArgs = 0;
-    func::FuncOp parentFunc;
-    gpu::GPUFuncOp parentGpuFunc;
-    if (useAppendedGridArgs) {
-      if (auto func = op->template getParentOfType<func::FuncOp>()) {
-        parentFunc = func;
-      } else if (auto gpuFunc =
-                     op->template getParentOfType<gpu::GPUFuncOp>()) {
-        parentGpuFunc = gpuFunc;
-      }
-      if (parentFunc)
-        numFuncArgs = parentFunc.getNumArguments();
-      else if (parentGpuFunc)
-        numFuncArgs = parentGpuFunc.getNumArguments();
-
-      if ((!parentFunc && !parentGpuFunc) ||
-          numFuncArgs < AppendedGridArgLayout::kNumArgs)
+    // arguments (of any function-like parent, e.g. func.func or gpu.func).
+    FunctionOpInterface parentFunc;
+    if (appendGridArgs) {
+      parentFunc = op->template getParentOfType<FunctionOpInterface>();
+      if (!parentFunc ||
+          parentFunc.getNumArguments() < AppendedGridArgLayout::kNumArgs)
         return rewriter.notifyMatchFailure(
             op, "expected enclosing function with appended launch-coordinate "
                 "arguments");
-    }
-
-    if (!useAppendedGridArgs && target != TileIRTarget::GPU)
+    } else if (target != TileIRTarget::GPU) {
       return rewriter.notifyMatchFailure(
           op, "dim-query lowering on non-GPU targets requires "
               "append-grid-args=true");
+    }
 
     SmallVector<Value, 3> results;
     for (gpu::Dimension dim :
          {gpu::Dimension::x, gpu::Dimension::y, gpu::Dimension::z}) {
-      unsigned argIdx =
-          AppendedGridArgLayout::argIndex(numFuncArgs, CpuArgBase, dim);
-      Value raw = useAppendedGridArgs
-                      ? Value(parentFunc ? parentFunc.getArgument(argIdx)
-                                         : parentGpuFunc.getArgument(argIdx))
-                      : Value(GpuDimOp::create(rewriter, loc, dim));
+      Value raw =
+          parentFunc ? Value(parentFunc.getArgument(AppendedGridArgLayout::argIndex(
+                           parentFunc.getNumArguments(), CpuArgBase, dim)))
+                     : Value(GpuDimOp::create(rewriter, loc, dim));
       Value casted = castValueToType(rewriter, loc, raw, resultTy);
       if (!casted)
         return rewriter.notifyMatchFailure(
@@ -763,7 +752,7 @@ struct ConvertDimQueryOp : public OpConversionPattern<SrcOp> {
 /// flush_to_zero has no equivalent in the arith FastMath flags; it is dropped.
 /// propagate_nan dispatches to arith.maximumf/minimumf (NaN propagating) vs
 /// arith.maxnumf/minnumf (NaN suppressing).
-template <typename SrcOp, bool IsMax>
+template <typename SrcOp, typename NanPropagatingOp, typename NanSuppressingOp>
 struct ConvertMinMaxFOp : public OpConversionPattern<SrcOp> {
   using OpConversionPattern<SrcOp>::OpConversionPattern;
 
@@ -771,64 +760,19 @@ struct ConvertMinMaxFOp : public OpConversionPattern<SrcOp> {
   matchAndRewrite(SrcOp op,
                   typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // flush_to_zero has no equivalent in arith max/min FastMath flags; drop it.
     bool ftz = op.getFlushToZero();
-    Operation *newOp;
-    if (op.getPropagateNan()) {
-      if constexpr (IsMax) {
-        newOp = rewriter
-                    .template replaceOpWithNewOp<arith::MaximumFOp>(
-                        op, adaptor.getLhs(), adaptor.getRhs())
-                    .getOperation();
-      } else {
-        newOp = rewriter
-                    .template replaceOpWithNewOp<arith::MinimumFOp>(
-                        op, adaptor.getLhs(), adaptor.getRhs())
-                    .getOperation();
-      }
-    } else {
-      if constexpr (IsMax) {
-        newOp = rewriter
-                    .template replaceOpWithNewOp<arith::MaxNumFOp>(
-                        op, adaptor.getLhs(), adaptor.getRhs())
-                    .getOperation();
-      } else {
-        newOp = rewriter
-                    .template replaceOpWithNewOp<arith::MinNumFOp>(
-                        op, adaptor.getLhs(), adaptor.getRhs())
-                    .getOperation();
-      }
-    }
+    Operation *newOp =
+        op.getPropagateNan()
+            ? rewriter
+                  .template replaceOpWithNewOp<NanPropagatingOp>(
+                      op, adaptor.getLhs(), adaptor.getRhs())
+                  .getOperation()
+            : rewriter
+                  .template replaceOpWithNewOp<NanSuppressingOp>(
+                      op, adaptor.getLhs(), adaptor.getRhs())
+                  .getOperation();
+    // flush_to_zero has no equivalent in arith max/min FastMath flags; drop it.
     preserveDroppedFlushToZero(rewriter, ftz, newOp);
-    return success();
-  }
-};
-
-/// Convert cuda_tile.maxi/mini using signed or unsigned arith variants.
-template <typename SrcOp, bool IsMax>
-struct ConvertMinMaxIOp : public OpConversionPattern<SrcOp> {
-  using OpConversionPattern<SrcOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(SrcOp op,
-                  typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    bool isUnsigned = op.getSignedness() == cuda_tile::Signedness::Unsigned;
-    if constexpr (IsMax) {
-      if (isUnsigned)
-        rewriter.template replaceOpWithNewOp<arith::MaxUIOp>(
-            op, adaptor.getLhs(), adaptor.getRhs());
-      else
-        rewriter.template replaceOpWithNewOp<arith::MaxSIOp>(
-            op, adaptor.getLhs(), adaptor.getRhs());
-    } else {
-      if (isUnsigned)
-        rewriter.template replaceOpWithNewOp<arith::MinUIOp>(
-            op, adaptor.getLhs(), adaptor.getRhs());
-      else
-        rewriter.template replaceOpWithNewOp<arith::MinSIOp>(
-            op, adaptor.getLhs(), adaptor.getRhs());
-    }
     return success();
   }
 };
@@ -848,39 +792,38 @@ matchSingleOperandCombiningOp(OpT op, ValueRange convertedOperands,
     return rewriter.notifyMatchFailure(
         op, "multi-operand reductions are not supported");
 
-  Block &block = op.getBody().front();
-  if (block.getNumArguments() != 2)
+  auto bodyFailure = [&]() -> LogicalResult {
     return rewriter.notifyMatchFailure(
         op, "cannot determine combining kind from body");
+  };
+
+  Block &block = op.getBody().front();
+  if (block.getNumArguments() != 2)
+    return bodyFailure();
 
   auto yieldOp = dyn_cast<cuda_tile::YieldOp>(block.getTerminator());
   if (!yieldOp || yieldOp.getNumOperands() != 1)
-    return rewriter.notifyMatchFailure(
-        op, "cannot determine combining kind from body");
+    return bodyFailure();
 
   Operation *combiningOp = nullptr;
   for (Operation &bodyOp : block.without_terminator()) {
     if (combiningOp)
-      return rewriter.notifyMatchFailure(
-          op, "cannot determine combining kind from body");
+      return bodyFailure();
     combiningOp = &bodyOp;
   }
   if (!combiningOp)
-    return rewriter.notifyMatchFailure(
-        op, "cannot determine combining kind from body");
+    return bodyFailure();
 
   if (combiningOp->getNumOperands() != 2 || combiningOp->getNumResults() != 1 ||
       yieldOp.getOperand(0) != combiningOp->getResult(0))
-    return rewriter.notifyMatchFailure(
-        op, "cannot determine combining kind from body");
+    return bodyFailure();
 
   auto lhsArg = dyn_cast<BlockArgument>(combiningOp->getOperand(0));
   auto rhsArg = dyn_cast<BlockArgument>(combiningOp->getOperand(1));
   if (!lhsArg || !rhsArg || lhsArg.getOwner() != &block ||
       rhsArg.getOwner() != &block ||
       lhsArg.getArgNumber() == rhsArg.getArgNumber())
-    return rewriter.notifyMatchFailure(
-        op, "cannot determine combining kind from body");
+    return bodyFailure();
 
   auto kind =
       llvm::TypeSwitch<Operation *, FailureOr<vector::CombiningKind>>(
@@ -915,8 +858,7 @@ matchSingleOperandCombiningOp(OpT op, ValueRange convertedOperands,
               [](auto) { return vector::CombiningKind::XOR; })
           .Default([](Operation *) { return failure(); });
   if (failed(kind))
-    return rewriter.notifyMatchFailure(
-        op, "cannot determine combining kind from body");
+    return bodyFailure();
 
   Value source = convertedOperands.front();
   auto srcVecTy = dyn_cast<VectorType>(source.getType());
@@ -946,7 +888,8 @@ matchSingleOperandCombiningOp(OpT op, ValueRange convertedOperands,
   return std::make_tuple(*kind, source, srcVecTy, identityAttr);
 }
 
-/// Convert integer binary ops that dispatch on signedness (remi, shri).
+/// Convert integer binary ops that dispatch on signedness (remi, shri, maxi,
+/// mini).
 template <typename SrcOp, typename SignedDstOp, typename UnsignedDstOp>
 struct ConvertBinaryLhsRhsWithSignednessOp : public OpConversionPattern<SrcOp> {
   using OpConversionPattern<SrcOp>::OpConversionPattern;
@@ -955,12 +898,8 @@ struct ConvertBinaryLhsRhsWithSignednessOp : public OpConversionPattern<SrcOp> {
   matchAndRewrite(SrcOp op,
                   typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (op.getSignedness() == cuda_tile::Signedness::Unsigned)
-      rewriter.template replaceOpWithNewOp<UnsignedDstOp>(op, adaptor.getLhs(),
-                                                          adaptor.getRhs());
-    else
-      rewriter.template replaceOpWithNewOp<SignedDstOp>(op, adaptor.getLhs(),
-                                                        adaptor.getRhs());
+    replaceBySignedness<SignedDstOp, UnsignedDstOp>(
+        rewriter, op, op.getSignedness(), adaptor.getLhs(), adaptor.getRhs());
     return success();
   }
 };
@@ -1043,36 +982,32 @@ buildTransferViewAccessPlan(ConversionPatternRewriter &rewriter, Operation *op,
   // indices the view expects; cross-check the extracted layout against it so a
   // mismatch is reported against the view contract rather than silently relied
   // upon downstream.
-  if (cast<cuda_tile::TileView>(view.getType()).getViewIndexRank() != tileRank)
+  if (cast<cuda_tile::TileView>(view.getType()).getViewIndexRank() != tileRank ||
+      convertedIndices.size() != tileRank)
     return rewriter.notifyMatchFailure(
         op, "view index rank does not match tile_shape rank");
   if ((unsigned)vecTy.getRank() != tileRank)
     return rewriter.notifyMatchFailure(
         op, "converted tile rank does not match view tile_shape rank");
-  if (convertedIndices.size() != tileRank)
-    return rewriter.notifyMatchFailure(
-        op, "view index rank does not match tile_shape rank");
 
   Location loc = op->getLoc();
   auto *ctx = rewriter.getContext();
 
   // Build memref indices in tensor-dimension order.
+  auto nswFlag = arith::IntegerOverflowFlagsAttr::get(
+      ctx, arith::IntegerOverflowFlags::nsw);
   Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
   SmallVector<Value> memrefIndices(tensorRank, zero);
   for (unsigned i = 0; i < tileRank; ++i) {
-    unsigned tensorDim = viewInfo.dimMap[i];
-    int64_t stride = viewInfo.viewStrides[i];
     Value tileIndex = castValueToType(rewriter, loc, convertedIndices[i],
                                       rewriter.getIndexType());
     if (!tileIndex)
       return rewriter.notifyMatchFailure(
           op, "view index could not be converted to index");
-    Value strideVal = arith::ConstantIndexOp::create(rewriter, loc, stride);
-    auto nswFlag = arith::IntegerOverflowFlagsAttr::get(
-        rewriter.getContext(), arith::IntegerOverflowFlags::nsw);
-    Value elemOffset =
+    Value strideVal =
+        arith::ConstantIndexOp::create(rewriter, loc, viewInfo.viewStrides[i]);
+    memrefIndices[viewInfo.dimMap[i]] =
         arith::MulIOp::create(rewriter, loc, tileIndex, strideVal, nswFlag);
-    memrefIndices[tensorDim] = elemOffset;
   }
 
   SmallVector<AffineExpr> permExprs;
@@ -1086,17 +1021,14 @@ buildTransferViewAccessPlan(ConversionPatternRewriter &rewriter, Operation *op,
   SmallVector<bool> inBounds(tileRank, false);
   for (unsigned i = 0; i < tileRank; ++i) {
     int64_t ext = memrefShape[viewInfo.dimMap[i]];
-    int64_t stride = viewInfo.viewStrides[i];
-    int64_t tile = viewInfo.tileShape[i];
-    if (ext == ShapedType::kDynamic || stride <= 0 || tile <= 0) {
-      inBounds[i] = false;
+    if (ext == ShapedType::kDynamic)
       continue;
-    }
     // Number of in-bounds tile bases along this dimension (partial edge tiles
     // are included), then check whether the trailing tile fits entirely.
+    int64_t stride = viewInfo.viewStrides[i];
     int64_t numTiles = (ext + stride - 1) / stride;
     int64_t lastBase = numTiles > 0 ? (numTiles - 1) * stride : 0;
-    inBounds[i] = (lastBase + tile <= ext);
+    inBounds[i] = (lastBase + viewInfo.tileShape[i] <= ext);
   }
 
   return TransferViewAccessPlan{std::move(viewInfo), std::move(memrefIndices),
@@ -1208,6 +1140,19 @@ struct ConvertBitcast : public OpConversionPattern<cuda_tile::BitcastOp> {
   }
 };
 
+/// Materialize the value that feeds a broadcast into a ranked pointer tile
+/// (`vector<...xindex>` of per-lane offsets).
+///
+/// A scalar pointer converts to an unranked memref, which carries no per-lane
+/// offset; the load/store lowerings recover the base pointer from it directly,
+/// so the lane offsets start at 0. Any other source already is the lane value.
+static Value getPointerTileLaneSource(OpBuilder &builder, Location loc,
+                                      Value source) {
+  if (isa<UnrankedMemRefType>(source.getType()))
+    return arith::ConstantIndexOp::create(builder, loc, 0);
+  return source;
+}
+
 /// Convert cuda_tile.broadcast to vector.broadcast.
 ///
 /// Both ops expand size-1 dimensions by duplicating data along them while
@@ -1228,25 +1173,17 @@ struct ConvertBroadcast : public OpConversionPattern<cuda_tile::BroadcastOp> {
     Value source = adaptor.getSource();
     if (auto dstVecTy = dyn_cast<VectorType>(resultTy)) {
       // Handles both data tiles (vector<NxMxelemTy>) and ranked pointer tiles
-      // (vector<NxMxindex>). For pointer tiles, the source may be an unranked
-      // memref (scalar ptr) that needs to be turned into an index first.
-      if (isa<UnrankedMemRefType>(source.getType())) {
-        // Scalar pointer being broadcast to ranked pointer tile.
-        // We broadcast an index of 0 (since the base pointer is extracted later
-        // directly from the source by the load/store lowerings).
-        Value zero = arith::ConstantIndexOp::create(rewriter, op.getLoc(), 0);
-        rewriter.replaceOpWithNewOp<vector::BroadcastOp>(op, dstVecTy, zero);
-      } else {
-        rewriter.replaceOpWithNewOp<vector::BroadcastOp>(op, dstVecTy, source);
-      }
-    } else if (adaptor.getSource().getType() == resultTy) {
-      rewriter.replaceOp(op, adaptor.getSource());
-    } else {
-      return rewriter.notifyMatchFailure(op,
-                                         "unsupported broadcast result type");
+      // (vector<NxMxindex>), whose scalar-pointer source needs a lane offset.
+      rewriter.replaceOpWithNewOp<vector::BroadcastOp>(
+          op, dstVecTy,
+          getPointerTileLaneSource(rewriter, op.getLoc(), source));
+      return success();
     }
-
-    return success();
+    if (source.getType() == resultTy) {
+      rewriter.replaceOp(op, source);
+      return success();
+    }
+    return rewriter.notifyMatchFailure(op, "unsupported broadcast result type");
   }
 };
 
@@ -1303,6 +1240,53 @@ struct ConvertCat : public OpConversionPattern<cuda_tile::CatOp> {
 
 using ConvertCeil = ConvertUnarySourceOp<cuda_tile::CeilOp, math::CeilOp>;
 
+/// Map a cuda_tile comparison predicate to the arith.cmpf predicate with the
+/// matching ordering (`cuda_tile::ComparisonOrdering` is either ordered or
+/// unordered).
+static arith::CmpFPredicate
+mapCmpFPredicate(cuda_tile::ComparisonPredicate pred, bool ordered) {
+  using CP = cuda_tile::ComparisonPredicate;
+  using AP = arith::CmpFPredicate;
+  switch (pred) {
+  case CP::EQUAL:
+    return ordered ? AP::OEQ : AP::UEQ;
+  case CP::NOT_EQUAL:
+    return ordered ? AP::ONE : AP::UNE;
+  case CP::LESS_THAN:
+    return ordered ? AP::OLT : AP::ULT;
+  case CP::LESS_THAN_OR_EQUAL:
+    return ordered ? AP::OLE : AP::ULE;
+  case CP::GREATER_THAN:
+    return ordered ? AP::OGT : AP::UGT;
+  case CP::GREATER_THAN_OR_EQUAL:
+    return ordered ? AP::OGE : AP::UGE;
+  }
+  llvm_unreachable("unhandled cuda_tile comparison predicate");
+}
+
+/// Map a cuda_tile comparison predicate to the arith.cmpi predicate with the
+/// requested signedness. Equality predicates are signedness-agnostic.
+static arith::CmpIPredicate
+mapCmpIPredicate(cuda_tile::ComparisonPredicate pred, bool isUnsigned) {
+  using CP = cuda_tile::ComparisonPredicate;
+  using AP = arith::CmpIPredicate;
+  switch (pred) {
+  case CP::EQUAL:
+    return AP::eq;
+  case CP::NOT_EQUAL:
+    return AP::ne;
+  case CP::LESS_THAN:
+    return isUnsigned ? AP::ult : AP::slt;
+  case CP::LESS_THAN_OR_EQUAL:
+    return isUnsigned ? AP::ule : AP::sle;
+  case CP::GREATER_THAN:
+    return isUnsigned ? AP::ugt : AP::sgt;
+  case CP::GREATER_THAN_OR_EQUAL:
+    return isUnsigned ? AP::uge : AP::sge;
+  }
+  llvm_unreachable("unhandled cuda_tile comparison predicate");
+}
+
 /// Convert cuda_tile.cmpf to arith.cmpf.
 struct ConvertCmpF : public OpConversionPattern<cuda_tile::CmpFOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -1310,57 +1294,11 @@ struct ConvertCmpF : public OpConversionPattern<cuda_tile::CmpFOp> {
   LogicalResult
   matchAndRewrite(cuda_tile::CmpFOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    FailureOr<arith::CmpFPredicate> pred = failure();
-    using CP = cuda_tile::ComparisonPredicate;
-    using CO = cuda_tile::ComparisonOrdering;
-    if (op.getComparisonOrdering() == CO::ORDERED) {
-      switch (op.getComparisonPredicate()) {
-      case CP::EQUAL:
-        pred = arith::CmpFPredicate::OEQ;
-        break;
-      case CP::NOT_EQUAL:
-        pred = arith::CmpFPredicate::ONE;
-        break;
-      case CP::LESS_THAN:
-        pred = arith::CmpFPredicate::OLT;
-        break;
-      case CP::LESS_THAN_OR_EQUAL:
-        pred = arith::CmpFPredicate::OLE;
-        break;
-      case CP::GREATER_THAN:
-        pred = arith::CmpFPredicate::OGT;
-        break;
-      case CP::GREATER_THAN_OR_EQUAL:
-        pred = arith::CmpFPredicate::OGE;
-        break;
-      }
-    } else if (op.getComparisonOrdering() == CO::UNORDERED) {
-      switch (op.getComparisonPredicate()) {
-      case CP::EQUAL:
-        pred = arith::CmpFPredicate::UEQ;
-        break;
-      case CP::NOT_EQUAL:
-        pred = arith::CmpFPredicate::UNE;
-        break;
-      case CP::LESS_THAN:
-        pred = arith::CmpFPredicate::ULT;
-        break;
-      case CP::LESS_THAN_OR_EQUAL:
-        pred = arith::CmpFPredicate::ULE;
-        break;
-      case CP::GREATER_THAN:
-        pred = arith::CmpFPredicate::UGT;
-        break;
-      case CP::GREATER_THAN_OR_EQUAL:
-        pred = arith::CmpFPredicate::UGE;
-        break;
-      }
-    }
-    if (failed(pred))
-      return rewriter.notifyMatchFailure(op,
-                                         "unsupported cmpf predicate/ordering");
-    rewriter.replaceOpWithNewOp<arith::CmpFOp>(op, *pred, adaptor.getLhs(),
-                                               adaptor.getRhs());
+    bool ordered = op.getComparisonOrdering() ==
+                   cuda_tile::ComparisonOrdering::ORDERED;
+    rewriter.replaceOpWithNewOp<arith::CmpFOp>(
+        op, mapCmpFPredicate(op.getComparisonPredicate(), ordered),
+        adaptor.getLhs(), adaptor.getRhs());
     return success();
   }
 };
@@ -1372,34 +1310,10 @@ struct ConvertCmpI : public OpConversionPattern<cuda_tile::CmpIOp> {
   LogicalResult
   matchAndRewrite(cuda_tile::CmpIOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    FailureOr<arith::CmpIPredicate> pred = failure();
-    using CP = cuda_tile::ComparisonPredicate;
     bool isUnsigned = op.getSignedness() == cuda_tile::Signedness::Unsigned;
-    switch (op.getComparisonPredicate()) {
-    case CP::EQUAL:
-      pred = arith::CmpIPredicate::eq;
-      break;
-    case CP::NOT_EQUAL:
-      pred = arith::CmpIPredicate::ne;
-      break;
-    case CP::LESS_THAN:
-      pred = isUnsigned ? arith::CmpIPredicate::ult : arith::CmpIPredicate::slt;
-      break;
-    case CP::LESS_THAN_OR_EQUAL:
-      pred = isUnsigned ? arith::CmpIPredicate::ule : arith::CmpIPredicate::sle;
-      break;
-    case CP::GREATER_THAN:
-      pred = isUnsigned ? arith::CmpIPredicate::ugt : arith::CmpIPredicate::sgt;
-      break;
-    case CP::GREATER_THAN_OR_EQUAL:
-      pred = isUnsigned ? arith::CmpIPredicate::uge : arith::CmpIPredicate::sge;
-      break;
-    }
-    if (failed(pred))
-      return rewriter.notifyMatchFailure(
-          op, "unsupported cmpi predicate/signedness");
-    rewriter.replaceOpWithNewOp<arith::CmpIOp>(op, *pred, adaptor.getLhs(),
-                                               adaptor.getRhs());
+    rewriter.replaceOpWithNewOp<arith::CmpIOp>(
+        op, mapCmpIPredicate(op.getComparisonPredicate(), isUnsigned),
+        adaptor.getLhs(), adaptor.getRhs());
     return success();
   }
 };
@@ -1466,36 +1380,8 @@ using ConvertCosH = ConvertUnarySourceOp<cuda_tile::CosHOp, math::CoshOp>;
 /// `tir-dropped-rounding`.
 /// `flush_to_zero` has no arith equivalent and is preserved on the result as
 /// `tir-dropped-flush-to-zero`.
-struct ConvertDivF : public OpConversionPattern<cuda_tile::DivFOp> {
-  ConvertDivF(const TypeConverter &tc, MLIRContext *ctx, bool dropRoundingModes)
-      : OpConversionPattern(tc, ctx), dropRoundingModes(dropRoundingModes) {}
-
-  LogicalResult
-  matchAndRewrite(cuda_tile::DivFOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto rounding = op.getRoundingMode();
-    bool ftz = op.getFlushToZero();
-
-    arith::FastMathFlags fmf = arith::FastMathFlags::none;
-    bool roundingRepresented =
-        !dropRoundingModes && rounding == cuda_tile::RoundingMode::NEAREST_EVEN;
-    if (!dropRoundingModes && rounding == cuda_tile::RoundingMode::APPROX) {
-      // approx has no rounding-mode equivalent; map to the arcp FastMath flag.
-      fmf = arith::FastMathFlags::arcp;
-      roundingRepresented = true;
-    }
-
-    auto newOp = rewriter.replaceOpWithNewOp<arith::DivFOp>(
-        op, adaptor.getLhs(), adaptor.getRhs(),
-        arith::FastMathFlagsAttr::get(rewriter.getContext(), fmf));
-    preserveDroppedRoundingIfUnsupported(rewriter, rounding,
-                                         roundingRepresented, newOp);
-    preserveDroppedFlushToZero(rewriter, ftz, newOp);
-    return success();
-  }
-
-  bool dropRoundingModes;
-};
+using ConvertDivF = ConvertBinaryFloatOp<cuda_tile::DivFOp, arith::DivFOp,
+                                         arith::FastMathFlags::arcp>;
 
 /// Convert cuda_tile.divi to arith.divsi/divui.
 ///
@@ -1510,17 +1396,8 @@ struct ConvertDivI : public OpConversionPattern<cuda_tile::DivIOp> {
                   ConversionPatternRewriter &rewriter) const override {
     bool roundingRepresented =
         !dropRoundingModes && op.getRounding() == cuda_tile::RoundingMode::ZERO;
-    Operation *newOp = nullptr;
-    if (op.getSignedness() == cuda_tile::Signedness::Unsigned)
-      newOp = rewriter
-                  .replaceOpWithNewOp<arith::DivUIOp>(op, adaptor.getLhs(),
-                                                      adaptor.getRhs())
-                  .getOperation();
-    else
-      newOp = rewriter
-                  .replaceOpWithNewOp<arith::DivSIOp>(op, adaptor.getLhs(),
-                                                      adaptor.getRhs())
-                  .getOperation();
+    Operation *newOp = replaceBySignedness<arith::DivSIOp, arith::DivUIOp>(
+        rewriter, op, op.getSignedness(), adaptor.getLhs(), adaptor.getRhs());
     preserveDroppedRoundingIfUnsupported(rewriter, op.getRounding(),
                                          roundingRepresented, newOp);
     return success();
@@ -1567,7 +1444,7 @@ struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
     TypeConverter::SignatureConversion sigConv(numArgs);
     SmallVector<Type> funcArgTypes;
 
-    funcArgTypes.reserve(funcArgTypes.size() + numArgs);
+    funcArgTypes.reserve(numArgs + AppendedGridArgLayout::kNumArgs);
     for (unsigned i = 0; i < numArgs; ++i) {
       Type origTy = entryBlock->getArgument(i).getType();
       Type converted = tc->convertType(origTy);
@@ -1652,12 +1529,8 @@ struct ConvertExtI : public OpConversionPattern<cuda_tile::ExtIOp> {
     if (failed(resultTy))
       return failure();
 
-    if (op.getSignedness() == cuda_tile::Signedness::Unsigned)
-      rewriter.replaceOpWithNewOp<arith::ExtUIOp>(op, resultTy.value(),
-                                                  adaptor.getFrom());
-    else
-      rewriter.replaceOpWithNewOp<arith::ExtSIOp>(op, resultTy.value(),
-                                                  adaptor.getFrom());
+    replaceBySignedness<arith::ExtSIOp, arith::ExtUIOp>(
+        rewriter, op, op.getSignedness(), resultTy.value(), adaptor.getFrom());
     return success();
   }
 };
@@ -1941,20 +1814,16 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToStart(newBody);
 
-    Value iv;
+    Value ivSrc = newForOp.getInductionVar();
     if (tileSize > 0) {
       // The loop iterates in element space; recover the tile-space index
       // that body ops expect with divui(iv, tileSize).
       Value tileSizeVal =
           arith::ConstantIndexOp::create(rewriter, loc, tileSize);
-      Value tileIdx = arith::DivUIOp::create(
-          rewriter, loc, newForOp.getInductionVar(), tileSizeVal);
-      iv = castValueToType(rewriter, loc, tileIdx,
-                           oldBody->getArgument(0).getType());
-    } else {
-      iv = castValueToType(rewriter, loc, newForOp.getInductionVar(),
-                           oldBody->getArgument(0).getType());
+      ivSrc = arith::DivUIOp::create(rewriter, loc, ivSrc, tileSizeVal);
     }
+    Value iv = castValueToType(rewriter, loc, ivSrc,
+                               oldBody->getArgument(0).getType());
     if (!iv)
       return rewriter.notifyMatchFailure(
           op, "for induction variable could not be converted to body type");
@@ -2271,30 +2140,12 @@ struct ConvertGlobal : public OpConversionPattern<cuda_tile::GlobalOp> {
     if (failed(memrefTy))
       return failure();
 
-    auto initAttr = dyn_cast<ElementsAttr>(op.getValue());
-    if (!initAttr)
-      return rewriter.notifyMatchFailure(
-          op, "global initializer must be an elements attribute");
-
-    auto initTy = dyn_cast<ShapedType>(initAttr.getType());
-    if (!initTy || !initTy.hasStaticShape())
-      return rewriter.notifyMatchFailure(
-          op, "global initializer must be a statically shaped elements "
-              "attribute");
-
-    auto tensorTy =
-        RankedTensorType::get(initTy.getShape(), initTy.getElementType());
-    ElementsAttr normalizedInitAttr = initAttr;
-    if (initAttr.getType() != tensorTy) {
-      auto denseAttr = dyn_cast<DenseElementsAttr>(initAttr);
-      if (!denseAttr)
-        return rewriter.notifyMatchFailure(
-            op, "global initializer must be a dense elements attribute when "
-                "retyping is required");
-
-      normalizedInitAttr =
-          ElementsAttr(retypeDenseElements(denseAttr, tensorTy));
-    }
+    // memref.global requires a tensor-typed initializer of the same shape.
+    DenseElementsAttr initAttr = op.getValue();
+    auto tensorTy = RankedTensorType::get(memrefTy->getShape(),
+                                          memrefTy->getElementType());
+    if (initAttr.getType() != tensorTy)
+      initAttr = retypeDenseElements(initAttr, tensorTy);
 
     IntegerAttr alignmentAttr;
     if (op.getAlignment() != 0)
@@ -2302,7 +2153,7 @@ struct ConvertGlobal : public OpConversionPattern<cuda_tile::GlobalOp> {
 
     rewriter.replaceOpWithNewOp<memref::GlobalOp>(
         op, op.getSymName(), /*sym_visibility=*/StringAttr(), *memrefTy,
-        normalizedInitAttr, /*constant=*/false, alignmentAttr);
+        initAttr, /*constant=*/false, alignmentAttr);
     return success();
   }
 };
@@ -2323,23 +2174,15 @@ struct ConvertIf : public OpConversionPattern<cuda_tile::IfOp> {
     auto newIfOp = scf::IfOp::create(rewriter, op.getLoc(), resultTypes,
                                      adaptor.getCondition(), hasElse);
 
-    // Move then region.
-    {
-      Block *oldBlock = op.getThenBlock();
-      Block *newBlock = newIfOp.thenBlock();
+    // Replace the auto-created (empty) scf.if block by the cuda_tile.if one.
+    auto moveBody = [&](Block *oldBlock, Block *newBlock) {
       if (newBlock->mightHaveTerminator())
         rewriter.eraseOp(newBlock->getTerminator());
       rewriter.mergeBlocks(oldBlock, newBlock, {});
-    }
-
-    // Move else region (if present).
-    if (hasElse) {
-      Block *oldBlock = op.getElseBlock();
-      Block *newBlock = newIfOp.elseBlock();
-      if (newBlock->mightHaveTerminator())
-        rewriter.eraseOp(newBlock->getTerminator());
-      rewriter.mergeBlocks(oldBlock, newBlock, {});
-    }
+    };
+    moveBody(op.getThenBlock(), newIfOp.thenBlock());
+    if (hasElse)
+      moveBody(op.getElseBlock(), newIfOp.elseBlock());
 
     rewriter.replaceOp(op, newIfOp.getResults());
     return success();
@@ -2453,9 +2296,9 @@ struct ConvertLoadViewTko
       padding = arith::ConstantIntOp::create(rewriter, loc,
                                              vecTy->getElementType(), 0);
     }
-    SmallVector<bool> inBounds(vecTy->getRank(), assumeInBounds);
-    if (!assumeInBounds)
-      inBounds = plan->inBounds;
+    SmallVector<bool> inBounds = assumeInBounds
+                                     ? SmallVector<bool>(vecTy->getRank(), true)
+                                     : plan->inBounds;
 
     auto readOp = vector::TransferReadOp::create(
         rewriter, loc, *vecTy, plan->viewInfo.memref, plan->memrefIndices,
@@ -2700,13 +2543,17 @@ struct ConvertMakeTensorView
   }
 };
 
-using ConvertMaxF = ConvertMinMaxFOp<cuda_tile::MaxFOp, /*IsMax=*/true>;
+using ConvertMaxF =
+    ConvertMinMaxFOp<cuda_tile::MaxFOp, arith::MaximumFOp, arith::MaxNumFOp>;
 
-using ConvertMaxI = ConvertMinMaxIOp<cuda_tile::MaxIOp, /*IsMax=*/true>;
+using ConvertMaxI = ConvertBinaryLhsRhsWithSignednessOp<
+    cuda_tile::MaxIOp, arith::MaxSIOp, arith::MaxUIOp>;
 
-using ConvertMinF = ConvertMinMaxFOp<cuda_tile::MinFOp, /*IsMax=*/false>;
+using ConvertMinF =
+    ConvertMinMaxFOp<cuda_tile::MinFOp, arith::MinimumFOp, arith::MinNumFOp>;
 
-using ConvertMinI = ConvertMinMaxIOp<cuda_tile::MinIOp, /*IsMax=*/false>;
+using ConvertMinI = ConvertBinaryLhsRhsWithSignednessOp<
+    cuda_tile::MinIOp, arith::MinSIOp, arith::MinUIOp>;
 
 /// Convert cuda_tile.mmaf to vector.contract (matmul-style contraction).
 ///
@@ -2975,9 +2822,7 @@ struct ConvertLoadPtrTkoScalar
     if (failed(checkCommonTkoGuards(op, rewriter)))
       return failure();
 
-    auto srcUnranked =
-        dyn_cast<UnrankedMemRefType>(adaptor.getSource().getType());
-    if (!srcUnranked)
+    if (!isa<UnrankedMemRefType>(adaptor.getSource().getType()))
       return rewriter.notifyMatchFailure(
           op, "expected unranked memref pointer source");
 
@@ -3013,9 +2858,7 @@ struct ConvertStorePtrTkoScalar
     if (failed(checkCommonTkoGuards(op, rewriter)))
       return failure();
 
-    auto dstUnranked =
-        dyn_cast<UnrankedMemRefType>(adaptor.getDestination().getType());
-    if (!dstUnranked)
+    if (!isa<UnrankedMemRefType>(adaptor.getDestination().getType()))
       return rewriter.notifyMatchFailure(
           op, "expected unranked memref pointer destination");
 
@@ -3096,19 +2939,15 @@ struct ConvertOffsetRanked : public OpConversionPattern<cuda_tile::OffsetOp> {
   }
 };
 
-/// Helper for vector.gather/scatter lowering. Derives the common 1D base
-/// memref and the flattened (rank-1) mask and index vectors.
+/// Derive the flat base memref plus the mask and index vectors of an access.
 ///
-/// vector.gather/scatter only lower to LLVM for rank-1 vectors, so the index
-/// and mask are flattened here with vector.shape_cast (a pure row-major
-/// reshape). The base is already a flat 1-D memref and the whole address lives
-/// in the per-element index vector, so flattening preserves the
-/// lane<->index<->value correspondence exactly. Callers flatten the
-/// value/result and shape_cast back to the tile shape.
-static LogicalResult deriveGatherScatterMemRefAndMask(
+/// `flatten` collapses the mask and indices to rank-1, which the gather/scatter
+/// lowering requires; row loads pass false to keep the source shape so they can
+/// slice contiguous minor-dimension rows.
+static LogicalResult deriveAccessMemRefAndMask(
     Operation *op, Value origPtr, Value cvtPtr, Value origMask, Value cvtMask,
     Type elemTy, ArrayRef<int64_t> shape, ConversionPatternRewriter &rewriter,
-    Value &baseMemref, Value &mask, Value &indexVec) {
+    bool flatten, Value &baseMemref, Value &mask, Value &indexVec) {
   Location loc = op->getLoc();
 
   indexVec = cvtPtr;
@@ -3126,14 +2965,11 @@ static LogicalResult deriveGatherScatterMemRefAndMask(
     return rewriter.notifyMatchFailure(op, "base is not scalar");
 
   // Get the converted base value.
-  Value scalarBase;
-  if (auto blockArg = dyn_cast<BlockArgument>(origBase)) {
-    scalarBase = rewriter.getRemappedValue(blockArg);
-  } else {
-    scalarBase = rewriter.getRemappedValue(origBase);
-  }
+  Value scalarBase = rewriter.getRemappedValue(origBase);
   if (!scalarBase)
     return rewriter.notifyMatchFailure(op, "cannot find converted base memref");
+  if (!isa<BaseMemRefType>(scalarBase.getType()))
+    return rewriter.notifyMatchFailure(op, "base is not a memref");
 
   // Cast to memref<?xelemTy> for gather/scatter. The flat type must keep a
   // dynamic offset: the scalar base may be a `memref.reinterpret_cast` that
@@ -3143,23 +2979,20 @@ static LogicalResult deriveGatherScatterMemRefAndMask(
   // descriptor's offset field and drop the row stride entirely.
   auto flatMemTy =
       get1DDynamicOffsetMemRefType(elemTy, /*size=*/ShapedType::kDynamic);
-  if (!isa<MemRefType>(scalarBase.getType()) &&
-      !isa<UnrankedMemRefType>(scalarBase.getType()))
-    return rewriter.notifyMatchFailure(op, "base is not a memref");
   baseMemref = memref::CastOp::create(rewriter, loc, flatMemTy, scalarBase);
 
   // Mask.
-  auto maskTy = VectorType::get(shape, rewriter.getI1Type());
   if (origMask) {
     mask = cvtMask;
   } else {
+    auto maskTy = VectorType::get(shape, rewriter.getI1Type());
     Value trueVal = arith::ConstantIntOp::create(rewriter, loc, 1, 1);
     mask = vector::BroadcastOp::create(rewriter, loc, maskTy, trueVal);
   }
 
   // Flatten the index and mask to rank-1 so the gather/scatter is legal for
   // the Vector->LLVM lowering (which only supports rank-1).
-  if (ptrVecTy.getRank() != 1) {
+  if (flatten && ptrVecTy.getRank() != 1) {
     int64_t numElts = ptrVecTy.getNumElements();
     auto flatIdxTy = VectorType::get({numElts}, rewriter.getIndexType());
     indexVec = vector::ShapeCastOp::create(rewriter, loc, flatIdxTy, indexVec);
@@ -3170,15 +3003,144 @@ static LogicalResult deriveGatherScatterMemRefAndMask(
   return success();
 }
 
-/// Convert ranked cuda_tile.load_ptr_tko to vector.gather.
+//===----------------------------------------------------------------------===//
+// Row-wise masked load support
+//
+// A pointer tile holds one absolute element offset per lane, so a load is only
+// a sequence of contiguous row loads when, within every row, the offsets grow
+// by exactly one from column to column. `hasUnitMinorStride` establishes that
+// structurally on the converted index vector: it walks down to the `vector.step`
+// that supplies the iota, allowing replication across leading dimensions and
+// any number of minor-invariant shifts (row bases, strides, buffer offsets) at
+// any level. That covers the canonical `row_base + column_iota` address form as
+// well as the equally common `broadcast(start + iota)` spelling.
+//
+// Everything is a conservative structural match: an unrecognised expression
+// simply falls back to the gather lowering below.
+//===----------------------------------------------------------------------===//
+
+/// Strip casts that change only the element type and preserve the lane layout.
+static Value lookThroughElementCast(Value value) {
+  while (Operation *def = value.getDefiningOp()) {
+    if (!isa<arith::IndexCastOp, arith::IndexCastUIOp, arith::ExtSIOp,
+             arith::ExtUIOp>(def))
+      break;
+    value = def->getOperand(0);
+  }
+  return value;
+}
+
+/// True when `ty` varies *only* along the minor dimension, i.e. its trailing
+/// extent is `minorSize` and every other extent is 1. Comparing element counts
+/// alone would also accept transposed shapes such as `vector<Nx1>`, whose
+/// values vary across rows rather than across columns.
+static bool isMinorOnlyShape(VectorType ty, int64_t minorSize) {
+  return ty && ty.getRank() > 0 && ty.getShape().back() == minorSize &&
+         ty.getNumElements() == minorSize;
+}
+
+/// Match a value that is constant along the minor dimension, so adding it
+/// shifts a whole row without disturbing its unit spacing.
+static bool isMinorInvariant(Value value) {
+  value = lookThroughElementCast(value);
+  auto valueTy = dyn_cast<VectorType>(value.getType());
+  if (!valueTy)
+    return true;
+  DenseElementsAttr elements;
+  if (matchPattern(value, m_Constant(&elements)) && elements.isSplat())
+    return true;
+  auto broadcast = value.getDefiningOp<vector::BroadcastOp>();
+  if (!broadcast)
+    return false;
+  // `vector.broadcast` aligns trailing dimensions, so a source whose minor
+  // extent is 1 (or a scalar source) is stretched uniformly across columns.
+  auto sourceTy = dyn_cast<VectorType>(broadcast.getSource().getType());
+  return !sourceTy ||
+         (sourceTy.getRank() > 0 && sourceTy.getShape().back() == 1);
+}
+
+/// Prove that offsets within each row increase by exactly one per column.
+static bool hasUnitMinorStride(Value value, int64_t minorSize) {
+  value = lookThroughElementCast(value);
+  // Base case: the iota itself, which must span exactly the minor dimension.
+  if (auto step = value.getDefiningOp<vector::StepOp>())
+    return isMinorOnlyShape(step.getType(), minorSize);
+  // Replication preserves the step only when the source already carries it
+  // along its own minor dimension; the shape guard rejects transposed sources.
+  if (auto shapeCast = value.getDefiningOp<vector::ShapeCastOp>())
+    return isMinorOnlyShape(shapeCast.getSourceVectorType(), minorSize) &&
+           hasUnitMinorStride(shapeCast.getSource(), minorSize);
+  if (auto broadcast = value.getDefiningOp<vector::BroadcastOp>()) {
+    // A scalar source cannot carry a step, so a vector source is required.
+    auto sourceTy = dyn_cast<VectorType>(broadcast.getSource().getType());
+    return isMinorOnlyShape(sourceTy, minorSize) &&
+           hasUnitMinorStride(broadcast.getSource(), minorSize);
+  }
+  // Shifting by a minor-invariant term moves a row without restriding it. The
+  // shift may sit either side of a replication, e.g. `broadcast(start + iota)`.
+  if (auto add = value.getDefiningOp<arith::AddIOp>())
+    return (hasUnitMinorStride(add.getLhs(), minorSize) &&
+            isMinorInvariant(add.getRhs())) ||
+           (hasUnitMinorStride(add.getRhs(), minorSize) &&
+            isMinorInvariant(add.getLhs()));
+  return false;
+}
+
+/// Replace a minor-contiguous pointer load by one masked load per row.
+///
+/// Leading dimensions are collapsed first, so a rank-N access becomes
+/// `rows x columns` regardless of N. Each row then loads from its own first
+/// offset: because the offsets step by one across a row, lane `j` resolves to
+/// the same address the gather would have used, and masked-off lanes are never
+/// accessed, so a row whose base offset lies outside the buffer stays safe.
+static Value buildRowWiseMaskedLoad(cuda_tile::LoadPtrTkoOp op,
+                                    Value baseMemref, Value indexVec,
+                                    Value mask, Value passThru,
+                                    ConversionPatternRewriter &rewriter) {
+  Location loc = op.getLoc();
+  auto resultTy = cast<VectorType>(passThru.getType());
+  int64_t columns = resultTy.getShape().back();
+  int64_t rows = resultTy.getNumElements() / columns;
+  auto rowTy = VectorType::get({columns}, resultTy.getElementType());
+  bool needsCollapse = resultTy.getRank() != 2;
+
+  if (needsCollapse) {
+    auto collapse = [&](Value value, Type elementType) {
+      auto ty = VectorType::get({rows, columns}, elementType);
+      return vector::ShapeCastOp::create(rewriter, loc, ty, value).getResult();
+    };
+    indexVec = collapse(indexVec, rewriter.getIndexType());
+    mask = collapse(mask, rewriter.getI1Type());
+    passThru = collapse(passThru, resultTy.getElementType());
+  }
+
+  Value result = passThru;
+  for (int64_t row = 0; row < rows; ++row) {
+    Value baseIndex = vector::ExtractOp::create(rewriter, loc, indexVec,
+                                                ArrayRef<int64_t>{row, 0});
+    Value maskRow = vector::ExtractOp::create(rewriter, loc, mask, row);
+    Value passThruRow = vector::ExtractOp::create(rewriter, loc, passThru, row);
+    auto load = vector::MaskedLoadOp::create(
+        rewriter, loc, rowTy, baseMemref, ValueRange{baseIndex}, maskRow,
+        passThruRow, llvm::MaybeAlign());
+    preserveDroppedOptHints(op, load);
+    result =
+        vector::InsertOp::create(rewriter, loc, load.getResult(), result, row);
+  }
+
+  if (needsCollapse)
+    result = vector::ShapeCastOp::create(rewriter, loc, resultTy, result);
+  return result;
+}
+
+/// Convert ranked cuda_tile.load_ptr_tko to masked row loads or vector.gather.
 ///
 /// The pointer tile (vector<...xindex>) holds per-element offsets from the
-/// buffer base. We trace the original IR to find the scalar base pointer
-/// (converted to memref<*xT>), cast it to memref<?xT>, and emit a 1-D
-/// vector.gather, reshaping back to the tile shape.
+/// buffer base. Minor-contiguous accesses use independent masked row loads;
+/// all other accesses are flattened into a 1-D vector.gather.
 ///
 /// `optimization_hints`, when present, is preserved on the produced
-/// vector.gather as the discardable attribute `tir-dropped-optimization-hints`.
+/// memory ops as the discardable attribute `tir-dropped-optimization-hints`.
 struct ConvertLoadPtrTkoRanked
     : public OpConversionPattern<cuda_tile::LoadPtrTkoOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -3197,11 +3159,14 @@ struct ConvertLoadPtrTkoRanked
     auto shape = tileTy.getShape();
     Type elemTy = tileTy.getElementType();
 
+    bool useRowLoads = shape.size() >= 2 &&
+                       hasUnitMinorStride(adaptor.getSource(), shape.back());
+
     Value baseMemref, mask, indexVec;
-    if (failed(deriveGatherScatterMemRefAndMask(
+    if (failed(deriveAccessMemRefAndMask(
             op, op.getSource(), adaptor.getSource(), op.getMask(),
-            adaptor.getMask(), elemTy, shape, rewriter, baseMemref, mask,
-            indexVec)))
+            adaptor.getMask(), elemTy, shape, rewriter,
+            /*flatten=*/!useRowLoads, baseMemref, mask, indexVec)))
       return failure();
 
     // Passthrough.
@@ -3213,6 +3178,14 @@ struct ConvertLoadPtrTkoRanked
       auto zeroAttr = rewriter.getZeroAttr(resultVecTy);
       passThru =
           arith::ConstantOp::create(rewriter, loc, resultVecTy, zeroAttr);
+    }
+
+    // Row-wise masked loads retain the source mask while exposing contiguity.
+    if (useRowLoads) {
+      Value result = buildRowWiseMaskedLoad(op, baseMemref, indexVec, mask,
+                                            passThru, rewriter);
+      rewriter.replaceOp(op, {result, Value()});
+      return success();
     }
 
     // vector.gather lowers to LLVM only for rank-1 vectors. The index/mask were
@@ -3263,10 +3236,10 @@ struct ConvertStorePtrTkoRanked
     Type elemTy = valTileTy.getElementType();
 
     Value baseMemref, mask, indexVec;
-    if (failed(deriveGatherScatterMemRefAndMask(
+    if (failed(deriveAccessMemRefAndMask(
             op, op.getDestination(), adaptor.getDestination(), op.getMask(),
-            adaptor.getMask(), elemTy, shape, rewriter, baseMemref, mask,
-            indexVec)))
+            adaptor.getMask(), elemTy, shape, rewriter,
+            /*flatten=*/true, baseMemref, mask, indexVec)))
       return failure();
 
     Value valVec = adaptor.getValue();
@@ -3293,9 +3266,9 @@ struct ConvertStorePtrTkoRanked
 /// Map a cuda_tile.atomic_rmw mode to the equivalent arith atomic_rmw kind.
 ///
 /// MAX/MIN are the signed integer variants; UMAX/UMIN are the unsigned ones.
-/// XCHG (unconditional swap) maps to `assign`. Returns nullopt for modes with
-/// no clean arith equivalent.
-static std::optional<arith::AtomicRMWKind>
+/// XCHG (unconditional swap) maps to `assign`. Every cuda_tile mode has an
+/// arith equivalent, so this mapping is total.
+static arith::AtomicRMWKind
 mapAtomicRMWMode(cuda_tile::AtomicRMWMode mode) {
   switch (mode) {
   case cuda_tile::AtomicRMWMode::AND:
@@ -3319,7 +3292,7 @@ mapAtomicRMWMode(cuda_tile::AtomicRMWMode mode) {
   case cuda_tile::AtomicRMWMode::XCHG:
     return arith::AtomicRMWKind::assign;
   }
-  return std::nullopt;
+  llvm_unreachable("unhandled cuda_tile atomic_rmw mode");
 }
 
 /// Convert scalar (rank-0) cuda_tile.atomic_rmw_tko on a `tile<ptr<T>>` to a
@@ -3369,22 +3342,17 @@ struct ConvertAtomicRMWTko
       return rewriter.notifyMatchFailure(
           op, "result_token has live uses; this lowering drops the token");
 
-    std::optional<arith::AtomicRMWKind> kind = mapAtomicRMWMode(op.getMode());
-    if (!kind)
-      return rewriter.notifyMatchFailure(op, "unsupported atomic_rmw mode");
-
-    auto srcUnranked =
-        dyn_cast<UnrankedMemRefType>(adaptor.getPointers().getType());
-    if (!srcUnranked)
+    if (!isa<UnrankedMemRefType>(adaptor.getPointers().getType()))
       return rewriter.notifyMatchFailure(
           op, "expected unranked memref pointer source");
 
     Location loc = op.getLoc();
     Value rc = reinterpretScalarPtrPreservingOffset(rewriter, loc,
                                                     adaptor.getPointers());
-    auto rmw =
-        memref::AtomicRMWOp::create(rewriter, loc, *kind, adaptor.getArg(), rc,
-                                    /*indices=*/ValueRange{});
+    auto rmw = memref::AtomicRMWOp::create(rewriter, loc,
+                                           mapAtomicRMWMode(op.getMode()),
+                                           adaptor.getArg(), rc,
+                                           /*indices=*/ValueRange{});
     rmw->setAttr(
         "tir-dropped-memory-ordering",
         rewriter.getStringAttr(cuda_tile::stringifyMemoryOrderingSemantics(
@@ -3572,17 +3540,11 @@ struct ConvertReshape : public OpConversionPattern<cuda_tile::ReshapeOp> {
     if (srcVecTy && dstVecTy) {
       rewriter.replaceOpWithNewOp<vector::ShapeCastOp>(op, dstVecTy, source);
     } else if (!srcVecTy && dstVecTy) {
-      if (isa<UnrankedMemRefType>(source.getType())) {
-        // Scalar pointer being reshaped to ranked pointer tile
-        // (e.g. tile<ptr<T>> → tile<1x1xptr<T>>). The ranked ptr type is now
-        // vector<...xindex>. We broadcast an index of 0 (since the base pointer
-        // is extracted later directly from the source by the load/store
-        // lowerings).
-        Value zero = arith::ConstantIndexOp::create(rewriter, op.getLoc(), 0);
-        rewriter.replaceOpWithNewOp<vector::BroadcastOp>(op, dstVecTy, zero);
-      } else {
-        rewriter.replaceOpWithNewOp<vector::BroadcastOp>(op, dstVecTy, source);
-      }
+      // Also covers a scalar pointer reshaped to a ranked pointer tile
+      // (e.g. tile<ptr<T>> -> tile<1x1xptr<T>> -> vector<1x1xindex>).
+      rewriter.replaceOpWithNewOp<vector::BroadcastOp>(
+          op, dstVecTy,
+          getPointerTileLaneSource(rewriter, op.getLoc(), source));
     } else if (srcVecTy && !dstVecTy) {
       SmallVector<int64_t> indices(srcVecTy.getRank(), 0);
       rewriter.replaceOpWithNewOp<vector::ExtractOp>(op, source, indices);
@@ -3754,9 +3716,9 @@ struct ConvertStoreViewTko
     if (failed(plan))
       return failure();
 
-    SmallVector<bool> inBounds(vecTy->getRank(), assumeInBounds);
-    if (!assumeInBounds)
-      inBounds = plan->inBounds;
+    SmallVector<bool> inBounds = assumeInBounds
+                                     ? SmallVector<bool>(vecTy->getRank(), true)
+                                     : plan->inBounds;
 
     auto writeOp = vector::TransferWriteOp::create(
         rewriter, loc, /*resultTypes=*/TypeRange{}, adaptor.getTile(),
@@ -4161,21 +4123,14 @@ struct ConvertTileIRToMLIRPass
       mulOp->erase();
     }
 
-    // Erase unrealized_conversion_casts left dead by pattern application,
-    // to a fixed point.
-    bool changed = true;
-    while (changed) {
-      changed = false;
-      SmallVector<Operation *> toErase;
-      module.walk([&](UnrealizedConversionCastOp op) {
-        if (op->use_empty())
-          toErase.push_back(op);
-      });
-      for (auto *op : toErase) {
+    // Erase unrealized_conversion_casts left dead by pattern application.
+    // Casts have no regions, so a cast always precedes its cast users in walk
+    // order; sweeping in reverse therefore collapses whole chains in one pass.
+    SmallVector<Operation *> casts;
+    module.walk([&](UnrealizedConversionCastOp op) { casts.push_back(op); });
+    for (Operation *op : llvm::reverse(casts))
+      if (op->use_empty())
         op->erase();
-        changed = true;
-      }
-    }
 
     // Mark the module as a GPU container module when targeting the GPU. For the
     // CPU target the GPU container-module marker is intentionally omitted.

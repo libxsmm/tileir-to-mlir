@@ -170,7 +170,7 @@ static void eraseTriviallyDead(SmallVectorImpl<Operation *> &worklist) {
 
   while (!deduplicatedWorklist.empty()) {
     Operation *op = deduplicatedWorklist.pop_back_val();
-    if (!op || !isOpTriviallyDead(op))
+    if (!isOpTriviallyDead(op))
       continue;
     for (Value operand : op->getOperands())
       if (Operation *def = operand.getDefiningOp())
@@ -225,12 +225,10 @@ static bool promoteOneFunction(FunctionOpInterface func,
   }
 
   SmallVector<Operation *> maybeDead;
-  bool changed = false;
 
   for (const PtrPromotionPlan &plan : ptrPlans) {
     BlockArgument arg = func.getArgument(plan.argIndex);
     arg.setType(plan.rankedType);
-    changed = true;
 
     for (memref::ReinterpretCastOp rc : plan.casts) {
       for (Value operand : rc->getOperands())
@@ -241,14 +239,13 @@ static bool promoteOneFunction(FunctionOpInterface func,
     }
   }
 
-  if (changed) {
-    SmallVector<Type> currentArgTypes;
-    currentArgTypes.reserve(func.getNumArguments());
-    for (BlockArgument arg : func.getArguments())
-      currentArgTypes.push_back(arg.getType());
-    func.setFunctionTypeAttr(TypeAttr::get(
-        func.cloneTypeWith(currentArgTypes, func.getResultTypes())));
-  }
+  // `ptrPlans` is non-empty, so at least one argument type just changed.
+  SmallVector<Type> currentArgTypes;
+  currentArgTypes.reserve(func.getNumArguments());
+  for (BlockArgument arg : func.getArguments())
+    currentArgTypes.push_back(arg.getType());
+  func.setFunctionTypeAttr(TypeAttr::get(
+      func.cloneTypeWith(currentArgTypes, func.getResultTypes())));
 
   llvm::BitVector argsToErase(func.getNumArguments());
   llvm::BitVector memrefDependentArgs(func.getNumArguments());
@@ -298,8 +295,8 @@ static bool promoteOneFunction(FunctionOpInterface func,
       continue;
 
     bool isMemrefDependent = memrefDependentArgs.test(arg.getArgNumber());
-  bool isAssumedMemrefDependent =
-    assumedMemrefDependentArgs.test(arg.getArgNumber());
+    bool isAssumedMemrefDependent =
+        assumedMemrefDependentArgs.test(arg.getArgNumber());
     bool shouldErase = false;
     switch (removeUnused) {
     case MemrefArgRemovalMode::All:
@@ -321,14 +318,11 @@ static bool promoteOneFunction(FunctionOpInterface func,
       argsToErase.set(arg.getArgNumber());
   }
 
-  if (argsToErase.any()) {
-    if (failed(func.eraseArguments(argsToErase)))
-      return false;
-    changed = true;
-  }
+  if (argsToErase.any() && failed(func.eraseArguments(argsToErase)))
+    return false;
 
   eraseTriviallyDead(maybeDead);
-  return changed;
+  return true;
 }
 
 struct ConvertMemrefArgsToRankedMemrefPass
