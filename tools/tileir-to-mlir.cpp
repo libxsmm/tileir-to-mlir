@@ -44,6 +44,8 @@
 #include "cuda_tile/Bytecode/Reader/BytecodeReader.h"
 #include "cuda_tile/Dialect/CudaTile/IR/Dialect.h"
 
+#include <iostream>
+
 int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
   registry.insert<
@@ -184,6 +186,9 @@ int main(int argc, char **argv) {
     module.get().getOperation()->print(os);
     os.flush();
     buffer = llvm::MemoryBuffer::getMemBufferCopy(text, inputFilename);
+    module.get().getOperation()->print(llvm::errs());
+    llvm::errs() << '\n';
+    
   } else {
     buffer = std::move(input);
   }

@@ -503,6 +503,16 @@ module {
       // CHECK:   %[[C32:.*]] = constant <i32: 32> : tile<i32>
       // CHECK:   %[[DIV:.*]] = divi %[[IV]], %[[C32]] unsigned
       // CHECK:   load_view_tko weak %[[PV]][%[[DIV]]]
+      // The lowered transfer initially contains the exact casted round trip
+      // `muli(index_cast(divui(index_cast(iv), 32)), 32)`. The cleanup must
+      // replace it with an unsigned widening of the original i32 loop IV.
+      // CHECK-GPU: scf.for %[[LOOP_IV:.*]] =
+      // CHECK-GPU:   %[[LOOP_IV_I32:.*]] = arith.index_cast %[[LOOP_IV]] : index to i32
+      // CHECK-GPU:   %[[DIV_I32:.*]] = arith.divui %[[LOOP_IV_I32]], %{{.*}} : i32
+      // CHECK-GPU:   %[[DIV_INDEX:.*]] = arith.index_cast %[[DIV_I32]] : i32 to index
+      // CHECK-GPU-NOT: arith.muli %[[DIV_INDEX]], {{.*}} : index
+      // CHECK-GPU:   %[[FOLDED_INDEX:.*]] = arith.index_castui %[[LOOP_IV_I32]] : i32 to index
+      // CHECK-GPU:   vector.transfer_read %{{.*}}[%[[FOLDED_INDEX]]], %{{.*}} : memref<?xf32, strided<[1], offset: ?>>, vector<32xf32>
       for %iv in (%c0 to %N, step %c32) : tile<i32> {
         %iv_1d = reshape %iv : tile<i32> -> tile<1xi32>
         %iv_bc = broadcast %iv_1d : tile<1xi32> -> tile<32xi32>
@@ -552,6 +562,275 @@ module {
       // CHECK-GPU: %[[GPAD:.*]] = arith.constant 0.000000e+00 : bf16
       // CHECK-GPU: %{{.*}} = vector.transfer_read %[[GVIEW]][%{{.*}}], %[[GPAD]] : memref<?xbf16, strided<[1], offset: ?>>, vector<32xbf16>
       %v, %t = load_ptr_tko weak %ptr, %mask, %cst_pad : tile<32xptr<bf16>>, tile<32xi1>, tile<32xbf16> -> tile<32xbf16>, !cuda_tile.token
+      return
+    }
+
+    // A lane-invariant vector offset is part of the base address, not a
+    // partition dimension.
+    // CHECK-LABEL: entry @load_uniform_vector_shift
+    // CHECK: %[[SHIFTED_BASE:.*]] = offset %{{.*}}, %{{.*}} : tile<ptr<f32>>, tile<i32> -> tile<ptr<f32>>
+    // CHECK: make_tensor_view %[[SHIFTED_BASE]], shape = [{{.*}}], strides = [1]
+    // CHECK: load_view_tko
+    // CHECK-NOT: load_ptr_tko
+    entry @load_uniform_vector_shift(%base: tile<ptr<f32>>, %N: tile<i32>, %shift: tile<i32>) {
+      %c32 = constant <i32: 32> : tile<i32>
+      %block_id_x, %block_id_y, %block_id_z = get_tile_block_id : tile<i32>
+      %start = muli %block_id_x, %c32 : tile<i32>
+      %lane = iota : tile<32xi32>
+      %start_1d = reshape %start : tile<i32> -> tile<1xi32>
+      %start_bc = broadcast %start_1d : tile<1xi32> -> tile<32xi32>
+      %index = addi %start_bc, %lane : tile<32xi32>
+      %shift_1d = reshape %shift : tile<i32> -> tile<1xi32>
+      %shift_bc = broadcast %shift_1d : tile<1xi32> -> tile<32xi32>
+      %offset = addi %shift_bc, %index : tile<32xi32>
+      %N_1d = reshape %N : tile<i32> -> tile<1xi32>
+      %N_bc = broadcast %N_1d : tile<1xi32> -> tile<32xi32>
+      %mask = cmpi less_than %index, %N_bc, signed : tile<32xi32> -> tile<32xi1>
+      %base_1d = reshape %base : tile<ptr<f32>> -> tile<1xptr<f32>>
+      %base_bc = broadcast %base_1d : tile<1xptr<f32>> -> tile<32xptr<f32>>
+      %ptr = offset %base_bc, %offset : tile<32xptr<f32>>, tile<32xi32> -> tile<32xptr<f32>>
+      %pad = constant <f32: 0.000000e+00> : tile<32xf32>
+      %value, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<32xptr<f32>>, tile<32xi1>, tile<32xf32> -> tile<32xf32>, !cuda_tile.token
+      return
+    }
+
+    // The mask proves that the clamped index equals the original index.
+    // CHECK-LABEL: entry @load_masked_clamp
+    // CHECK: make_tensor_view %arg0, shape = [64], strides = [1] : tensor_view<64xf32, strides=[1]>
+    // CHECK: load_view_tko
+    // CHECK-NOT: load_ptr_tko
+    entry @load_masked_clamp(%base: tile<ptr<f32>>) {
+      %c8 = constant <i32: 8> : tile<i32>
+      %c63 = constant <i32: 63> : tile<i32>
+      %c64 = constant <i32: 64> : tile<i32>
+      %c0 = constant <i32: 0> : tile<i32>
+      %block, %block_y, %block_z = get_tile_block_id : tile<i32>
+      %start = muli %block, %c8 : tile<i32>
+      %lane = iota : tile<8xi32>
+      %start_1d = reshape %start : tile<i32> -> tile<1xi32>
+      %start_bc = broadcast %start_1d : tile<1xi32> -> tile<8xi32>
+      %index = addi %start_bc, %lane : tile<8xi32>
+      %zero_1d = reshape %c0 : tile<i32> -> tile<1xi32>
+      %zero_bc = broadcast %zero_1d : tile<1xi32> -> tile<8xi32>
+      %clamp_lower = maxi %index, %zero_bc signed : tile<8xi32>
+      %upper_1d = reshape %c63 : tile<i32> -> tile<1xi32>
+      %upper_bc = broadcast %upper_1d : tile<1xi32> -> tile<8xi32>
+      %clamped_index = mini %clamp_lower, %upper_bc signed : tile<8xi32>
+      %extent_1d = reshape %c64 : tile<i32> -> tile<1xi32>
+      %extent_bc = broadcast %extent_1d : tile<1xi32> -> tile<8xi32>
+      %lower_mask = cmpi greater_than_or_equal %index, %zero_bc, signed : tile<8xi32> -> tile<8xi1>
+      %upper_mask = cmpi less_than %index, %extent_bc, signed : tile<8xi32> -> tile<8xi1>
+      %mask = andi %lower_mask, %upper_mask : tile<8xi1>
+      %base_1d = reshape %base : tile<ptr<f32>> -> tile<1xptr<f32>>
+      %base_bc = broadcast %base_1d : tile<1xptr<f32>> -> tile<8xptr<f32>>
+      %ptr = offset %base_bc, %clamped_index : tile<8xptr<f32>>, tile<8xi32> -> tile<8xptr<f32>>
+      %pad = constant <f32: 0.000000e+00> : tile<8xf32>
+      %value, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<8xptr<f32>>, tile<8xi1>, tile<8xf32> -> tile<8xf32>, !cuda_tile.token
+      return
+    }
+
+    // A uniform `start * stride` term belongs to its strided dimension, even
+    // when the dimension is already represented as a singleton 2-D tile.
+    // CHECK-LABEL: entry @load_2d_separate_strided_start
+    // CHECK: %[[TV_SEPARATE_START:.*]] = make_tensor_view %arg0, shape = [%arg1, %arg2], strides = [8, 1] : tile<i32> -> tensor_view<?x?xf32, strides=[8,1]>
+    // CHECK: %[[PV_SEPARATE_START:.*]] = make_partition_view %[[TV_SEPARATE_START]] : partition_view<tile=(2x4), padding_value = zero, tensor_view<?x?xf32, strides=[8,1]>>
+    // CHECK: load_view_tko weak %[[PV_SEPARATE_START]][%{{.*}}, %{{.*}}]
+    // CHECK-NOT: load_ptr_tko
+    entry @load_2d_separate_strided_start(%base: tile<ptr<f32>>, %rows: tile<i32>, %cols: tile<i32>) {
+      %c2 = constant <i32: 2> : tile<i32>
+      %c4 = constant <i32: 4> : tile<i32>
+      %c8 = constant <i32: 8> : tile<i32>
+      %block_x, %block_y, %block_z = get_tile_block_id : tile<i32>
+      %row_start = muli %block_x, %c2 : tile<i32>
+      %row_lane = iota : tile<2xi32>
+      %row_start_1d = reshape %row_start : tile<i32> -> tile<1xi32>
+      %row_start_bc = broadcast %row_start_1d : tile<1xi32> -> tile<2xi32>
+      %row_index = addi %row_start_bc, %row_lane : tile<2xi32>
+      %row_offset = muli %row_start, %c8 : tile<i32>
+      %row_offset_2d = reshape %row_offset : tile<i32> -> tile<1x1xi32>
+      %row_offset_bc = broadcast %row_offset_2d : tile<1x1xi32> -> tile<2x1xi32>
+      %row_lane_2d = reshape %row_lane : tile<2xi32> -> tile<2x1xi32>
+      %stride_2d = reshape %c8 : tile<i32> -> tile<1x1xi32>
+      %stride_bc = broadcast %stride_2d : tile<1x1xi32> -> tile<2x1xi32>
+      %row_elements = muli %row_lane_2d, %stride_bc : tile<2x1xi32>
+      %row_offset_elements = addi %row_offset_bc, %row_elements : tile<2x1xi32>
+      %row_offset_full = broadcast %row_offset_elements : tile<2x1xi32> -> tile<2x4xi32>
+      %col_start = muli %block_y, %c4 : tile<i32>
+      %col_lane = iota : tile<4xi32>
+      %col_start_2d = reshape %col_start : tile<i32> -> tile<1x1xi32>
+      %col_start_bc = broadcast %col_start_2d : tile<1x1xi32> -> tile<1x4xi32>
+      %col_lane_2d = reshape %col_lane : tile<4xi32> -> tile<1x4xi32>
+      %col_index = addi %col_start_bc, %col_lane_2d : tile<1x4xi32>
+      %col_offset_full = broadcast %col_index : tile<1x4xi32> -> tile<2x4xi32>
+      %offset = addi %row_offset_full, %col_offset_full : tile<2x4xi32>
+      %rows_1d = reshape %rows : tile<i32> -> tile<1xi32>
+      %rows_bc = broadcast %rows_1d : tile<1xi32> -> tile<2xi32>
+      %row_mask = cmpi less_than %row_index, %rows_bc, signed : tile<2xi32> -> tile<2xi1>
+      %row_mask_2d = reshape %row_mask : tile<2xi1> -> tile<2x1xi1>
+      %row_mask_full = broadcast %row_mask_2d : tile<2x1xi1> -> tile<2x4xi1>
+      %cols_2d = reshape %cols : tile<i32> -> tile<1x1xi32>
+      %cols_bc = broadcast %cols_2d : tile<1x1xi32> -> tile<1x4xi32>
+      %col_mask = cmpi less_than %col_index, %cols_bc, signed : tile<1x4xi32> -> tile<1x4xi1>
+      %col_mask_full = broadcast %col_mask : tile<1x4xi1> -> tile<2x4xi1>
+      %mask = andi %row_mask_full, %col_mask_full : tile<2x4xi1>
+      %base_2d = reshape %base : tile<ptr<f32>> -> tile<1x1xptr<f32>>
+      %base_bc = broadcast %base_2d : tile<1x1xptr<f32>> -> tile<2x4xptr<f32>>
+      %ptr = offset %base_bc, %offset : tile<2x4xptr<f32>>, tile<2x4xi32> -> tile<2x4xptr<f32>>
+      %pad = constant <f32: 0.000000e+00> : tile<2x4xf32>
+      %value, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<2x4xptr<f32>>, tile<2x4xi1>, tile<2x4xf32> -> tile<2x4xf32>, !cuda_tile.token
+      return
+    }
+
+    // A global-coordinate mask can be normalized against a uniform base shift.
+    // CHECK-LABEL: entry @store_global_mask_base_shift
+    // CHECK: %[[LOCAL_SIZE:.*]] = subi %{{.*}}, %{{.*}} : tile<i32>
+    // CHECK: %[[NONNEG_SIZE:.*]] = maxi %[[LOCAL_SIZE]], %{{.*}} signed : tile<i32>
+    // CHECK: %[[SHIFTED_BASE:.*]] = offset %{{.*}}, %{{.*}} : tile<ptr<f32>>, tile<i32> -> tile<ptr<f32>>
+    // CHECK: make_tensor_view %[[SHIFTED_BASE]], shape = [%[[NONNEG_SIZE]]], strides = [1]
+    // CHECK: store_view_tko
+    // CHECK-NOT: store_ptr_tko
+    entry @store_global_mask_base_shift(%base: tile<ptr<f32>>, %N: tile<i32>, %row: tile<i32>, %block: tile<i32>) {
+      %c64 = constant <i32: 64> : tile<i32>
+      %c255 = constant <i32: 255> : tile<i32>
+      %row_shift = muli %row, %c255 : tile<i32>
+      %block_start = muli %block, %c64 : tile<i32>
+      %lane = iota : tile<64xi32>
+      %block_start_1d = reshape %block_start : tile<i32> -> tile<1xi32>
+      %block_start_bc = broadcast %block_start_1d : tile<1xi32> -> tile<64xi32>
+      %local_index = addi %block_start_bc, %lane : tile<64xi32>
+      %row_shift_1d = reshape %row_shift : tile<i32> -> tile<1xi32>
+      %row_shift_bc = broadcast %row_shift_1d : tile<1xi32> -> tile<64xi32>
+      %global_index = addi %row_shift_bc, %local_index : tile<64xi32>
+      %N_1d = reshape %N : tile<i32> -> tile<1xi32>
+      %N_bc = broadcast %N_1d : tile<1xi32> -> tile<64xi32>
+      %global_index_i64 = exti %global_index signed : tile<64xi32> -> tile<64xi64>
+      %N_i64 = exti %N_bc signed : tile<64xi32> -> tile<64xi64>
+      %mask = cmpi less_than %global_index_i64, %N_i64, unsigned : tile<64xi64> -> tile<64xi1>
+      %base_1d = reshape %base : tile<ptr<f32>> -> tile<1xptr<f32>>
+      %base_bc = broadcast %base_1d : tile<1xptr<f32>> -> tile<64xptr<f32>>
+      %ptr = offset %base_bc, %global_index : tile<64xptr<f32>>, tile<64xi32> -> tile<64xptr<f32>>
+      %value = constant <f32: 1.000000e+00> : tile<64xf32>
+      %token = store_ptr_tko weak %ptr, %value, %mask : tile<64xptr<f32>>, tile<64xf32>, tile<64xi1> -> !cuda_tile.token
+      return
+    }
+
+    // A contiguous flat slice whose start combines a row offset and a block
+    // offset. Both terms are multiples of the vector width, so PtrToView can
+    // factor them into one partition index.
+    // CHECK-LABEL: entry @load_flat_row_slice
+    // CHECK-GPU-LABEL: gpu.func @load_flat_row_slice
+    entry @load_flat_row_slice(%base: tile<ptr<f32>>, %N: tile<i32>, %row: tile<i32>, %block: tile<i32>) {
+      %D = constant <i32: 1024> : tile<i32>
+      %BLOCK_SIZE = constant <i32: 32> : tile<i32>
+      %lane = iota : tile<32xi32>
+      %row_offset = muli %row, %D : tile<i32>
+      %block_offset = muli %block, %BLOCK_SIZE : tile<i32>
+      %start = addi %row_offset, %block_offset : tile<i32>
+      %start_1d = reshape %start : tile<i32> -> tile<1xi32>
+      %start_bc = broadcast %start_1d : tile<1xi32> -> tile<32xi32>
+      %index = addi %start_bc, %lane : tile<32xi32>
+      %N_1d = reshape %N : tile<i32> -> tile<1xi32>
+      %N_bc = broadcast %N_1d : tile<1xi32> -> tile<32xi32>
+      %mask = cmpi less_than %index, %N_bc, signed : tile<32xi32> -> tile<32xi1>
+      %base_1d = reshape %base : tile<ptr<f32>> -> tile<1xptr<f32>>
+      %base_bc = broadcast %base_1d : tile<1xptr<f32>> -> tile<32xptr<f32>>
+      %ptr = offset %base_bc, %index : tile<32xptr<f32>>, tile<32xi32> -> tile<32xptr<f32>>
+      %pad = constant <f32: 0.000000e+00> : tile<32xf32>
+      // CHECK: %[[TV_ROW:.*]] = make_tensor_view %arg0, shape = [%arg1], strides = [1] : tile<i32> -> tensor_view<?xf32, strides=[1]>
+      // CHECK: %[[PV_ROW:.*]] = make_partition_view %[[TV_ROW]] : partition_view<tile=(32), padding_value = zero, tensor_view<?xf32, strides=[1]>>
+      // CHECK: %{{.*}}, %{{.*}} = load_view_tko weak %[[PV_ROW]][%{{.*}}] : partition_view<tile=(32), padding_value = zero, tensor_view<?xf32, strides=[1]>>, tile<i32> -> tile<32xf32>, token
+      // CHECK-NOT: load_ptr_tko
+      // CHECK-GPU: %[[ROW_VIEW:.*]] = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%{{.*}}], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1], offset: ?>>
+      // CHECK-GPU: vector.transfer_read %[[ROW_VIEW]][%{{.*}}], %{{.*}} : memref<?xf32, strided<[1], offset: ?>>, vector<32xf32>
+      // CHECK-GPU-NOT: vector.gather
+      %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<32xptr<f32>>, tile<32xi1>, tile<32xf32> -> tile<32xf32>, !cuda_tile.token
+      return
+    }
+
+    // A flat row slice can add an element-space loop induction variable to a
+    // row offset. The loop starts at zero and advances by the vector width, so
+    // the induction variable is a valid tile index after division by 32.
+    // CHECK-LABEL: entry @load_flat_row_loop_slice
+    // CHECK-GPU-LABEL: gpu.func @load_flat_row_loop_slice
+    entry @load_flat_row_loop_slice(%base: tile<ptr<f32>>, %N: tile<i32>) {
+      %c0 = constant <i32: 0> : tile<i32>
+      %c32 = constant <i32: 32> : tile<i32>
+      %c1024 = constant <i32: 1024> : tile<i32>
+      %lane = iota : tile<32xi32>
+      %blockId_x, %blockId_y, %blockId_z = get_tile_block_id : tile<i32>
+      %row_offset = muli %blockId_x, %c1024 : tile<i32>
+      %N_1d = reshape %N : tile<i32> -> tile<1xi32>
+      %N_bc = broadcast %N_1d : tile<1xi32> -> tile<32xi32>
+      %base_1d = reshape %base : tile<ptr<f32>> -> tile<1xptr<f32>>
+      %base_bc = broadcast %base_1d : tile<1xptr<f32>> -> tile<32xptr<f32>>
+      %pad = constant <f32: 0.000000e+00> : tile<32xf32>
+      // CHECK: %[[TV_ROW_LOOP:.*]] = make_tensor_view %arg0, shape = [%arg1], strides = [1] : tile<i32> -> tensor_view<?xf32, strides=[1]>
+      // CHECK: %[[PV_ROW_LOOP:.*]] = make_partition_view %[[TV_ROW_LOOP]] : partition_view<tile=(32), padding_value = zero, tensor_view<?xf32, strides=[1]>>
+      // CHECK: %[[ROW_BLOCK_ID:.*]], %{{.*}}, %{{.*}} = get_tile_block_id : tile<i32>
+      // CHECK: for %[[ROW_LOOP_IV:.*]] in
+      // CHECK:   %[[ROW_TILE_INDEX:.*]] = muli %[[ROW_BLOCK_ID]], %{{.*}} : tile<i32>
+      // CHECK:   %[[LOOP_TILE_INDEX:.*]] = divi %[[ROW_LOOP_IV]], %{{.*}} unsigned : tile<i32>
+      // CHECK:   %[[PARTITION_INDEX:.*]] = addi %[[ROW_TILE_INDEX]], %[[LOOP_TILE_INDEX]] : tile<i32>
+      // CHECK:   %{{.*}}, %{{.*}} = load_view_tko weak %[[PV_ROW_LOOP]][%[[PARTITION_INDEX]]]
+      // CHECK-NOT: load_ptr_tko
+      // CHECK-GPU: scf.for %[[ROW_LOOP_INDEX:.*]] =
+      // CHECK-GPU:   %[[ROW_LOOP_INDEX_I32:.*]] = arith.index_cast %[[ROW_LOOP_INDEX]] : index to i32
+      // CHECK-GPU:   arith.divui %[[ROW_LOOP_INDEX_I32]], %{{.*}} : i32
+      // CHECK-GPU:   vector.transfer_read %{{.*}}[%{{.*}}], %{{.*}} : memref<?xf32, strided<[1], offset: ?>>, vector<32xf32>
+      for %loopIdx in (%c0 to %c1024, step %c32) : tile<i32> {
+        %start = addi %row_offset, %loopIdx : tile<i32>
+        %start_1d = reshape %start : tile<i32> -> tile<1xi32>
+        %start_bc = broadcast %start_1d : tile<1xi32> -> tile<32xi32>
+        %index = addi %start_bc, %lane : tile<32xi32>
+        %mask = cmpi less_than %index, %N_bc, signed : tile<32xi32> -> tile<32xi1>
+        %ptr = offset %base_bc, %index : tile<32xptr<f32>>, tile<32xi32> -> tile<32xptr<f32>>
+        %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<32xptr<f32>>, tile<32xi1>, tile<32xf32> -> tile<32xf32>, !cuda_tile.token
+        continue
+      }
+      return
+    }
+
+    // A row-local mask can exclude a scalar row-base shift from its index.
+    // PtrToView moves that shift into the scalar base and retains the local
+    // loop index for a static-width row view.
+    // CHECK-LABEL: entry @load_row_local_loop_slice
+    // CHECK-GPU-LABEL: gpu.func @load_row_local_loop_slice
+    entry @load_row_local_loop_slice(%base: tile<ptr<f32>>) {
+      %c0 = constant <i32: 0> : tile<i32>
+      %c32 = constant <i32: 32> : tile<i32>
+      %c1024 = constant <i32: 1024> : tile<i32>
+      %lane = iota : tile<32xi32>
+      %blockId_x, %blockId_y, %blockId_z = get_tile_block_id : tile<i32>
+      %row_offset = muli %blockId_x, %c1024 : tile<i32>
+      %width_1d = reshape %c1024 : tile<i32> -> tile<1xi32>
+      %width_bc = broadcast %width_1d : tile<1xi32> -> tile<32xi32>
+      %base_1d = reshape %base : tile<ptr<f32>> -> tile<1xptr<f32>>
+      %base_bc = broadcast %base_1d : tile<1xptr<f32>> -> tile<32xptr<f32>>
+      %pad = constant <f32: 0.000000e+00> : tile<32xf32>
+      // CHECK: %[[ROW_BLOCK:.*]], %{{.*}}, %{{.*}} = get_tile_block_id : tile<i32>
+      // CHECK: %[[ROW_OFFSET:.*]] = muli %[[ROW_BLOCK]], %{{.*}} : tile<i32>
+      // CHECK: for %[[ROW_LOOP:.*]] in
+      // CHECK: %[[ROW_BASE:.*]] = offset %arg0, %[[ROW_OFFSET]] : tile<ptr<f32>>, tile<i32> -> tile<ptr<f32>>
+      // CHECK: %[[ROW_TV:.*]] = make_tensor_view %[[ROW_BASE]], shape = [1024], strides = [1] : tensor_view<1024xf32, strides=[1]>
+      // CHECK: %[[ROW_PV:.*]] = make_partition_view %[[ROW_TV]] : partition_view<tile=(32), padding_value = zero, tensor_view<1024xf32, strides=[1]>>
+      // CHECK:   %[[ROW_TILE:.*]] = divi %[[ROW_LOOP]], %{{.*}} unsigned : tile<i32>
+      // CHECK:   %{{.*}}, %{{.*}} = load_view_tko weak %[[ROW_PV]][%[[ROW_TILE]]]
+      // CHECK-NOT: load_ptr_tko
+      // CHECK-GPU: scf.for
+      // CHECK-GPU:   vector.transfer_read %{{.*}}[%{{.*}}], %{{.*}} {in_bounds = [true]} : memref<1024xf32, strided<[1], offset: ?>>, vector<32xf32>
+      for %loopIdx in (%c0 to %c1024, step %c32) : tile<i32> {
+        %local_1d = reshape %loopIdx : tile<i32> -> tile<1xi32>
+        %local_bc = broadcast %local_1d : tile<1xi32> -> tile<32xi32>
+        %local_index = addi %local_bc, %lane : tile<32xi32>
+        %mask = cmpi less_than %local_index, %width_bc, signed : tile<32xi32> -> tile<32xi1>
+        %global_start = addi %row_offset, %loopIdx : tile<i32>
+        %global_1d = reshape %global_start : tile<i32> -> tile<1xi32>
+        %global_bc = broadcast %global_1d : tile<1xi32> -> tile<32xi32>
+        %global_index = addi %global_bc, %lane : tile<32xi32>
+        %ptr = offset %base_bc, %global_index : tile<32xptr<f32>>, tile<32xi32> -> tile<32xptr<f32>>
+        %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<32xptr<f32>>, tile<32xi1>, tile<32xf32> -> tile<32xf32>, !cuda_tile.token
+        continue
+      }
       return
     }
 

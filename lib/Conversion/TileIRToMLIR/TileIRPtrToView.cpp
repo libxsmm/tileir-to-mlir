@@ -99,6 +99,7 @@
 #include "llvm/Support/Casting.h"
 
 #include <array>
+#include <limits>
 
 using namespace mlir;
 using namespace mlir::cuda_tile;
@@ -291,10 +292,62 @@ static std::array<std::pair<Value, Value>, 2> commutedOperands(Value lhs,
           std::pair<Value, Value>(rhs, lhs)};
 }
 
+static std::optional<int64_t> matchSplatInt64(Value v);
+
+/// Strip wrappers used to lift a boolean conjunct into the access tile.
+static Value stripMaskWrappers(Value v) {
+  while (v) {
+    v = lookThroughIndexCast(v);
+    if (!v)
+      return nullptr;
+    if (auto b = v.getDefiningOp<BroadcastOp>()) {
+      v = b.getSource();
+      continue;
+    }
+    if (auto r = v.getDefiningOp<ReshapeOp>()) {
+      v = r.getSource();
+      continue;
+    }
+    if (auto t = v.getDefiningOp<TruncIOp>()) {
+      v = t.getFrom();
+      continue;
+    }
+    return v;
+  }
+  return nullptr;
+}
+
+static bool isMaskConjunct(Value condition, Value mask) {
+  condition = stripMaskWrappers(condition);
+  mask = stripMaskWrappers(mask);
+  if (!condition || !mask)
+    return false;
+  if (auto a = mask.getDefiningOp<AndIOp>())
+    return isMaskConjunct(condition, a.getLhs()) ||
+           isMaskConjunct(condition, a.getRhs());
+  return condition == mask;
+}
+
+/// Return the true arm of a select whose false arm is irrelevant because its
+/// condition is one of the access mask's conjuncts.
+static Value lookThroughGuardedSelect(Value v, Value mask) {
+  while (Value cur = lookThroughIndexCast(v)) {
+    auto select = cur.getDefiningOp<SelectOp>();
+    if (!select)
+      return cur;
+    if (!isMaskConjunct(select.getCond(), mask) ||
+        !matchSplatInt64(select.getValIfFalse()))
+      return cur;
+    v = select.getValIfTrue();
+  }
+  return v;
+}
+
 /// Strip transparent wrappers and outer `broadcast` ops.  `reshape` is kept:
 /// it identifies which tile dimension an index expression populates.
-static Value stripBroadcasts(Value v) {
-  while (Value cur = lookThroughIndexCast(v)) {
+static Value stripBroadcasts(Value v,
+                             Value mask = {}) {
+  while (Value cur = lookThroughGuardedSelect(v, mask)) {
     auto b = cur.getDefiningOp<BroadcastOp>();
     if (!b)
       return cur;
@@ -304,8 +357,9 @@ static Value stripBroadcasts(Value v) {
 }
 
 /// Strip transparent wrappers and outer `broadcast`/`reshape` ops.
-static Value stripBroadcastReshape(Value v) {
-  while (Value cur = lookThroughIndexCast(v)) {
+static Value stripBroadcastReshape(Value v,
+                                   Value mask = {}) {
+  while (Value cur = lookThroughGuardedSelect(v, mask)) {
     if (auto b = cur.getDefiningOp<BroadcastOp>()) {
       v = b.getSource();
       continue;
@@ -317,6 +371,12 @@ static Value stripBroadcastReshape(Value v) {
     return cur;
   }
   return Value();
+}
+
+/// Return whether `v` is an iota after removing shape-only wrappers.
+static bool isIotaLike(Value v, Value mask) {
+  Value source = stripBroadcastReshape(v, mask);
+  return source && source.getDefiningOp<IotaOp>();
 }
 
 /// Strip a chain of `broadcast` and `reshape` ops applied to a scalar tile,
@@ -355,6 +415,91 @@ static std::optional<int64_t> matchSplatInt64(Value v) {
   return value.getSExtValue();
 }
 
+/// Return whether `mask` proves `0 <= index < upperBound`.
+static void findMaskBounds(Value mask, Value index, int64_t upperBound,
+                           bool &hasLowerBound, bool &hasUpperBound) {
+  Value v = lookThroughAssume(mask);
+  if (!v)
+    return;
+  if (auto a = v.getDefiningOp<AndIOp>()) {
+    findMaskBounds(a.getLhs(), index, upperBound, hasLowerBound,
+                   hasUpperBound);
+    findMaskBounds(a.getRhs(), index, upperBound, hasLowerBound,
+                   hasUpperBound);
+    return;
+  }
+  if (auto e = v.getDefiningOp<ExtIOp>()) {
+    findMaskBounds(e.getFrom(), index, upperBound, hasLowerBound,
+                   hasUpperBound);
+    return;
+  }
+  if (auto t = v.getDefiningOp<TruncIOp>()) {
+    findMaskBounds(t.getFrom(), index, upperBound, hasLowerBound,
+                   hasUpperBound);
+    return;
+  }
+  if (auto b = v.getDefiningOp<BroadcastOp>()) {
+    findMaskBounds(b.getSource(), index, upperBound, hasLowerBound,
+                   hasUpperBound);
+    return;
+  }
+  if (auto r = v.getDefiningOp<ReshapeOp>()) {
+    findMaskBounds(r.getSource(), index, upperBound, hasLowerBound,
+                   hasUpperBound);
+    return;
+  }
+  auto cmp = v.getDefiningOp<CmpIOp>();
+  if (!cmp || lookThroughIndexCast(cmp.getLhs()) !=
+                  lookThroughIndexCast(index))
+    return;
+  std::optional<int64_t> rhs = matchSplatInt64(cmp.getRhs());
+  if (cmp.getComparisonPredicate() == ComparisonPredicate::LESS_THAN && rhs &&
+      *rhs == upperBound)
+    hasUpperBound = true;
+  if (cmp.getComparisonPredicate() ==
+          ComparisonPredicate::GREATER_THAN_OR_EQUAL &&
+      cmp.getSignedness() == Signedness::Signed && rhs && *rhs == 0)
+    hasLowerBound = true;
+}
+
+/// Strip `min(max(index, 0), upper)` when the access mask proves the clamps
+/// cannot alter any enabled address.
+static Value lookThroughMaskedClamp(Value v, Value mask) {
+  while (Value cur = lookThroughIndexCast(v)) {
+    auto min = cur.getDefiningOp<MinIOp>();
+    if (!min)
+      return cur;
+    bool stripped = false;
+    for (auto [maxValue, upperValue] :
+         commutedOperands(min.getLhs(), min.getRhs())) {
+      std::optional<int64_t> upper = matchSplatInt64(upperValue);
+      auto max = lookThroughIndexCast(maxValue).getDefiningOp<MaxIOp>();
+      if (!upper || *upper < 0 ||
+          *upper == std::numeric_limits<int64_t>::max() || !max)
+        continue;
+      for (auto [index, lowerValue] :
+           commutedOperands(max.getLhs(), max.getRhs())) {
+        std::optional<int64_t> lower = matchSplatInt64(lowerValue);
+        if (!lower || *lower != 0)
+          continue;
+        bool hasLowerBound = false;
+        bool hasUpperBound = false;
+        findMaskBounds(mask, index, *upper + 1, hasLowerBound, hasUpperBound);
+        if (hasLowerBound && hasUpperBound) {
+          v = index;
+          stripped = true;
+          break;
+        }
+      }
+      if (stripped)
+        break;
+    }
+    if (!stripped)
+      return cur;
+  }
+  return v;
+}
+
 /// Per-dimension information recovered from a ptr-arithmetic chain.
 struct DimInfo {
   /// Tile-side size (= shape of the tile produced by the load/store).
@@ -380,6 +525,8 @@ struct DimInfo {
 struct PtrAccess {
   /// The scalar base pointer (tile<ptr<T>>).
   Value base;
+  /// Uniform offsets that can be folded into the scalar base pointer.
+  SmallVector<Value> baseShifts;
   /// Per-tile-dimension info, ordered by dimension.
   SmallVector<DimInfo> dims;
   /// True when the access mask was *fully* understood by `analyzeMask` (every
@@ -417,12 +564,14 @@ struct PtrAccess {
 ///   3. The pure 1-D forms (no outer reshape) — same content as above
 ///      collapsed.
 static LogicalResult decomposeAddend(Value addend, ArrayRef<int64_t> tileShape,
-                                     int &dim, DimInfo &info) {
+                                     int &dim, DimInfo &info,
+                                     Value mask = {}) {
   // Strip outer broadcasts that just replicate this 1-D pattern across
   // orthogonal dimensions of the tile.
-  Value cur = stripBroadcasts(addend);
+  Value cur = stripBroadcasts(addend, mask);
   if (!cur)
     return failure();
+  cur = lookThroughMaskedClamp(cur, mask);
 
   // Optional `muli` with one side being a broadcast-of-reshape-of-scalar (the
   // stride).
@@ -444,15 +593,13 @@ static LogicalResult decomposeAddend(Value addend, ArrayRef<int64_t> tileShape,
       return failure();
     // Strip broadcasts again (the index side of the mul may itself be a
     // broadcast).
-    cur = stripBroadcasts(cur);
+    cur = stripBroadcasts(cur, mask);
   }
   if (!cur)
     return failure();
 
-  // After stripping, we should have either a reshape of a 1-D tile, or a 1-D
-  // tile directly.  In the reshape case, find the single non-1 dim of the
-  // reshape result to determine which dimension of the tile this addend
-  // populates.
+  // After stripping, we should have either a reshape of a 1-D tile, a 1-D tile
+  // directly, or an expression already expanded to a singleton tile shape.
   Value oneD = cur;
   if (auto rs = cur.getDefiningOp<ReshapeOp>()) {
     auto resShape = cast<TileType>(rs.getResult().getType()).getShape();
@@ -469,26 +616,53 @@ static LogicalResult decomposeAddend(Value addend, ArrayRef<int64_t> tileShape,
     dim = found;
     oneD = rs.getSource();
   } else {
-    // 1-D tile: only valid when the tile itself is 1-D.
-    if (tileShape.size() != 1)
+    auto curTy = dyn_cast<TileType>(cur.getType());
+    if (!curTy)
       return failure();
-    dim = 0;
+    auto curShape = curTy.getShape();
+    if (curShape.size() == 1 && tileShape.size() == 1) {
+      dim = 0;
+    } else if (curShape.size() == tileShape.size()) {
+      int found = -1;
+      for (int i = 0, e = curShape.size(); i < e; ++i) {
+        if (curShape[i] == 1)
+          continue;
+        if (found != -1)
+          return failure();
+        found = i;
+      }
+      if (found < 0)
+        return failure();
+      dim = found;
+    } else {
+      return failure();
+    }
   }
   oneD = lookThroughIndexCast(oneD);
   auto oneDTy = dyn_cast<TileType>(oneD.getType());
-  if (!oneDTy || oneDTy.getShape().size() != 1)
+  if (!oneDTy)
     return failure();
-  info.tileSize = oneDTy.getShape()[0];
+  auto oneDShape = oneDTy.getShape();
+  if (oneDShape.size() == 1) {
+    info.tileSize = oneDShape[0];
+  } else {
+    if (oneDShape.size() != tileShape.size())
+      return failure();
+    for (int i = 0, e = oneDShape.size(); i < e; ++i)
+      if (i != dim && oneDShape[i] != 1)
+        return failure();
+    info.tileSize = oneDShape[dim];
+  }
   if (info.tileSize != tileShape[dim])
     return failure();
 
   // The 1-D content is either pure `iota` (start = 0) or
   // `addi(broadcast(reshape(start)), iota)`.
-  if (oneD.getDefiningOp<IotaOp>())
+  if (isIotaLike(oneD, mask))
     return success();
   if (auto add = oneD.getDefiningOp<AddIOp>()) {
     for (auto [a, b] : commutedOperands(add.getLhs(), add.getRhs())) {
-      if (lookThroughIndexCast(a).getDefiningOp<IotaOp>()) {
+      if (isIotaLike(a, mask)) {
         if (Value scalar = matchScalarBroadcastReshape(b)) {
           info.start = scalar;
           return success();
@@ -505,9 +679,10 @@ static LogicalResult decomposeAddend(Value addend, ArrayRef<int64_t> tileShape,
 /// broadcast-of-reshape-of-scalar — that scalar is the per-dim size.
 /// Locate which dimension `val` bounds. We look through reshapes, broadcasts,
 /// and addi's to find the dimension index.
-static int findDimFromIndexValue(Value val, unsigned rank) {
+static int findDimFromIndexValue(Value val, unsigned rank,
+                                 Value mask = {}) {
   while (val) {
-    val = lookThroughIndexCast(val);
+    val = lookThroughGuardedSelect(val, mask);
     if (!val)
       return -1;
     if (auto rs = val.getDefiningOp<ReshapeOp>()) {
@@ -530,7 +705,7 @@ static int findDimFromIndexValue(Value val, unsigned rank) {
     }
     if (auto add = val.getDefiningOp<AddIOp>()) {
       // Check both sides of the add.
-      int d = findDimFromIndexValue(add.getLhs(), rank);
+      int d = findDimFromIndexValue(add.getLhs(), rank, mask);
       if (d >= 0)
         return d;
       val = add.getRhs();
@@ -547,22 +722,39 @@ static int findDimFromIndexValue(Value val, unsigned rank) {
 
 /// Recover the `start` scalar of a mask comparison index written in the
 /// canonical `start + iota` form (or pure `iota`, in which case `start` is left
-/// null, meaning start == 0).  Strips transparent broadcast/reshape/assume
-/// wrappers.  Returns `false` when the index is not of this shape (e.g. it adds
-/// a non-scalar constant, or is an unrelated expression), so the caller refuses
-/// to treat the comparison as a faithful per-dim bound.
-static bool recoverMaskIndexStart(Value idx, Value &start) {
+/// null, meaning start == 0). A matching uniform `baseShift` may be stripped
+/// from a rank-1 global index. Returns `false` when the index is not of this
+/// shape, so the caller refuses to treat the comparison as a faithful per-dim
+/// bound.
+static bool recoverMaskIndexStart(Value idx, Value &start, Value mask = {},
+                                  Value baseShift = {},
+                                  bool *usesBaseShift = nullptr) {
+  if (usesBaseShift)
+    *usesBaseShift = false;
   start = Value();
-  Value cur = stripBroadcastReshape(idx);
+  Value cur = stripBroadcastReshape(idx, mask);
   if (!cur)
     return false;
   if (cur.getDefiningOp<IotaOp>())
     return true; // pure iota => start == 0
   if (auto add = cur.getDefiningOp<AddIOp>()) {
     for (auto [a, b] : commutedOperands(add.getLhs(), add.getRhs())) {
-      if (lookThroughIndexCast(a).getDefiningOp<IotaOp>()) {
+      if (isIotaLike(a, mask)) {
         if (Value s = matchScalarBroadcastReshape(b)) {
           start = s;
+          return true;
+        }
+      }
+    }
+    if (baseShift) {
+      for (auto [shift, localIndex] :
+           commutedOperands(add.getLhs(), add.getRhs())) {
+        if (lookThroughIndexCast(matchScalarBroadcastReshape(shift)) !=
+            lookThroughIndexCast(baseShift))
+          continue;
+        if (recoverMaskIndexStart(localIndex, start, mask)) {
+          if (usesBaseShift)
+            *usesBaseShift = true;
           return true;
         }
       }
@@ -582,6 +774,9 @@ struct MaskBound {
   Value start;
   /// Start of a redundant `index >= 0` conjunct, if the mask contained one.
   Value lowerStart;
+  /// The upper-bound index contains the pointer base shift, so its extent is
+  /// global rather than relative to the partition-view base.
+  bool startIncludesBaseShift = false;
   bool bounded = false;
   bool lowerBounded = false;
 };
@@ -607,7 +802,8 @@ struct MaskBound {
 /// shape, or an ambiguous/conflicting bound is seen, in which case the caller
 /// must not treat the mask as understood.
 static bool analyzeMask(Value mask, ArrayRef<int64_t> tileShape,
-                        SmallVectorImpl<MaskBound> &bounds) {
+                        SmallVectorImpl<MaskBound> &bounds,
+                        Value maskContext = {}, Value baseShift = {}) {
   unsigned rank = tileShape.size();
   bounds.assign(rank, MaskBound{});
   bool ok = true;
@@ -689,14 +885,17 @@ static bool analyzeMask(Value mask, ArrayRef<int64_t> tileShape,
       // Prefer a dimension recovered from the comparison's index operand (the
       // reshape may live inside it); fall back to the reshape-derived hint when
       // the operand is a raw 1-D index that cannot identify the dimension.
-      int dim = findDimFromIndexValue(cmp.getLhs(), rank);
+      int dim = findDimFromIndexValue(cmp.getLhs(), rank, maskContext);
       if (dim < 0)
         dim = dimHint;
       // The compared index must be the canonical `start + iota`; recovering its
       // start lets the caller confirm it matches the pointer's index for this
       // dimension (otherwise the view's implied masking would differ).
       Value start;
-      bool startOk = recoverMaskIndexStart(cmp.getLhs(), start);
+      bool startIncludesBaseShift = false;
+      bool startOk =
+          recoverMaskIndexStart(cmp.getLhs(), start, maskContext, baseShift,
+                                &startIncludesBaseShift);
       if (dim < 0 || !startOk) {
         ok = false;
         continue;
@@ -732,9 +931,11 @@ static bool analyzeMask(Value mask, ArrayRef<int64_t> tileShape,
         bound.size = dynamicSize;
         bound.staticSize = staticSize;
         bound.start = start;
+        bound.startIncludesBaseShift = startIncludesBaseShift;
         bound.bounded = true;
       } else if (bound.size != dynamicSize ||
                  bound.staticSize != staticSize ||
+                 bound.startIncludesBaseShift != startIncludesBaseShift ||
                  lookThroughIndexCast(bound.start) !=
                      lookThroughIndexCast(start)) {
         // The same dimension bounded twice with different facts is ambiguous.
@@ -758,23 +959,29 @@ static bool analyzeMask(Value mask, ArrayRef<int64_t> tileShape,
 /// This prevents splitting `addi(broadcast(start), iota)` which
 /// decomposeAddend needs to see whole.
 static void flattenOffset(Value val, ArrayRef<int64_t> tileShape,
-                          SmallVectorImpl<Value> &addends) {
+                          SmallVectorImpl<Value> &addends,
+                          Value mask = {}) {
   val = lookThroughIndexCast(val);
   if (!val)
     return;
+  val = stripBroadcasts(val, mask);
+  if (!val)
+    return;
+  val = lookThroughMaskedClamp(val, mask);
   // If the whole expression decomposes, keep it as one addend.
   {
     DimInfo info;
     int dim = -1;
-    if (succeeded(decomposeAddend(val, tileShape, dim, info))) {
+    if (succeeded(
+          decomposeAddend(val, tileShape, dim, info, mask))) {
       addends.push_back(val);
       return;
     }
   }
   // Otherwise, try splitting at the top-level addi.
   if (auto add = val.getDefiningOp<AddIOp>()) {
-    flattenOffset(add.getLhs(), tileShape, addends);
-    flattenOffset(add.getRhs(), tileShape, addends);
+    flattenOffset(add.getLhs(), tileShape, addends, mask);
+    flattenOffset(add.getRhs(), tileShape, addends, mask);
   } else {
     addends.push_back(val);
   }
@@ -788,7 +995,8 @@ static void flattenOffset(Value val, ArrayRef<int64_t> tileShape,
 /// If the pointer source is a for-loop iter_arg, the function traces through
 /// to the initial value and records loop advancement info in `out.loop`.
 static LogicalResult analyzePtr(Value ptr, ArrayRef<int64_t> tileShape,
-                                PtrAccess &out) {
+                                PtrAccess &out,
+                                Value mask = {}) {
   out.dims.assign(tileShape.size(), DimInfo{});
   for (unsigned i = 0; i < tileShape.size(); ++i)
     out.dims[i].tileSize = tileShape[i];
@@ -810,13 +1018,14 @@ static LogicalResult analyzePtr(Value ptr, ArrayRef<int64_t> tileShape,
     }
     if (auto off = cur.getDefiningOp<OffsetOp>()) {
       SmallVector<Value> addends;
-      flattenOffset(off.getOffset(), tileShape, addends);
+      flattenOffset(off.getOffset(), tileShape, addends, mask);
 
       bool handledAll = true;
       for (Value a : addends) {
         DimInfo info;
         int dim = -1;
-        if (succeeded(decomposeAddend(a, tileShape, dim, info))) {
+        if (succeeded(
+                decomposeAddend(a, tileShape, dim, info, mask))) {
           if (dim < 0 || dim >= (int)tileShape.size()) {
             handledAll = false;
             break;
@@ -833,10 +1042,13 @@ static LogicalResult analyzePtr(Value ptr, ArrayRef<int64_t> tileShape,
           out.dims[dim].stride = info.stride;
           out.dims[dim].staticStride = info.staticStride;
           covered[dim] = true;
-        } else if (isScalarTile(a.getType())) {
-          // Scalar shift — cannot absorb without creating ops.
-          handledAll = false;
-          break;
+        } else if (!isScalarTile(a.getType())) {
+          if (Value shift = matchScalarBroadcastReshape(a))
+            out.baseShifts.push_back(shift);
+          else {
+            handledAll = false;
+            break;
+          }
         } else {
           handledAll = false;
           break;
@@ -959,23 +1171,69 @@ struct BuiltViews {
   SmallVector<Value> indices;
 };
 
-/// Given a per-dim `start` scalar that is expected to be `multiplier *
-/// tileSize`, extract the multiplier scalar (the per-dim partition index).
-/// Returns null when the pattern doesn't match.
-static Value extractTileMultiplier(Value start, int64_t tileSize) {
+/// Given a per-dim `start` scalar that is expected to be a sum of terms of the
+/// form `multiplier * tileSize`, extract the multiplier scalar (the per-dim
+/// partition index). Returns null when the pattern doesn't match.
+static Value extractTileMultiplier(OpBuilder &b, Location loc, Value start,
+                                   int64_t tileSize) {
   if (!start)
     return nullptr;
   start = lookThroughIndexCast(start);
   auto mul = start.getDefiningOp<MulIOp>();
-  if (!mul)
+  if (mul) {
+    for (auto [a, rhs] : commutedOperands(mul.getLhs(), mul.getRhs())) {
+      std::optional<int64_t> factor = matchSplatInt64(a);
+      if (!factor || *factor <= 0 || *factor % tileSize != 0)
+        continue;
+      Value multiplier = lookThroughIndexCast(rhs);
+      int64_t remainingFactor = *factor / tileSize;
+      if (remainingFactor == 1)
+        return multiplier;
+
+      auto i32 = b.getI32Type();
+      auto tileTy = TileType::get(b.getContext(), {}, i32);
+      auto attr = DenseElementsAttr::get(tileTy, APInt(32, remainingFactor));
+      Value remainingFactorCst = ConstantOp::create(
+          b, loc, tileTy, cast<DenseTypedElementsAttr>(attr));
+      return MulIOp::create(b, loc, multiplier, remainingFactorCst)
+          .getResult();
+    }
     return nullptr;
-  for (auto [a, b] : commutedOperands(mul.getLhs(), mul.getRhs())) {
-    Value cstSide = lookThroughIndexCast(a);
-    DenseIntElementsAttr ints;
-    if (matchPattern(cstSide, m_Constant(&ints)) && ints.isSplat() &&
-        ints.getSplatValue<APInt>().getSExtValue() == tileSize)
-      return lookThroughIndexCast(b);
   }
+
+  if (auto add = start.getDefiningOp<AddIOp>()) {
+    Value lhs = extractTileMultiplier(b, loc, add.getLhs(), tileSize);
+    Value rhs = extractTileMultiplier(b, loc, add.getRhs(), tileSize);
+    if (lhs && rhs)
+      return AddIOp::create(b, loc, lhs, rhs).getResult();
+  }
+
+  // An element-space loop induction variable is a tile-space index after
+  // division by the tile size when every iteration value is non-negative and
+  // tile aligned. This lets it participate in a larger start expression such
+  // as `row * D + iv`, where `D` and the loop step are both `tileSize`
+  // multiples.
+  if (auto blockArg = dyn_cast<BlockArgument>(start)) {
+    auto *parentOp = blockArg.getOwner()->getParentOp();
+    if (auto forOp = dyn_cast_or_null<ForOp>(parentOp);
+        forOp && blockArg == forOp.getInductionVar()) {
+      std::optional<int64_t> step = matchSplatInt64(forOp.getStep());
+      std::optional<int64_t> lowerBound =
+          matchSplatInt64(forOp.getLowerBound());
+      if (step && lowerBound && *step == tileSize && *lowerBound >= 0 &&
+          *lowerBound % tileSize == 0) {
+        auto i32 = b.getI32Type();
+        auto tileTy = TileType::get(b.getContext(), {}, i32);
+        auto attr = DenseElementsAttr::get(tileTy, APInt(32, tileSize));
+        Value tileSizeCst = ConstantOp::create(
+            b, loc, tileTy, cast<DenseTypedElementsAttr>(attr));
+        return DivIOp::create(b, loc, start, tileSizeCst,
+                              Signedness::Unsigned)
+            .getResult();
+      }
+    }
+  }
+
   return nullptr;
 }
 
@@ -1109,45 +1367,9 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
     // Compute the base index (from initial ptr pattern).
     Value baseIdx;
     if (di.start) {
-      baseIdx = extractTileMultiplier(di.start, di.tileSize);
-      if (!baseIdx) {
-        // Fallback: if start is a for-loop induction variable whose constant
-        // step equals tileSize, emit loopIdx / tileSize to recover the
-        // tile-level partition index.
-        Value s = lookThroughIndexCast(di.start);
-        if (auto blockArg = dyn_cast<BlockArgument>(s)) {
-          auto *parentOp = blockArg.getOwner()->getParentOp();
-          if (auto forOp = dyn_cast_or_null<ForOp>(parentOp);
-              forOp && blockArg == forOp.getInductionVar()) {
-            // `iv / tileSize` only recovers the tile index exactly when every
-            // iteration value `iv = lb + k*step` is a multiple of tileSize.
-            // Require step == tileSize and a non-negative, tile-aligned lower
-            // bound (so `lb + k*tileSize` is always a tileSize multiple and
-            // unsigned division is exact); otherwise the recovered index would
-            // be wrong (e.g. lb=1 gives 1/32 == 0, dropping the offset).
-            DenseIntElementsAttr stepAttr, lbAttr;
-            if (matchPattern(forOp.getStep(), m_Constant(&stepAttr)) &&
-                stepAttr.isSplat() &&
-                stepAttr.getSplatValue<APInt>().getSExtValue() == di.tileSize &&
-                matchPattern(forOp.getLowerBound(), m_Constant(&lbAttr)) &&
-                lbAttr.isSplat() &&
-                lbAttr.getSplatValue<APInt>().getSExtValue() >= 0 &&
-                (lbAttr.getSplatValue<APInt>().getSExtValue() % di.tileSize) ==
-                    0) {
-              auto i32 = b.getI32Type();
-              auto tileTy = TileType::get(b.getContext(), {}, i32);
-              auto cst = DenseElementsAttr::get(tileTy, APInt(32, di.tileSize));
-              Value tileSizeCst = ConstantOp::create(
-                  b, loc, tileTy, cast<DenseTypedElementsAttr>(cst));
-              baseIdx = DivIOp::create(b, loc, di.start, tileSizeCst,
-                                       Signedness::Unsigned)
-                            .getResult();
-            }
-          }
-        }
-        if (!baseIdx)
-          return failure();
-      }
+      baseIdx = extractTileMultiplier(b, loc, di.start, di.tileSize);
+      if (!baseIdx)
+        return failure();
     }
 
     if (isLoopAdvancingDim) {
@@ -1271,6 +1493,67 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
 // Rewrite drivers
 //===----------------------------------------------------------------------===//
 
+/// Recover the scalar shift in a rank-1 pointer start written as
+/// `maskStart + shift`. When the mask starts at zero, the entire pointer start
+/// is the shift. The caller moves this shift into a scalar base `offset` so the
+/// partition view can use the mask's local index space.
+static Value recoverRank1BaseShift(Value ptrStart, Value maskStart) {
+  ptrStart = lookThroughIndexCast(ptrStart);
+  maskStart = lookThroughIndexCast(maskStart);
+  if (!ptrStart)
+    return nullptr;
+  if (!maskStart)
+    return isScalarI32Tile(ptrStart.getType()) ? ptrStart : Value();
+
+  auto add = ptrStart.getDefiningOp<AddIOp>();
+  if (!add)
+    return nullptr;
+  for (auto [start, shift] : commutedOperands(add.getLhs(), add.getRhs()))
+    if (lookThroughIndexCast(start) == maskStart &&
+        isScalarI32Tile(shift.getType()))
+      return shift;
+  return nullptr;
+}
+
+/// Return whether `offset` is exactly `start * stride` for `dim`. A unit
+/// stride is represented by the unscaled `start` value.
+static bool matchesStartStride(Value offset, Value start, const DimInfo &dim) {
+  offset = lookThroughIndexCast(offset);
+  start = lookThroughIndexCast(start);
+  if (!offset || !start)
+    return false;
+  if (!dim.stride && (!dim.staticStride || *dim.staticStride == 1))
+    return offset == start;
+
+  auto mul = offset.getDefiningOp<MulIOp>();
+  if (!mul)
+    return false;
+  for (auto [a, b] : commutedOperands(mul.getLhs(), mul.getRhs())) {
+    if (lookThroughIndexCast(a) != start)
+      continue;
+    if (dim.stride && lookThroughIndexCast(b) == dim.stride)
+      return true;
+    if (dim.staticStride && isSplatIntEqual(b, *dim.staticStride))
+      return true;
+  }
+  return false;
+}
+
+/// Find the unique uniform offset that encodes `start` along `dim`.
+static std::optional<unsigned>
+findBaseShiftForDimension(ArrayRef<Value> baseShifts, Value start,
+                          const DimInfo &dim) {
+  std::optional<unsigned> match;
+  for (auto [index, shift] : llvm::enumerate(baseShifts)) {
+    if (!matchesStartStride(shift, start, dim))
+      continue;
+    if (match)
+      return std::nullopt;
+    match = index;
+  }
+  return match;
+}
+
 /// Analyze the pointer-arithmetic chain feeding a load/store (`ptr` + `mask`)
 /// and materialise the corresponding `make_tensor_view` + `make_partition_view`
 /// at the builder's current insertion point.  On success `outView` is the
@@ -1281,42 +1564,94 @@ static LogicalResult lowerAccess(OpBuilder &b, Location loc, Value ptr,
                                  Type elemTy, PaddingValueAttr padding,
                                  AssumeForwarder &fwd, Operation *anchor,
                                  Value &outView,
-                                 SmallVectorImpl<Value> &outIndices) {
+                                 SmallVectorImpl<Value> &outIndices,
+                                 StringRef *failureReason = nullptr) {
   PtrAccess access;
-  if (failed(analyzePtr(ptr, tileShape, access)))
+  if (failed(analyzePtr(ptr, tileShape, access, mask))) {
+    if (failureReason)
+      *failureReason = "pointer arithmetic";
     return failure();
+  }
 
   // Recover per-dim global sizes and compared-index starts from the mask.
   // Refuse partially-understood masks outright: an unrecognised predicate
   // (e.g. an extra `!=` term) would otherwise be silently dropped, changing
   // which elements are accessed.
   SmallVector<MaskBound> bounds;
-  if (!analyzeMask(mask, tileShape, bounds))
+  Value maskBaseShift;
+  if (tileShape.size() == 1 && access.baseShifts.size() == 1)
+    maskBaseShift = access.baseShifts.front();
+  if (!analyzeMask(mask, tileShape, bounds, mask, maskBaseShift)) {
+    if (failureReason)
+      *failureReason = "mask analysis";
     return failure();
+  }
   access.maskFullyRecognized = true;
   for (unsigned d = 0; d < tileShape.size(); ++d) {
     access.dims[d].size = bounds[d].size;
     access.dims[d].staticSize = bounds[d].staticSize;
+    if (bounds[d].startIncludesBaseShift) {
+      if (d != 0 || !access.dims[d].size || !maskBaseShift)
+        return failure();
+      Value localSize = SubIOp::create(b, loc, access.dims[d].size,
+                                       maskBaseShift)
+                            .getResult();
+      access.dims[d].size =
+          MaxIOp::create(b, loc, localSize, buildZeroI32(b, loc),
+                         Signedness::Signed)
+              .getResult();
+    }
     // The mask's per-dim index must match the pointer's index for that
     // dimension (same start); otherwise the partition view's implied bound
     // (`idx*tileSize + lane < size`) would mask different lanes than the
-    // source did.
+    // source did. For rank-1 accesses, a scalar pointer-only shift can instead
+    // become a pre-shifted base, leaving the view in the mask's local index
+    // space (e.g. `row * width + block * tileSize + lane`, masked only by
+    // `block * tileSize + lane < width`).
     Value ptrStart = lookThroughIndexCast(access.dims[d].start);
-    if (bounds[d].bounded &&
-        lookThroughIndexCast(bounds[d].start) != ptrStart)
-      return failure();
+    Value maskStart = lookThroughIndexCast(bounds[d].start);
+    if (bounds[d].bounded && maskStart != ptrStart) {
+      if (!ptrStart) {
+        if (std::optional<unsigned> shift = findBaseShiftForDimension(
+                access.baseShifts, maskStart, access.dims[d])) {
+          access.dims[d].start = bounds[d].start;
+          access.baseShifts.erase(access.baseShifts.begin() + *shift);
+          ptrStart = maskStart;
+        }
+      }
+      if (maskStart == ptrStart)
+        continue;
+      if (tileShape.size() != 1)
+        return failure();
+      Value baseShift = recoverRank1BaseShift(ptrStart, maskStart);
+      if (!baseShift)
+        return failure();
+      access.base = OffsetOp::create(b, loc, access.base.getType(),
+                                     access.base, baseShift)
+                        .getResult();
+      access.dims[d].start = bounds[d].start;
+      ptrStart = maskStart;
+    }
     if (bounds[d].lowerBounded &&
         lookThroughIndexCast(bounds[d].lowerStart) != ptrStart)
       return failure();
   }
 
+  Value base = fwd.forward(access.base, anchor);
+  for (Value shift : access.baseShifts)
+    base = OffsetOp::create(b, loc, base.getType(), base, shift)
+                      .getResult();
+  access.base = base;
+
   BuiltViews bv;
-  if (failed(buildViews(b, loc, access, elemTy, padding, bv)))
+  if (failed(buildViews(b, loc, access, elemTy, padding, bv))) {
+    if (failureReason)
+      *failureReason = "view shape or partition index recovery";
     return failure();
+  }
 
   // Forward any `assume` metadata the source attached to the operands we reuse
   // (base pointer, dynamic shape/stride scalars) onto the rewritten view.
-  Value base = fwd.forward(access.base, anchor);
   SmallVector<Value> dynShape, dynStride;
   dynShape.reserve(bv.dynamicShape.size());
   dynStride.reserve(bv.dynamicStride.size());
@@ -1371,10 +1706,13 @@ static LogicalResult rewriteLoad(LoadPtrTkoOp op, AssumeForwarder &fwd) {
   OpBuilder b(op);
   Value view;
   SmallVector<Value> indices;
+  StringRef failureReason = "access validation";
   if (failed(lowerAccess(b, loc, op.getSource(), op.getMask(), tileShape,
-                         elemTy, padding, fwd, op, view, indices))) {
+                         elemTy, padding, fwd, op, view, indices,
+                         &failureReason))) {
     op.emitRemark("tileir-ptr-to-view: pointer-arithmetic pattern not "
-                  "recognised; skipping");
+            "recognised; skipping")
+      << " (failed during " << failureReason << ")";
     return failure();
   }
 
@@ -1417,10 +1755,13 @@ static LogicalResult rewriteStore(StorePtrTkoOp op, AssumeForwarder &fwd) {
       PaddingValueAttr::get(op.getContext(), PaddingValue::zero);
   Value view;
   SmallVector<Value> indices;
+  StringRef failureReason = "access validation";
   if (failed(lowerAccess(b, loc, op.getDestination(), op.getMask(), tileShape,
-                         elemTy, padding, fwd, op, view, indices))) {
+                         elemTy, padding, fwd, op, view, indices,
+                         &failureReason))) {
     op.emitRemark("tileir-ptr-to-view: pointer-arithmetic pattern not "
-                  "recognised; skipping");
+            "recognised; skipping")
+      << " (failed during " << failureReason << ")";
     return failure();
   }
 

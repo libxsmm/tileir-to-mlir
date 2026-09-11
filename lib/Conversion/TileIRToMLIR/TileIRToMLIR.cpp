@@ -39,6 +39,8 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/Transforms/DialectConversion.h"
 
 #include "llvm/ADT/TypeSwitch.h"
@@ -4084,15 +4086,110 @@ struct ConvertTileIRToMLIRPass
                                       std::move(patterns))))
       return signalPassFailure();
 
-    // Fold muli(divui(x, c), c) -> x. These patterns are produced when
-    // ConvertFor rescales loop bounds and inserts a divui in the body; once
-    // a transfer op then multiplies the recovered tile-space index by the
-    // same tile size, the round-trip collapses. The divui result may be
-    // wrapped in index_cast ops, and the two `c` operands may be distinct
-    // constant ops with the same value.
+    // Fold select(mask, transfer_read(.., pad), splat(pad)) into a masked
+    // transfer_read. Both forms yield `pad` on masked-off lanes, but the
+    // masked form lets the backend skip issuing their physical loads. The
+    // in_bounds attribute is carried over unchanged, so lanes the mask leaves
+    // enabled keep their original out-of-bounds protection.
+    {
+      // Return the scalar constant splatted across `value`, or a null
+      // attribute. Broadcasts are peeled only through single-element sources,
+      // where every result lane is known to hold the same value.
+      auto getSplatConstant = [](Value value) -> Attribute {
+        while (auto bcast = value.getDefiningOp<vector::BroadcastOp>()) {
+          Value src = bcast.getSource();
+          auto srcTy = dyn_cast<VectorType>(src.getType());
+          if (srcTy && (srcTy.isScalable() || srcTy.getNumElements() != 1))
+            break;
+          value = src;
+        }
+        Attribute attr;
+        if (!matchPattern(value, m_Constant(&attr)))
+          return {};
+        if (auto elements = dyn_cast<SplatElementsAttr>(attr))
+          return elements.getSplatValue<Attribute>();
+        return isa<VectorType>(value.getType()) ? Attribute() : attr;
+      };
+
+      DominanceInfo domInfo(module);
+      SmallVector<arith::SelectOp> maskFolds;
+      module.walk([&](arith::SelectOp op) {
+        auto readOp = op.getTrueValue().getDefiningOp<vector::TransferReadOp>();
+        if (!readOp || !readOp->hasOneUse() || readOp.getMask())
+          return;
+        // A scalar condition does not select per lane.
+        if (!isa<VectorType>(op.getCondition().getType()))
+          return;
+        // Attaching the mask at the load must not move the load itself.
+        if (!domInfo.properlyDominates(op.getCondition(), readOp))
+          return;
+        Attribute pad;
+        if (!matchPattern(readOp.getPadding(), m_Constant(&pad)))
+          return;
+        Attribute falsePad = getSplatConstant(op.getFalseValue());
+        if (!falsePad || falsePad != pad)
+          return;
+        maskFolds.push_back(op);
+      });
+      for (arith::SelectOp op : maskFolds) {
+        auto readOp =
+            cast<vector::TransferReadOp>(op.getTrueValue().getDefiningOp());
+        OpBuilder builder(readOp);
+        auto maskedRead = vector::TransferReadOp::create(
+            builder, readOp.getLoc(), readOp.getVectorType(), readOp.getBase(),
+            readOp.getIndices(), readOp.getPermutationMapAttr(),
+            readOp.getPadding(), op.getCondition(), readOp.getInBoundsAttr());
+        op.replaceAllUsesWith(maskedRead.getResult());
+        op.erase();
+        readOp.erase();
+      }
+    }
+
+    // Fold muli(index_cast(divui(iv, c)), c) -> index_cast(iv) when `iv` is
+    // the induction variable of a loop whose lower bound and step are both
+    // multiples of `c`. These patterns are produced when ConvertFor rescales
+    // loop bounds and inserts a divui in the body; once a transfer op then
+    // multiplies the recovered tile-space index by the same tile size, the
+    // round-trip collapses. The divui result may be wrapped in index_cast
+    // ops, and the two `c` operands may be distinct constants with different
+    // integer types.
     //
     // Collect the rewrites first and apply them afterwards: erasing the op
     // currently being visited would invalidate the walker's iterator.
+    auto getIntegerConstant = [](Value value) -> std::optional<int64_t> {
+      while (auto cast = value.getDefiningOp<arith::IndexCastOp>())
+        value = cast.getIn();
+      if (auto constant = value.getDefiningOp<arith::ConstantIndexOp>())
+        return constant.value();
+      if (auto constant = value.getDefiningOp<arith::ConstantIntOp>())
+        return constant.value();
+      return std::nullopt;
+    };
+    auto isMultipleOf = [&](Value value, int64_t divisor) {
+      if (std::optional<int64_t> constant = getIntegerConstant(value))
+        return *constant % divisor == 0;
+      auto mul = value.getDefiningOp<arith::MulIOp>();
+      if (!mul)
+        return false;
+      for (Value operand : {mul.getLhs(), mul.getRhs()})
+        if (std::optional<int64_t> constant = getIntegerConstant(operand);
+            constant && *constant % divisor == 0)
+          return true;
+      return false;
+    };
+    auto isRescaledLoopInductionVar = [&](Value value, int64_t tileSize) {
+      while (auto cast = value.getDefiningOp<arith::IndexCastOp>())
+        value = cast.getIn();
+      auto inductionVar = dyn_cast<BlockArgument>(value);
+      if (!inductionVar)
+        return false;
+      auto forOp = dyn_cast<scf::ForOp>(
+          inductionVar.getOwner()->getParentOp());
+      return forOp && inductionVar == forOp.getInductionVar() &&
+             isMultipleOf(forOp.getLowerBound(), tileSize) &&
+             isMultipleOf(forOp.getStep(), tileSize);
+    };
+
     SmallVector<std::pair<arith::MulIOp, Value>> mulFolds;
     module.walk([&](arith::MulIOp op) {
       for (auto [mulOperand, otherOperand] :
@@ -4104,21 +4201,35 @@ struct ConvertTileIRToMLIRPass
         auto divOp = v.getDefiningOp<arith::DivUIOp>();
         if (!divOp)
           continue;
-        if (divOp.getLhs().getType() != op.getType())
+        std::optional<int64_t> divisor = getIntegerConstant(divOp.getRhs());
+        std::optional<int64_t> multiplier =
+            getIntegerConstant(otherOperand);
+        if (!divisor || !multiplier || *divisor <= 0 ||
+            *divisor != *multiplier)
           continue;
-        if (divOp.getRhs() == otherOperand) {
-          mulFolds.emplace_back(op, divOp.getLhs());
-          return;
-        }
-        auto divCst = divOp.getRhs().getDefiningOp<arith::ConstantIndexOp>();
-        auto mulCst = otherOperand.getDefiningOp<arith::ConstantIndexOp>();
-        if (divCst && mulCst && divCst.value() == mulCst.value()) {
-          mulFolds.emplace_back(op, divOp.getLhs());
-          return;
-        }
+        if (divOp.getLhs().getType() != op.getType() &&
+            !((isa<IndexType>(divOp.getLhs().getType()) &&
+               isa<IntegerType>(op.getType())) ||
+              (isa<IntegerType>(divOp.getLhs().getType()) &&
+               isa<IndexType>(op.getType()))))
+          continue;
+        if (!isRescaledLoopInductionVar(divOp.getLhs(), *divisor))
+          continue;
+        mulFolds.emplace_back(op, divOp.getLhs());
+        return;
       }
     });
     for (auto [mulOp, replacement] : mulFolds) {
+      if (replacement.getType() != mulOp.getType()) {
+        OpBuilder builder(mulOp);
+        if (isa<IntegerType>(replacement.getType()) &&
+            isa<IndexType>(mulOp.getType()))
+          replacement = arith::IndexCastUIOp::create(
+              builder, mulOp.getLoc(), mulOp.getType(), replacement);
+        else
+          replacement = arith::IndexCastOp::create(
+              builder, mulOp.getLoc(), mulOp.getType(), replacement);
+      }
       mulOp.replaceAllUsesWith(replacement);
       mulOp->erase();
     }

@@ -85,6 +85,16 @@ cuda_tile.module @for_wrapped_iv_index_rescale_module {
     {
       %scaled_k = muli %k, %c32 : tile<i32>
       %wrapped_k = divi %scaled_k, %c32 signed : tile<i32>
+      // The former `%scaled_k` lowering is exactly:
+      //   muli(index_cast(divui(%[[WRAPPED_IV]], 32)), 32) : i32.
+      // It must be replaced with index_cast(%[[WRAPPED_IV]]) before the
+      // remaining divsi; merely indexing the transfer from %[[WRAPPED_IV]]
+      // would not prove this dead scalar computation was folded.
+      // CHECK: %[[WRAPPED_TILE_IV:.*]] = arith.divui %[[WRAPPED_IV]], %{{.*}} : index
+      // CHECK: %[[WRAPPED_TILE_IV_I32:.*]] = arith.index_cast %[[WRAPPED_TILE_IV]] : index to i32
+      // CHECK-NOT: arith.muli %[[WRAPPED_TILE_IV_I32]], {{.*}} : i32
+      // CHECK: %[[FOLDED_IV_I32:.*]] = arith.index_cast %[[WRAPPED_IV]] : index to i32
+      // CHECK: %{{.*}} = arith.divsi %[[FOLDED_IV_I32]], %{{.*}} : i32
       // CHECK: vector.transfer_read %{{.*}}[%[[WRAPPED_IV]], %{{.*}}]
       %A_frag, %t1 = load_view_tko weak %A_block[%bidx, %wrapped_k] : partition_view<tile=(128x32), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>, tile<i32> -> tile<128x32xf16>, !cuda_tile.token
       continue %A_frag : tile<128x32xf16>

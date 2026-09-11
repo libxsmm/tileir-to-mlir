@@ -158,5 +158,34 @@ module {
       %unsigned_tile, %unsigned_token = load_ptr_tko weak %ptr, %unsigned_mask : tile<8xptr<f32>>, tile<8xi1> -> tile<8xf32>, !cuda_tile.token
       return
     }
+
+    // An upper-only mask does not prove that a zero lower clamp is redundant.
+    // CHECK-LABEL: entry @clamp_without_lower_mask
+    entry @clamp_without_lower_mask(%base: tile<ptr<f32>>) {
+      %c8 = constant <i32: 8> : tile<i32>
+      %c7 = constant <i32: 7> : tile<i32>
+      %c0 = constant <i32: 0> : tile<i32>
+      %c1 = constant <i32: 1> : tile<i32>
+      %lane = iota : tile<8xi32>
+      %one_1d = reshape %c1 : tile<i32> -> tile<1xi32>
+      %one_bc = broadcast %one_1d : tile<1xi32> -> tile<8xi32>
+      %index = subi %lane, %one_bc : tile<8xi32>
+      %zero_1d = reshape %c0 : tile<i32> -> tile<1xi32>
+      %zero_bc = broadcast %zero_1d : tile<1xi32> -> tile<8xi32>
+      %clamp_lower = maxi %index, %zero_bc signed : tile<8xi32>
+      %upper_1d = reshape %c7 : tile<i32> -> tile<1xi32>
+      %upper_bc = broadcast %upper_1d : tile<1xi32> -> tile<8xi32>
+      %clamped_index = mini %clamp_lower, %upper_bc signed : tile<8xi32>
+      %extent_1d = reshape %c8 : tile<i32> -> tile<1xi32>
+      %extent_bc = broadcast %extent_1d : tile<1xi32> -> tile<8xi32>
+      %mask = cmpi less_than %index, %extent_bc, signed : tile<8xi32> -> tile<8xi1>
+      %base_1d = reshape %base : tile<ptr<f32>> -> tile<1xptr<f32>>
+      %base_bc = broadcast %base_1d : tile<1xptr<f32>> -> tile<8xptr<f32>>
+      %ptr = offset %base_bc, %clamped_index : tile<8xptr<f32>>, tile<8xi32> -> tile<8xptr<f32>>
+      // CHECK: load_ptr_tko
+      // expected-remark @below {{tileir-ptr-to-view: pointer-arithmetic pattern not recognised; skipping}}
+      %value, %token = load_ptr_tko weak %ptr, %mask : tile<8xptr<f32>>, tile<8xi1> -> tile<8xf32>, !cuda_tile.token
+      return
+    }
   }
 }
