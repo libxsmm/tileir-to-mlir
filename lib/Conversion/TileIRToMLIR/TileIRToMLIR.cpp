@@ -981,16 +981,13 @@ buildTransferViewAccessPlan(ConversionPatternRewriter &rewriter, Operation *op,
   Location loc = op->getLoc();
   auto *ctx = rewriter.getContext();
 
-  // Build memref indices in tensor-dimension order.
+  // Build memref indices in tensor-dimension order. View indices are unsigned.
   auto nswFlag = arith::IntegerOverflowFlagsAttr::get(
       ctx, arith::IntegerOverflowFlags::nsw);
   SmallVector<Value> memrefIndices(rank);
   for (unsigned i = 0; i < rank; ++i) {
-    Value tileIndex = castValueToType(rewriter, loc, convertedIndices[i],
-                                      rewriter.getIndexType());
-    if (!tileIndex)
-      return rewriter.notifyMatchFailure(
-          op, "view index could not be converted to index");
+    Value tileIndex = arith::IndexCastUIOp::create(
+        rewriter, loc, rewriter.getIndexType(), convertedIndices[i]);
     Value strideVal =
         arith::ConstantIndexOp::create(rewriter, loc, viewInfo.viewStrides[i]);
     memrefIndices[viewInfo.dimMap[i]] =
@@ -2134,10 +2131,12 @@ reinterpretScalarPtrPreservingOffset(ConversionPatternRewriter &rewriter,
 ///
 /// The base operand is a scalar `tile<ptr<T>>`, which the type converter maps
 /// to `memref<*xT>`. The tensor_view result type maps to a ranked memref.
-/// Dynamic shape/stride operands of the source op are scalar `tile<i32>`, so
-/// this lowering inserts explicit casts to `index` before building the
-/// memref.reinterpret_cast operands; static dims come from the tensor_view
-/// type.
+/// Static shape and stride entries come from the tensor_view type.
+///
+/// cuda_tile specifies the dynamic shape and stride operands as unsigned, but
+/// they are sign-extended: --tileir-ptr-to-view derives them from signed
+/// pointer offsets and mask bounds, which can be negative. Unsigned values of
+/// 2^31 or more in i32 operands are therefore not supported.
 struct ConvertMakeTensorView
     : public OpConversionPattern<cuda_tile::MakeTensorViewOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -2151,53 +2150,25 @@ struct ConvertMakeTensorView
       return rewriter.notifyMatchFailure(
           op, "tensor_view did not convert to a ranked memref");
 
+    Location loc = op.getLoc();
+    auto toIndex = [&](ValueRange values) {
+      return llvm::map_to_vector(values, [&](Value value) -> Value {
+        return arith::IndexCastOp::create(rewriter, loc,
+                                          rewriter.getIndexType(), value);
+      });
+    };
     auto tvType = cast<cuda_tile::TensorViewType>(op.getType());
-    auto tvShape = tvType.getShape();
-    auto tvStrides = tvType.getStrides();
-    unsigned rank = tvShape.size();
-
-    // Variadic operands hold only the values for the dynamic dims, in
-    // dimension order.
-    auto dynShape = adaptor.getDynamicShape();
-    auto dynStrides = adaptor.getDynamicStrides();
-    unsigned dynShapeIdx = 0, dynStrideIdx = 0;
-
-    SmallVector<OpFoldResult> sizes;
-    sizes.reserve(rank);
-    for (unsigned d = 0; d < rank; ++d) {
-      if (tvShape[d] == ShapedType::kDynamic) {
-        Value size =
-            castValueToType(rewriter, op.getLoc(), dynShape[dynShapeIdx++],
-                            rewriter.getIndexType());
-        if (!size)
-          return rewriter.notifyMatchFailure(
-              op, "dynamic tensor_view shape could not be converted to index");
-        sizes.push_back(size);
-      } else
-        sizes.push_back(rewriter.getIndexAttr(tvShape[d]));
-    }
-
-    SmallVector<OpFoldResult> strides;
-    strides.reserve(rank);
-    for (unsigned d = 0; d < rank; ++d) {
-      if (tvStrides[d] == ShapedType::kDynamic) {
-        Value stride =
-            castValueToType(rewriter, op.getLoc(), dynStrides[dynStrideIdx++],
-                            rewriter.getIndexType());
-        if (!stride)
-          return rewriter.notifyMatchFailure(
-              op, "dynamic tensor_view stride could not be converted to index");
-        strides.push_back(stride);
-      } else
-        strides.push_back(rewriter.getIndexAttr(tvStrides[d]));
-    }
+    SmallVector<OpFoldResult> sizes = getMixedValues(
+        tvType.getShape(), toIndex(adaptor.getDynamicShape()), rewriter);
+    SmallVector<OpFoldResult> strides = getMixedValues(
+        tvType.getStrides(), toIndex(adaptor.getDynamicStrides()), rewriter);
 
     // make_tensor_view reshapes the buffer at the base pointer's current
     // location, so it must preserve whatever absolute offset the base memref
     // descriptor carries. Recover it unconditionally rather than matching only
     // a specific producer shape (e.g. direct scalar `offset`).
     OpFoldResult offset =
-        recoverUnrankedPtrOffset(rewriter, op.getLoc(), adaptor.getBase());
+        recoverUnrankedPtrOffset(rewriter, loc, adaptor.getBase());
 
     rewriter.replaceOpWithNewOp<memref::ReinterpretCastOp>(
         op, resultTy, adaptor.getBase(), offset, sizes, strides);

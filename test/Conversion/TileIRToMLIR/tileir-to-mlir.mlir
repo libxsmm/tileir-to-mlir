@@ -1465,7 +1465,7 @@ cuda_tile.module @m {
     // CHECK: %[[SLO_IDXIN:.*]] = arith.constant 0 : i32
     // CHECK: %[[SLO_PTR:.*]] = memref.reinterpret_cast %[[SLO_UPTR]] to offset: [0], sizes: [8], strides: [1] : memref<*xf32> to memref<8xf32, strided<[1], offset: ?>>
     // offset = index * traversal_strides[0] (= 1 here), not tile_shape.
-    // CHECK: %[[SLO_IDX:.*]] = arith.index_cast %[[SLO_IDXIN]] : i32 to index
+    // CHECK: %[[SLO_IDX:.*]] = arith.index_castui %[[SLO_IDXIN]] : i32 to index
     // CHECK: %[[SLO_C1:.*]] = arith.constant 1 : index
     // CHECK: %[[SLO_OFF:.*]] = arith.muli %[[SLO_IDX]], %[[SLO_C1]] overflow<nsw> : index
     // CHECK: %[[SLO_PAD:.*]] = ub.poison : f32
@@ -1487,7 +1487,7 @@ cuda_tile.module @m {
     // CHECK: %[[SLE_IDXIN:.*]] = arith.constant 1 : i32
     // CHECK: %[[SLE_PTR:.*]] = memref.reinterpret_cast %[[SLE_UPTR]] to offset: [0], sizes: [16], strides: [1] : memref<*xf32> to memref<16xf32, strided<[1], offset: ?>>
     // offset = index * traversal_strides[0] (= 2 here).
-    // CHECK: %[[SLE_IDX:.*]] = arith.index_cast %[[SLE_IDXIN]] : i32 to index
+    // CHECK: %[[SLE_IDX:.*]] = arith.index_castui %[[SLE_IDXIN]] : i32 to index
     // CHECK: %[[SLE_C2:.*]] = arith.constant 2 : index
     // CHECK: %[[SLE_OFF:.*]] = arith.muli %[[SLE_IDX]], %[[SLE_C2]] overflow<nsw> : index
     // Exact tiling (stride 2 == tile 2): every tile fits, so in_bounds = [true].
@@ -1510,11 +1510,11 @@ cuda_tile.module @m {
     // CHECK: %[[SLS_IDX1IN:.*]] = arith.constant 1 : i32
     // CHECK: %[[SLS_PTR:.*]] = memref.reinterpret_cast %[[SLS_UPTR]] to offset: [0], sizes: [64, 16], strides: [16, 1] : memref<*xf32> to memref<64x16xf32, strided<[16, 1], offset: ?>>
     // tile dim0 (index %c0) maps to tensor dim1 with traversal stride 4.
-    // CHECK: %[[SLS_IDX0:.*]] = arith.index_cast %[[SLS_IDX0IN]] : i32 to index
+    // CHECK: %[[SLS_IDX0:.*]] = arith.index_castui %[[SLS_IDX0IN]] : i32 to index
     // CHECK: %[[SLS_S4:.*]] = arith.constant 4 : index
     // CHECK: %[[SLS_OFF0:.*]] = arith.muli %[[SLS_IDX0]], %[[SLS_S4]] overflow<nsw> : index
     // tile dim1 (index %c1) maps to tensor dim0 with traversal stride 3.
-    // CHECK: %[[SLS_IDX1:.*]] = arith.index_cast %[[SLS_IDX1IN]] : i32 to index
+    // CHECK: %[[SLS_IDX1:.*]] = arith.index_castui %[[SLS_IDX1IN]] : i32 to index
     // CHECK: %[[SLS_S3:.*]] = arith.constant 3 : index
     // CHECK: %[[SLS_OFF1:.*]] = arith.muli %[[SLS_IDX1]], %[[SLS_S3]] overflow<nsw> : index
     // CHECK: %[[SLS_PAD:.*]] = arith.constant 0x7FC00000 : f32
@@ -1540,10 +1540,10 @@ cuda_tile.module @m {
     // CHECK: %[[SST_BCAST:.*]] = arith.constant dense<1.000000e+00> : vector<4x2xf32>
     // CHECK: %[[SST_PTR:.*]] = memref.reinterpret_cast %[[SST_UPTR]] to offset: [0], sizes: [64, 16], strides: [16, 1] : memref<*xf32> to memref<64x16xf32, strided<[16, 1], offset: ?>>
     // identity dim_map: tile dim0 uses stride 4, tile dim1 uses stride 2.
-    // CHECK: %[[SST_IDX0:.*]] = arith.index_cast %[[SST_IDX0IN]] : i32 to index
+    // CHECK: %[[SST_IDX0:.*]] = arith.index_castui %[[SST_IDX0IN]] : i32 to index
     // CHECK: %[[SST_S4:.*]] = arith.constant 4 : index
     // CHECK: %[[SST_OFF0:.*]] = arith.muli %[[SST_IDX0]], %[[SST_S4]] overflow<nsw> : index
-    // CHECK: %[[SST_IDX1:.*]] = arith.index_cast %[[SST_IDX1IN]] : i32 to index
+    // CHECK: %[[SST_IDX1:.*]] = arith.index_castui %[[SST_IDX1IN]] : i32 to index
     // CHECK: %[[SST_S2:.*]] = arith.constant 2 : index
     // CHECK: %[[SST_OFF1:.*]] = arith.muli %[[SST_IDX1]], %[[SST_S2]] overflow<nsw> : index
     // identity dim_map: memref index order is [OFF0, OFF1], both dims fit -> in_bounds = [true, true], no permutation_map.
