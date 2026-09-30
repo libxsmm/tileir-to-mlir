@@ -14,12 +14,12 @@
 // A few ops are intentionally not lowered because they have no faithful
 // representation in the target dialects; they must be removed by an earlier
 // pass or are rejected here: AssertOp, AtomicCASTkoOp, AtomicRedViewTkoOp,
-// BreakOp, IntToPtrOp, LoopOp, MakeGatherScatterViewOp, MmafScaledOp,
-// PrintTkoOp, PtrToIntOp.
+// BreakOp, IntToPtrOp, LoopOp, MmafScaledOp, PrintTkoOp, PtrToIntOp. A
+// gather_scatter_view can be created but not accessed.
 //
-// Pointer-tile accesses (LoadPtrTkoOp, StorePtrTkoOp, AtomicRMWTkoOp) are only
-// lowered for scalar/rank-0 pointers; higher-rank pointer accesses must first
-// be raised to view ops by the --tileir-ptr-to-view pass.
+// Ranked pointer tiles are lowered to gathers and scatters. The
+// --tileir-ptr-to-view pass raises the ones it can to view accesses first.
+// AtomicRMWTkoOp is only lowered for scalar pointers.
 //
 //===----------------------------------------------------------------------===//
 
@@ -116,7 +116,6 @@ struct ViewInfo {
   SmallVector<int64_t>
       viewStrides;             // Base advance per index step (per tile dim)
   SmallVector<int32_t> dimMap; // Mapping from tile dims to tensor_view dims
-  unsigned tensorViewRank;     // Rank of the underlying tensor_view
   // Optional padding value attribute from the view type; null if the view does
   // not specify one (i.e. OOB loads yield unspecified values).
   cuda_tile::PaddingValueAttr paddingValue;
@@ -127,6 +126,10 @@ struct ViewInfo {
 /// match-failure note) for view kinds that the transfer-based lowering cannot
 /// model (e.g. gather_scatter_view, whose sparse dimension requires gather /
 /// scatter rather than a contiguous transfer).
+///
+/// The view type verifiers guarantee that the tile and the tensor_view have
+/// the same rank, that dim_map is a permutation, and that tile sizes and
+/// strides are positive.
 static FailureOr<ViewInfo> getViewInfo(Operation *op, Value view,
                                        Value convertedView,
                                        ConversionPatternRewriter &rewriter) {
@@ -139,10 +142,6 @@ static FailureOr<ViewInfo> getViewInfo(Operation *op, Value view,
     info.tileShape.assign(tile.begin(), tile.end());
     info.viewStrides.assign(advance.begin(), advance.end());
     info.dimMap.assign(viewTy.getDimMap().begin(), viewTy.getDimMap().end());
-    if (info.dimMap.empty())
-      for (size_t d = 0, e = info.tileShape.size(); d < e; ++d)
-        info.dimMap.push_back(static_cast<int32_t>(d));
-    info.tensorViewRank = viewTy.getTensorView().getShape().size();
     info.paddingValue = viewTy.getPaddingValue();
   };
 
@@ -160,48 +159,6 @@ static FailureOr<ViewInfo> getViewInfo(Operation *op, Value view,
 
   return rewriter.notifyMatchFailure(
       op, "view kind is not supported by the transfer-based lowering");
-}
-
-/// Validate the semantic invariants that transfer and index-space queries rely
-/// on for a tile view.
-static LogicalResult validateViewInfo(Operation *op, const ViewInfo &info,
-                                      ConversionPatternRewriter &rewriter) {
-  auto memrefTy = dyn_cast<MemRefType>(info.memref.getType());
-  if (!memrefTy)
-    return rewriter.notifyMatchFailure(
-        op, "view source did not convert to a ranked memref");
-
-  if (memrefTy.getRank() != static_cast<int64_t>(info.tensorViewRank))
-    return rewriter.notifyMatchFailure(
-        op, "converted view memref rank does not match tensor_view rank");
-
-  if (info.dimMap.size() != info.tileShape.size())
-    return rewriter.notifyMatchFailure(
-        op, "view dim_map rank does not match tile_shape rank");
-
-  if (info.viewStrides.size() != info.tileShape.size())
-    return rewriter.notifyMatchFailure(
-        op, "view stride rank does not match tile_shape rank");
-
-  llvm::SmallBitVector seenDims(info.tensorViewRank);
-  for (auto [tileDim, tensorDim] : llvm::enumerate(info.dimMap)) {
-    if (tensorDim < 0 ||
-        static_cast<unsigned>(tensorDim) >= info.tensorViewRank)
-      return rewriter.notifyMatchFailure(
-          op, "view dim_map references an out-of-range tensor dimension");
-    if (seenDims.test(tensorDim))
-      return rewriter.notifyMatchFailure(
-          op, "view dim_map must be a permutation without duplicates");
-    seenDims.set(tensorDim);
-    if (info.tileShape[tileDim] <= 0)
-      return rewriter.notifyMatchFailure(
-          op, "view tile dimensions must be strictly positive");
-    if (info.viewStrides[tileDim] <= 0)
-      return rewriter.notifyMatchFailure(
-          op, "view traversal strides must be strictly positive");
-  }
-
-  return success();
 }
 
 /// Map a cuda_tile rounding mode to the equivalent arith rounding mode, if a
@@ -331,19 +288,6 @@ getConvertedResultTypeOrFail(OpT op, const TypeConverter *converter,
     return failure();
   }
   return resultTy;
-}
-
-template <typename OpT>
-static FailureOr<VectorType>
-getConvertedVectorResultTypeOrFail(OpT op, Type sourceType,
-                                   ConversionPatternRewriter &rewriter,
-                                   StringRef reason) {
-  auto vecTy = dyn_cast<VectorType>(sourceType);
-  if (!vecTy) {
-    (void)rewriter.notifyMatchFailure(op, reason);
-    return failure();
-  }
-  return vecTy;
 }
 
 static SmallVector<int64_t> getReducedVectorShape(VectorType sourceType,
@@ -775,12 +719,12 @@ struct AppendedGridArgLayout {
 ///     gpu.grid_dim.
 ///   - appendGridArgs=true: read matching trailing function arguments,
 ///     whose indices are looked up via AppendedGridArgLayout starting at
-///     `CpuArgBase`.
+///     `ArgBase`.
 ///   - appendGridArgs=false: lower to gpu dimension-query ops only when
 ///     `target=gpu`; otherwise fail conversion.
 ///
 /// Each result is cast to the converted result type as needed.
-template <typename SrcOp, typename GpuDimOp, unsigned CpuArgBase>
+template <typename SrcOp, typename GpuDimOp, unsigned ArgBase>
 struct ConvertDimQueryOp : public OpConversionPattern<SrcOp> {
   ConvertDimQueryOp(const TypeConverter &tc, MLIRContext *ctx,
                     TileIRTarget target, bool appendGridArgs)
@@ -816,9 +760,10 @@ struct ConvertDimQueryOp : public OpConversionPattern<SrcOp> {
     for (gpu::Dimension dim :
          {gpu::Dimension::x, gpu::Dimension::y, gpu::Dimension::z}) {
       Value raw =
-          parentFunc ? Value(parentFunc.getArgument(AppendedGridArgLayout::argIndex(
-                           parentFunc.getNumArguments(), CpuArgBase, dim)))
-                     : Value(GpuDimOp::create(rewriter, loc, dim));
+          parentFunc
+              ? Value(parentFunc.getArgument(AppendedGridArgLayout::argIndex(
+                    parentFunc.getNumArguments(), ArgBase, dim)))
+              : Value(GpuDimOp::create(rewriter, loc, dim));
       Value casted = castValueToType(rewriter, loc, raw, resultTy);
       if (!casted)
         return rewriter.notifyMatchFailure(
@@ -835,9 +780,9 @@ struct ConvertDimQueryOp : public OpConversionPattern<SrcOp> {
 
 /// Convert cuda_tile.maxf/minf based on propagate_nan.
 ///
-/// flush_to_zero has no equivalent in the arith FastMath flags; it is dropped.
 /// propagate_nan dispatches to arith.maximumf/minimumf (NaN propagating) vs
-/// arith.maxnumf/minnumf (NaN suppressing).
+/// arith.maxnumf/minnumf (NaN suppressing). flush_to_zero has no arith
+/// equivalent and is preserved as `tir-dropped-flush-to-zero`.
 template <typename SrcOp, typename NanPropagatingOp, typename NanSuppressingOp>
 struct ConvertMinMaxFOp : public OpConversionPattern<SrcOp> {
   using OpConversionPattern<SrcOp>::OpConversionPattern;
@@ -847,17 +792,15 @@ struct ConvertMinMaxFOp : public OpConversionPattern<SrcOp> {
                   typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     bool ftz = op.getFlushToZero();
-    Operation *newOp =
-        op.getPropagateNan()
-            ? rewriter
-                  .template replaceOpWithNewOp<NanPropagatingOp>(
-                      op, adaptor.getLhs(), adaptor.getRhs())
-                  .getOperation()
-            : rewriter
-                  .template replaceOpWithNewOp<NanSuppressingOp>(
-                      op, adaptor.getLhs(), adaptor.getRhs())
-                  .getOperation();
-    // flush_to_zero has no equivalent in arith max/min FastMath flags; drop it.
+    Operation *newOp = op.getPropagateNan()
+                           ? rewriter
+                                 .template replaceOpWithNewOp<NanPropagatingOp>(
+                                     op, adaptor.getLhs(), adaptor.getRhs())
+                                 .getOperation()
+                           : rewriter
+                                 .template replaceOpWithNewOp<NanSuppressingOp>(
+                                     op, adaptor.getLhs(), adaptor.getRhs())
+                                 .getOperation();
     preserveDroppedFlushToZero(rewriter, ftz, newOp);
     return success();
   }
@@ -1049,39 +992,23 @@ struct TransferViewAccessPlan {
 ///    tiles spill out of bounds, deferring those lanes to the masked path.
 static FailureOr<TransferViewAccessPlan>
 buildTransferViewAccessPlan(ConversionPatternRewriter &rewriter, Operation *op,
-                            Value view, Value convertedView, VectorType vecTy,
+                            Value view, Value convertedView,
                             ValueRange convertedIndices) {
   auto viewInfoOr = getViewInfo(op, view, convertedView, rewriter);
   if (failed(viewInfoOr))
     return failure();
   ViewInfo viewInfo = std::move(*viewInfoOr);
-  if (failed(validateViewInfo(op, viewInfo, rewriter)))
-    return failure();
 
-  unsigned tileRank = viewInfo.tileShape.size();
-  unsigned tensorRank = viewInfo.tensorViewRank;
-
-  // The TileView interface is the authoritative source for how many tile-space
-  // indices the view expects; cross-check the extracted layout against it so a
-  // mismatch is reported against the view contract rather than silently relied
-  // upon downstream.
-  if (cast<cuda_tile::TileView>(view.getType()).getViewIndexRank() != tileRank ||
-      convertedIndices.size() != tileRank)
-    return rewriter.notifyMatchFailure(
-        op, "view index rank does not match tile_shape rank");
-  if ((unsigned)vecTy.getRank() != tileRank)
-    return rewriter.notifyMatchFailure(
-        op, "converted tile rank does not match view tile_shape rank");
-
+  // The op verifiers guarantee one index per tile dimension.
+  unsigned rank = viewInfo.tileShape.size();
   Location loc = op->getLoc();
   auto *ctx = rewriter.getContext();
 
   // Build memref indices in tensor-dimension order.
   auto nswFlag = arith::IntegerOverflowFlagsAttr::get(
       ctx, arith::IntegerOverflowFlags::nsw);
-  Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
-  SmallVector<Value> memrefIndices(tensorRank, zero);
-  for (unsigned i = 0; i < tileRank; ++i) {
+  SmallVector<Value> memrefIndices(rank);
+  for (unsigned i = 0; i < rank; ++i) {
     Value tileIndex = castValueToType(rewriter, loc, convertedIndices[i],
                                       rewriter.getIndexType());
     if (!tileIndex)
@@ -1094,15 +1021,15 @@ buildTransferViewAccessPlan(ConversionPatternRewriter &rewriter, Operation *op,
   }
 
   SmallVector<AffineExpr> permExprs;
-  permExprs.reserve(tileRank);
+  permExprs.reserve(rank);
   for (int32_t td : viewInfo.dimMap)
     permExprs.push_back(getAffineDimExpr(td, ctx));
-  auto permutationMap = AffineMap::get(tensorRank, 0, permExprs, ctx);
+  auto permutationMap = AffineMap::get(rank, 0, permExprs, ctx);
 
   auto memrefTy = cast<MemRefType>(viewInfo.memref.getType());
   auto memrefShape = memrefTy.getShape();
-  SmallVector<bool> inBounds(tileRank, false);
-  for (unsigned i = 0; i < tileRank; ++i) {
+  SmallVector<bool> inBounds(rank, false);
+  for (unsigned i = 0; i < rank; ++i) {
     int64_t ext = memrefShape[viewInfo.dimMap[i]];
     if (ext == ShapedType::kDynamic)
       continue;
@@ -1949,8 +1876,6 @@ struct ConvertGetIndexSpaceShape
     if (failed(viewInfoOr))
       return failure();
     ViewInfo viewInfo = std::move(*viewInfoOr);
-    if (failed(validateViewInfo(op, viewInfo, rewriter)))
-      return failure();
 
     Location loc = op.getLoc();
     unsigned rank = viewInfo.tileShape.size();
@@ -2173,16 +2098,9 @@ using ConvertIToF = ConvertFromToSignednessCastWithRoundingOp<
 
 /// Convert cuda_tile.load_view_tko to vector.transfer_read.
 ///
-/// Mapping summary:
-///   - View indices (tile-level) are multiplied by the tile shape and stored
-///     into the memref index slot dim_map[i]. Non-covered memref dims are 0.
-///   - The result `vector` keeps the tile's logical (tile-dim) shape. A
-///     `permutation_map` on the transfer_read maps memref dim `dim_map[i]`
-///     to vector dim `i`, so no post-load transpose is needed.
-///   - `inBounds[i]` is set true only when the tensor extent along the
-///     corresponding memref dim is static and exactly divisible by the tile
-///     extent. Otherwise the transfer_read masks and substitutes the
-///     `padding` value, which is taken from `partition_view.padding_value`.
+/// The indices, permutation map and in-bounds flags come from
+/// buildTransferViewAccessPlan. Out-of-bounds lanes read the view's
+/// `padding_value`, or poison when it has none.
 ///
 /// Restrictions (return notifyMatchFailure on violation):
 ///   - Only `weak` memory_ordering_semantics is supported.
@@ -2204,22 +2122,20 @@ struct ConvertLoadViewTko
     if (failed(checkCommonTkoGuards(op, rewriter)))
       return failure();
 
-    auto vecTy = getConvertedVectorResultTypeOrFail(
-        op, getTypeConverter()->convertType(op.getTile().getType()), rewriter,
-        "load_view_tko tile must convert to a vector type");
-    if (failed(vecTy))
-      return failure();
+    auto vecTy = dyn_cast_or_null<VectorType>(
+        getTypeConverter()->convertType(op.getTile().getType()));
+    if (!vecTy)
+      return rewriter.notifyMatchFailure(op, "cannot convert tile type");
 
-    auto plan = buildTransferViewAccessPlan(rewriter, op, op.getView(),
-                                            adaptor.getView(), *vecTy,
-                                            adaptor.getIndex());
+    auto plan = buildTransferViewAccessPlan(
+        rewriter, op, op.getView(), adaptor.getView(), adaptor.getIndex());
     if (failed(plan))
       return failure();
 
     Value padding;
     if (!plan->viewInfo.paddingValue) {
-      padding = ub::PoisonOp::create(rewriter, loc, vecTy->getElementType());
-    } else if (auto fty = dyn_cast<FloatType>(vecTy->getElementType())) {
+      padding = ub::PoisonOp::create(rewriter, loc, vecTy.getElementType());
+    } else if (auto fty = dyn_cast<FloatType>(vecTy.getElementType())) {
       const llvm::fltSemantics &sem = fty.getFloatSemantics();
       APFloat val = APFloat::getZero(sem, /*Negative=*/false);
       switch (plan->viewInfo.paddingValue.getValue()) {
@@ -2242,14 +2158,14 @@ struct ConvertLoadViewTko
       padding = arith::ConstantFloatOp::create(rewriter, loc, fty, val);
     } else {
       padding = arith::ConstantIntOp::create(rewriter, loc,
-                                             vecTy->getElementType(), 0);
+                                             vecTy.getElementType(), 0);
     }
     SmallVector<bool> inBounds = assumeInBounds
-                                     ? SmallVector<bool>(vecTy->getRank(), true)
+                                     ? SmallVector<bool>(vecTy.getRank(), true)
                                      : plan->inBounds;
 
     auto readOp = vector::TransferReadOp::create(
-        rewriter, loc, *vecTy, plan->viewInfo.memref, plan->memrefIndices,
+        rewriter, loc, vecTy, plan->viewInfo.memref, plan->memrefIndices,
         AffineMapAttr::get(plan->permutationMap), padding,
         /*mask=*/Value(), rewriter.getBoolArrayAttr(inBounds));
     preserveDroppedOptHints(op, readOp);
@@ -2330,15 +2246,12 @@ struct ConvertMakeGatherScatterView
 /// offset / unit stride, then its offset field is read via
 /// memref.extract_strided_metadata.
 ///
-/// Kernel-pointer function arguments are a special case: they enter as raw
-/// pointers with a statically-zero descriptor offset, so there is nothing to
-/// recover. We short-circuit them to a static `0` and emit *no* IR. This is not
-/// just an optimization: ConvertMemrefArgsToPtrArgs only promotes an unranked
-/// argument to `!llvm.ptr` when every use of it is one and the same cast.
-/// Emitting an extra `memref.cast` of the argument here would create a second,
-/// divergent use and defeat that promotion, leaving the argument unranked and
-/// the enclosing `func.func` unconvertible under the bare-pointer calling
-/// convention.
+/// Kernel-pointer function arguments are a special case: by the calling
+/// convention of the converted kernels (see Passes.td), they are bare pointers
+/// with a zero descriptor offset, so there is nothing to recover. We
+/// short-circuit them to a static `0` and emit *no* IR. This also keeps every
+/// use of the argument a reinterpret_cast with a static zero offset, which
+/// ConvertMemrefArgsToRankedMemref requires to promote the argument.
 ///
 /// The short-circuit is restricted to entry-block arguments of function-like
 /// ops. A pointer carried as a loop/region iter-arg (e.g. an `scf.for` body
@@ -2617,9 +2530,8 @@ using ConvertMulI =
 /// Pointer model in this pass: tile<ptr<T>> -> memref<*xT>. For
 /// `offset(ptr, off)` with a scalar `off`, build a rank-1 memref view with
 /// dynamic offset and unit size/stride, then cast back to memref<*xT>. The
-/// unranked cast carries the buffer pointer at the offset position, so a
-/// downstream make_tensor_view's reinterpret_cast (offset 0) correctly starts
-/// at the shifted location.
+/// result's descriptor carries the accumulated offset, which consumers recover
+/// with recoverUnrankedPtrOffset.
 struct ConvertOffsetScalarPtr
     : public OpConversionPattern<cuda_tile::OffsetOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -2724,10 +2636,8 @@ struct ConvertNegI : public OpConversionPattern<cuda_tile::NegIOp> {
 
 /// Convert scalar (rank-0) cuda_tile.load_ptr_tko on a `tile<ptr<T>>` to a
 /// `memref.reinterpret_cast` + `memref.load`. The source `tile<ptr<T>>` is
-/// converted to `memref<*xT>`; a rank-0 reinterpret_cast (offset 0) recovers
-/// the scalar memref the load reads from.
-///
-/// Higher-rank pointer loads must first be lifted by `--tileir-ptr-to-view`.
+/// converted to `memref<*xT>`; a rank-0 reinterpret_cast that keeps the
+/// descriptor offset recovers the scalar memref the load reads from.
 ///
 /// `optimization_hints`, when present, is preserved on the produced memref.load
 /// as the discardable attribute `tir-dropped-optimization-hints`.
@@ -3039,8 +2949,8 @@ mapAtomicRMWMode(cuda_tile::AtomicRMWMode mode) {
 /// Convert scalar (rank-0) cuda_tile.atomic_rmw_tko on a `tile<ptr<T>>` to a
 /// `memref.reinterpret_cast` + `memref.atomic_rmw`. Mirrors
 /// ConvertLoadPtrTkoScalar: the source `tile<ptr<T>>` is converted to
-/// `memref<*xT>`; a rank-0 reinterpret_cast (offset 0) recovers the scalar
-/// memref the atomic operates on.
+/// `memref<*xT>`; a rank-0 reinterpret_cast that keeps the descriptor offset
+/// recovers the scalar memref the atomic operates on.
 ///
 /// Both ops return the value read at the location before the update, so the
 /// result maps directly. The `memory_ordering_semantics` and `memory_scope`
@@ -3397,15 +3307,10 @@ using ConvertSqrt = ConvertUnaryApproxMathOp<cuda_tile::SqrtOp, math::SqrtOp,
 
 /// Convert cuda_tile.store_view_tko to vector.transfer_write.
 ///
-/// Mapping summary (mirror of ConvertLoadViewTko):
-///   - Memref indices: memrefIndices[dim_map[i]] = tileIndex[i] * tileShape[i].
-///   - The stored vector keeps tile-dim order; a `permutation_map` makes
-///     vector dim i write into memref dim dim_map[i] (no pre-store transpose).
-///   - `inBounds[i]` is true only when the tensor extent along memref dim
-///     dim_map[i] is static and divisible by tile dim i. Otherwise
-///     vector.transfer_write masks the OOB lanes, matching the
-///     partition_view spec ("Out-of-bounds tile elements are masked during
-///     stores").
+/// The indices, permutation map and in-bounds flags come from
+/// buildTransferViewAccessPlan. vector.transfer_write skips out-of-bounds
+/// lanes, matching the view semantics ("Out-of-bounds tile elements are masked
+/// during stores").
 ///
 /// Restrictions / guards:
 ///   - Only `weak` memory_ordering_semantics is supported.
@@ -3427,21 +3332,15 @@ struct ConvertStoreViewTko
     if (failed(checkCommonTkoGuards(op, rewriter)))
       return failure();
 
-    auto vecTy = getConvertedVectorResultTypeOrFail(
-        op, getTypeConverter()->convertType(op.getTile().getType()), rewriter,
-        "store_view_tko tile must convert to a vector type");
-    if (failed(vecTy))
-      return failure();
-
-    auto plan = buildTransferViewAccessPlan(rewriter, op, op.getView(),
-                                            adaptor.getView(), *vecTy,
-                                            adaptor.getIndex());
+    auto plan = buildTransferViewAccessPlan(
+        rewriter, op, op.getView(), adaptor.getView(), adaptor.getIndex());
     if (failed(plan))
       return failure();
 
-    SmallVector<bool> inBounds = assumeInBounds
-                                     ? SmallVector<bool>(vecTy->getRank(), true)
-                                     : plan->inBounds;
+    SmallVector<bool> inBounds =
+        assumeInBounds
+            ? SmallVector<bool>(plan->viewInfo.tileShape.size(), true)
+            : plan->inBounds;
 
     auto writeOp = vector::TransferWriteOp::create(
         rewriter, loc, /*resultTypes=*/TypeRange{}, adaptor.getTile(),
@@ -3505,10 +3404,6 @@ using ConvertUnpack = ConvertVectorBitcastOp<cuda_tile::UnpackOp>;
 using ConvertXOrI = ConvertBinaryLhsRhsOp<cuda_tile::XOrIOp, arith::XOrIOp>;
 
 using ConvertYield = ConvertToScfYield<cuda_tile::YieldOp>;
-
-//===----------------------------------------------------------------------===//
-// Pass Definition
-//===----------------------------------------------------------------------===//
 
 //===----------------------------------------------------------------------===//
 // Type converter and conversion pattern population

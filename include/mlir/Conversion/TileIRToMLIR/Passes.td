@@ -28,6 +28,11 @@ def ConvertTileIRToMLIRPass : Pass<"convert-tileir-to-mlir", "ModuleOp"> {
     `known-block-size`, when given three values, sets the `known_block_size`
     attribute (x, y, z) on the generated `gpu.func` ops; when omitted the
     attribute is not set.
+
+    Scalar pointers become unranked memrefs (`memref<*xT>`). Pointer arguments
+    of the lowered entry functions are bare pointers: callers must pass
+    descriptors whose offset is zero, as the bare-pointer calling convention
+    of `convert-memref-args-to-ptr-args` does.
   }];
   let dependentDialects = [
     "cuda_tile::CudaTileDialect",
