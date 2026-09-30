@@ -25,6 +25,10 @@ namespace tileir {
 /// Every rewrite is proven exact with integer range analysis.
 void rescaleTileLoops(Operation *root);
 
+/// Wrap the body of every scf.for that allocates on the stack in a
+/// memref.alloca_scope, which cuda_tile.for implies but scf.for does not.
+void scopeLoopAllocations(Operation *root);
+
 /// Collect the patterns that optimize the converted IR locally.
 void populatePostConversionPatterns(RewritePatternSet &patterns);
 

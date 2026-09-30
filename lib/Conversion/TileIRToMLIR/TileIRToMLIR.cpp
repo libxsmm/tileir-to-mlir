@@ -3266,35 +3266,6 @@ static void populateTileIRToMLIRConversionPatterns(
 // Pass Definition
 //===----------------------------------------------------------------------===//
 
-/// cuda_tile.for is an automatic allocation scope but scf.for is not: wrap the
-/// body of every lowered loop that allocates in a memref.alloca_scope so that
-/// its stack allocations are released at the end of each iteration.
-static void scopeLoopAllocations(ModuleOp module) {
-  llvm::SetVector<scf::ForOp> loops;
-  module.walk([&](memref::AllocaOp alloca) {
-    Operation *scope = alloca->getParentOp();
-    while (scope && !isa<scf::ForOp>(scope) &&
-           !scope->hasTrait<OpTrait::AutomaticAllocationScope>())
-      scope = scope->getParentOp();
-    if (auto loop = dyn_cast_or_null<scf::ForOp>(scope))
-      loops.insert(loop);
-  });
-  for (scf::ForOp loop : loops) {
-    Block *body = loop.getBody();
-    auto yield = cast<scf::YieldOp>(body->getTerminator());
-    OpBuilder builder(yield);
-    auto scope = memref::AllocaScopeOp::create(builder, loop.getLoc(),
-                                               yield.getOperandTypes());
-    Block *scopeBody = builder.createBlock(&scope.getBodyRegion());
-    scopeBody->getOperations().splice(scopeBody->end(), body->getOperations(),
-                                      body->begin(), scope->getIterator());
-    builder.setInsertionPointToEnd(scopeBody);
-    memref::AllocaScopeReturnOp::create(builder, loop.getLoc(),
-                                        yield.getOperands());
-    yield->setOperands(scope.getResults());
-  }
-}
-
 /// Pass driver for lowering Tile IR to GPU/vector/scf/arith/memref.
 struct ConvertTileIRToMLIRPass
     : public impl::ConvertTileIRToMLIRPassBase<ConvertTileIRToMLIRPass> {
@@ -3340,7 +3311,7 @@ struct ConvertTileIRToMLIRPass
       return signalPassFailure();
 
     tileir::rescaleTileLoops(module);
-    scopeLoopAllocations(module);
+    tileir::scopeLoopAllocations(module);
 
     RewritePatternSet postConversionPatterns(ctx);
     tileir::populatePostConversionPatterns(postConversionPatterns);

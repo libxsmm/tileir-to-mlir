@@ -13,6 +13,7 @@
 #include "mlir/Analysis/DataFlow/Utils.h"
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Dominance.h"
@@ -561,5 +562,31 @@ void mlir::tileir::rescaleTileLoops(Operation *root) {
       mul->getResult(0).replaceAllUsesWith(iv);
       eraseDeadChain(mul);
     }
+  }
+}
+
+void mlir::tileir::scopeLoopAllocations(Operation *root) {
+  llvm::SetVector<scf::ForOp> loops;
+  root->walk([&](memref::AllocaOp alloca) {
+    Operation *scope = alloca->getParentOp();
+    while (scope && !isa<scf::ForOp>(scope) &&
+           !scope->hasTrait<OpTrait::AutomaticAllocationScope>())
+      scope = scope->getParentOp();
+    if (auto loop = dyn_cast_or_null<scf::ForOp>(scope))
+      loops.insert(loop);
+  });
+  for (scf::ForOp loop : loops) {
+    Block *body = loop.getBody();
+    auto yield = cast<scf::YieldOp>(body->getTerminator());
+    OpBuilder builder(yield);
+    auto scope = memref::AllocaScopeOp::create(builder, loop.getLoc(),
+                                               yield.getOperandTypes());
+    Block *scopeBody = builder.createBlock(&scope.getBodyRegion());
+    scopeBody->getOperations().splice(scopeBody->end(), body->getOperations(),
+                                      body->begin(), scope->getIterator());
+    builder.setInsertionPointToEnd(scopeBody);
+    memref::AllocaScopeReturnOp::create(builder, loop.getLoc(),
+                                        yield.getOperands());
+    yield->setOperands(scope.getResults());
   }
 }
