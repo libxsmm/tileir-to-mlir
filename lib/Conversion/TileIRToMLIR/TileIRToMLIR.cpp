@@ -2607,7 +2607,9 @@ struct ConvertMmaF : public OpConversionPattern<cuda_tile::MmaFOp> {
 /// Convert cuda_tile.mmai to vector.contract (matmul-style contraction).
 ///
 /// Lowering mirrors mmaf and uses the same indexing-map / iterator builder.
-/// The only semantic difference here is element type domain (integer).
+/// vector.contract promotes narrower integer operands by sign extension, so
+/// operands are first extended to the accumulator element type according to
+/// their signedness.
 struct ConvertMmaI : public OpConversionPattern<cuda_tile::MmaIOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -2625,19 +2627,23 @@ struct ConvertMmaI : public OpConversionPattern<cuda_tile::MmaIOp> {
       return rewriter.notifyMatchFailure(
           op, "only 2D or 3D (batched) mmai is supported");
 
-    auto signLhs = op.getSignednessLhs();
-    auto signRhs = op.getSignednessRhs();
-    // Explicit combining kind = add (mmai is integer multiply-accumulate).
-    auto newOp = rewriter.replaceOpWithNewOp<vector::ContractionOp>(
-        op, adaptor.getLhs(), adaptor.getRhs(), adaptor.getAcc(),
+    Type accElemTy = vecResultTy.getElementType();
+    auto extendToAcc = [&](Value operand,
+                           cuda_tile::Signedness signedness) -> Value {
+      auto operandTy = cast<VectorType>(operand.getType());
+      if (operandTy.getElementType() == accElemTy)
+        return operand;
+      auto extTy = operandTy.clone(accElemTy);
+      if (signedness == cuda_tile::Signedness::Unsigned)
+        return arith::ExtUIOp::create(rewriter, op.getLoc(), extTy, operand);
+      return arith::ExtSIOp::create(rewriter, op.getLoc(), extTy, operand);
+    };
+    Value lhs = extendToAcc(adaptor.getLhs(), op.getSignednessLhs());
+    Value rhs = extendToAcc(adaptor.getRhs(), op.getSignednessRhs());
+    rewriter.replaceOpWithNewOp<vector::ContractionOp>(
+        op, lhs, rhs, adaptor.getAcc(),
         rewriter.getAffineMapArrayAttr({spec->mapA, spec->mapB, spec->mapC}),
         rewriter.getArrayAttr(spec->iterTypes), vector::CombiningKind::ADD);
-    newOp->setAttr(
-        "tir-dropped-signedness-lhs",
-        rewriter.getStringAttr(cuda_tile::stringifySignedness(signLhs)));
-    newOp->setAttr(
-        "tir-dropped-signedness-rhs",
-        rewriter.getStringAttr(cuda_tile::stringifySignedness(signRhs)));
     return success();
   }
 };

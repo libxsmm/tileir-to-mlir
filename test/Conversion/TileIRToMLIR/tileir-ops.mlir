@@ -296,7 +296,9 @@ cuda_tile.module @ops_module {
     %rhs0 = constant <i8: 0> : tile<8x2xi8>
     // CHECK: %[[MMAI_ACC0:.*]] = arith.constant dense<0> : vector<4x2xi32>
     %acc0 = constant <i32: 0> : tile<4x2xi32>
-    // CHECK: %[[MMAI_R0:.*]] = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %[[MMAI_LHS0]], %[[MMAI_RHS0]], %[[MMAI_ACC0]] {"tir-dropped-signedness-lhs" = "signed", "tir-dropped-signedness-rhs" = "signed"} : vector<4x8xi8>, vector<8x2xi8> into vector<4x2xi32>
+    // CHECK: %[[MMAI_LHS0_EXT:.*]] = arith.extsi %[[MMAI_LHS0]] : vector<4x8xi8> to vector<4x8xi32>
+    // CHECK: %[[MMAI_RHS0_EXT:.*]] = arith.extsi %[[MMAI_RHS0]] : vector<8x2xi8> to vector<8x2xi32>
+    // CHECK: %[[MMAI_R0:.*]] = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %[[MMAI_LHS0_EXT]], %[[MMAI_RHS0_EXT]], %[[MMAI_ACC0]] : vector<4x8xi32>, vector<8x2xi32> into vector<4x2xi32>
     %0 = mmai %lhs0, %rhs0, %acc0 signed signed : tile<4x8xi8>, tile<8x2xi8>, tile<4x2xi32>
 
     // CHECK: %[[MMAI_LHS1:.*]] = arith.constant dense<0> : vector<2x4x8xi8>
@@ -305,8 +307,10 @@ cuda_tile.module @ops_module {
     %rhs1 = constant <i8: 0> : tile<2x8x2xi8>
     // CHECK: %[[MMAI_ACC1:.*]] = arith.constant dense<0> : vector<2x4x2xi32>
     %acc1 = constant <i32: 0> : tile<2x4x2xi32>
-    // CHECK: %[[MMAI_R1:.*]] = vector.contract {indexing_maps = [#map3, #map4, #map5], iterator_types = ["parallel", "parallel", "parallel", "reduction"], kind = #vector.kind<add>} %[[MMAI_LHS1]], %[[MMAI_RHS1]], %[[MMAI_ACC1]] {"tir-dropped-signedness-lhs" = "unsigned", "tir-dropped-signedness-rhs" = "unsigned"} : vector<2x4x8xi8>, vector<2x8x2xi8> into vector<2x4x2xi32>
-    %1 = mmai %lhs1, %rhs1, %acc1 unsigned unsigned : tile<2x4x8xi8>, tile<2x8x2xi8>, tile<2x4x2xi32>
+    // CHECK: %[[MMAI_LHS1_EXT:.*]] = arith.extui %[[MMAI_LHS1]] : vector<2x4x8xi8> to vector<2x4x8xi32>
+    // CHECK: %[[MMAI_RHS1_EXT:.*]] = arith.extsi %[[MMAI_RHS1]] : vector<2x8x2xi8> to vector<2x8x2xi32>
+    // CHECK: %[[MMAI_R1:.*]] = vector.contract {indexing_maps = [#map3, #map4, #map5], iterator_types = ["parallel", "parallel", "parallel", "reduction"], kind = #vector.kind<add>} %[[MMAI_LHS1_EXT]], %[[MMAI_RHS1_EXT]], %[[MMAI_ACC1]] : vector<2x4x8xi32>, vector<2x8x2xi32> into vector<2x4x2xi32>
+    %1 = mmai %lhs1, %rhs1, %acc1 unsigned signed : tile<2x4x8xi8>, tile<2x8x2xi8>, tile<2x4x2xi32>
     return
   }
 
