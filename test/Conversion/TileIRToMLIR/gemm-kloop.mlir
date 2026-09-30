@@ -1,10 +1,33 @@
+// RUN: tileir-to-mlir --convert-tileir-to-mlir %s | FileCheck %s
+// RUN: tileir-to-mlir --convert-tileir-to-mlir='target=cpu append-grid-args=true' %s | FileCheck %s --check-prefix=CPU
+
 // An implementation of GEMM in cuda_tile.
 //
-// Kernel computes MxNxK with 128x128x64 Tile Size.
+// Kernel computes MxNxK with 256x128x64 Tile Size.
 // Computes F32 += f16 * f16 + 0.0
 //
 // This implementation does tiling, and reduction over
 // K for dynamic sizes.
+
+// CHECK-LABEL: gpu.func @gemm_kloop_kernel(
+// CHECK-SAME:      %[[A:[a-z0-9]+]]: memref<*xf16>, %[[B:[a-z0-9]+]]: memref<*xf16>, %[[C:[a-z0-9]+]]: memref<*xf32>
+// CHECK-DAG:     %[[AV:.*]] = memref.reinterpret_cast %[[A]]
+// CHECK-DAG:     %[[BV:.*]] = memref.reinterpret_cast %[[B]]
+// CHECK-DAG:     %[[CV:.*]] = memref.reinterpret_cast %[[C]]
+// The loop over K tiles steps through elements, so it indexes the views directly.
+// CHECK:         %[[RES:.*]] = scf.for %[[K:.*]] = %{{.*}} to %{{.*}} step %{{.*}} iter_args(%[[ACC:.*]] = %{{.*}}) -> (vector<256x128xf32>)
+// CHECK:           %[[AT:.*]] = vector.transfer_read %[[AV]][%[[K]], %{{.*}}], %{{.*}} {permutation_map = #{{.*}}} : {{.*}}, vector<256x64xf16>
+// CHECK:           %[[BT:.*]] = vector.transfer_read %[[BV]][%{{.*}}, %[[K]]], %{{.*}} {permutation_map = #{{.*}}} : {{.*}}, vector<64x128xf16>
+// CHECK:           %[[D:.*]] = vector.contract {{.*}} %[[AT]], %[[BT]], %[[ACC]] : vector<256x64xf16>, vector<64x128xf16> into vector<256x128xf32>
+// CHECK:           scf.yield %[[D]]
+// CHECK:         vector.transfer_write %[[RES]], %[[CV]]
+
+// CPU-LABEL: func.func @gemm_kloop_kernel(
+// CPU-NOT:     gpu.
+// CPU:         scf.for
+// CPU:           vector.contract
+// CPU:         vector.transfer_write
+
 cuda_tile.module @gemm_kloop_module {
     entry @gemm_kloop_kernel(
         %A_ptr: !cuda_tile.tile<!cuda_tile.ptr<f16>>,
@@ -82,28 +105,3 @@ cuda_tile.module @gemm_kloop_module {
     }
 }
 
-
-// gpu.module @payload_kernel {
-//   gpu.func @payload_kernel(%arg0: memref<?x?xf32>, %arg1: memref<?x?xf16>, %arg2: memref<?x?xf16>) kernel {
-//     %block_id_x = gpu.block_id x
-//     %block_id_y = gpu.block_id y
-//     %c256 = arith.constant 256 : index
-//     %c128 = arith.constant 128 : index
-//     %0 = ub.poison : f32
-//     %1 = ub.poison : f16
-//     %c0 = arith.constant 0 : index
-//     %c512 = arith.constant 512 : index
-//     %c64 = arith.constant 64 : index
-//     %2 = arith.muli %block_id_x, %c256 overflow<nsw> : index
-//     %3 = arith.muli %block_id_y, %c128 overflow<nsw> : index
-//     %4 = vector.transfer_read %arg0[%2, %3], %0 {in_bounds = [true, true]} : memref<?x?xf32>, vector<256x128xf32>
-//     %5 = scf.for %arg3 = %c0 to %c512 step %c64 iter_args(%arg4 = %4) -> (vector<256x128xf32>) {
-//       %6 = vector.transfer_read %arg1[%2, %arg3], %1 {in_bounds = [true, true]} : memref<?x?xf16>, vector<256x64xf16>
-//       %7 = vector.transfer_read %arg2[%arg3, %3], %1 {in_bounds = [true, true]} : memref<?x?xf16>, vector<64x128xf16>
-//       %8 = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %6, %7, %arg4 : vector<256x64xf16>, vector<64x128xf16> into vector<256x128xf32>
-//       scf.yield %8 : vector<256x128xf32>
-//     }
-//     vector.transfer_write %5, %arg0[%2, %3] {in_bounds = [true, true]} : vector<256x128xf32>, memref<?x?xf32>
-//     gpu.return
-//   }
-// }
