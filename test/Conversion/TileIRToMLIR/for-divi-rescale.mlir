@@ -1,10 +1,9 @@
 // RUN: tileir-to-mlir --convert-tileir-to-mlir %s | FileCheck %s
 
-// Verifies that when the upper bound of a cuda_tile.for loop is produced by
-// `cuda_tile.divi <expr>, <constant N>`, the loop is rescaled so that the
-// step is multiplied by N (the tile size) and the redundant `iv * N`
-// multiplication used for indexing inside the body is folded away by the
-// post-conversion cleanup.
+// A loop whose induction variable indexes a view tile by tile is rescaled to
+// iterate over element indices, so that the transfers index with the induction
+// variable itself. The rewrite is proven exact with integer range analysis;
+// where it cannot be proven, the loop stays in tile space.
 
 // CHECK-LABEL: gpu.func @for_divi_rescale_kernel
 cuda_tile.module @for_divi_rescale_module {
@@ -40,8 +39,6 @@ cuda_tile.module @for_divi_rescale_module {
     %result = for %k in (%i0 to %ub, step %i1) : tile<i32>
         iter_values(%acc_prev = %cst) -> (tile<128x32xf16>)
     {
-      // The transfer_read should index with %[[IV]] directly (the
-      // post-conversion cleanup folds `muli(divui(iv, 32), 32) -> iv`).
       // Because dim_map=[1, 0], the K (loop) dimension is the first index.
       // CHECK: vector.transfer_read %{{.*}}[%[[IV]], %{{.*}}]
       %A_frag, %t1 = load_view_tko weak %A_block[%bidx, %k] : partition_view<tile=(128x32), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>, tile<i32> -> tile<128x32xf16>, !cuda_tile.token
@@ -83,21 +80,61 @@ cuda_tile.module @for_wrapped_iv_index_rescale_module {
     %result = for %k in (%i0 to %ub, step %i1) : tile<i32>
         iter_values(%acc_prev = %cst) -> (tile<128x32xf16>)
     {
+      // The upper bound keeps %k below 2^26, so `(%k * 32) / 32` equals %k: the
+      // transfer indexes with the element-space induction variable and the
+      // tile index computation is removed.
+      // CHECK-NOT: arith.divsi
+      // CHECK: vector.transfer_read %{{.*}}[%[[WRAPPED_IV]], %{{.*}}]
       %scaled_k = muli %k, %c32 : tile<i32>
       %wrapped_k = divi %scaled_k, %c32 signed : tile<i32>
-      // The former `%scaled_k` lowering is exactly:
-      //   muli(index_cast(divui(%[[WRAPPED_IV]], 32)), 32) : i32.
-      // It must be replaced with index_cast(%[[WRAPPED_IV]]) before the
-      // remaining divsi; merely indexing the transfer from %[[WRAPPED_IV]]
-      // would not prove this dead scalar computation was folded.
-      // CHECK: %[[WRAPPED_TILE_IV:.*]] = arith.divui %[[WRAPPED_IV]], %{{.*}} : index
-      // CHECK: %[[WRAPPED_TILE_IV_I32:.*]] = arith.index_cast %[[WRAPPED_TILE_IV]] : index to i32
-      // CHECK-NOT: arith.muli %[[WRAPPED_TILE_IV_I32]], {{.*}} : i32
-      // CHECK: %[[FOLDED_IV_I32:.*]] = arith.index_cast %[[WRAPPED_IV]] : index to i32
-      // CHECK: %{{.*}} = arith.divsi %[[FOLDED_IV_I32]], %{{.*}} : i32
-      // CHECK: vector.transfer_read %{{.*}}[%[[WRAPPED_IV]], %{{.*}}]
       %A_frag, %t1 = load_view_tko weak %A_block[%bidx, %wrapped_k] : partition_view<tile=(128x32), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>, tile<i32> -> tile<128x32xf16>, !cuda_tile.token
       continue %A_frag : tile<128x32xf16>
+    }
+    return
+  }
+}
+
+// Without a bound on %k, `(%k * 32) / 32` may differ from %k because the
+// multiplication can overflow, so the loop stays in tile space.
+
+// CHECK-LABEL: gpu.func @for_unbounded_wrapped_iv_kernel
+// CHECK: scf.for %[[UNBOUNDED_IV:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
+// CHECK: %[[UNBOUNDED_IV_I32:.*]] = arith.index_cast %[[UNBOUNDED_IV]] : index to i32
+// CHECK: arith.muli %[[UNBOUNDED_IV_I32]], %{{.*}} : i32
+cuda_tile.module @for_unbounded_wrapped_iv_module {
+  entry @for_unbounded_wrapped_iv_kernel(%A: !cuda_tile.tensor_view<?xf32, strides=[1]>,
+                                         %n: !cuda_tile.tile<i32>) {
+    %c0 = constant <i32: 0> : tile<i32>
+    %c1 = constant <i32: 1> : tile<i32>
+    %c32 = constant <i32: 32> : tile<i32>
+    %pv = make_partition_view %A : partition_view<tile=(32), tensor_view<?xf32, strides=[1]>>
+    for %k in (%c0 to %n, step %c1) : tile<i32> {
+      %scaled_k = muli %k, %c32 : tile<i32>
+      %wrapped_k = divi %scaled_k, %c32 signed : tile<i32>
+      %x, %t = load_view_tko weak %pv[%wrapped_k] : partition_view<tile=(32), tensor_view<?xf32, strides=[1]>>, tile<i32> -> tile<32xf32>, !cuda_tile.token
+      continue
+    }
+    return
+  }
+}
+
+// Only transfer indices are rewritten: `(%iv / 3) * 3` computed for a store is
+// kept, as it differs from %iv for negative %iv.
+
+// CHECK-LABEL: gpu.func @scalar_div_mul_kept
+// CHECK: %[[DIV:.*]] = arith.divui %{{.*}}, %{{.*}} : i32
+// CHECK: %[[MUL:.*]] = arith.muli %[[DIV]], %{{.*}} : i32
+// CHECK: memref.store %[[MUL]]
+cuda_tile.module @scalar_div_mul_module {
+  entry @scalar_div_mul_kept(%p: !cuda_tile.tile<!cuda_tile.ptr<i32>>) {
+    %lb = constant <i32: -3> : tile<i32>
+    %ub = constant <i32: 3> : tile<i32>
+    %c3 = constant <i32: 3> : tile<i32>
+    for %iv in (%lb to %ub, step %c3) : tile<i32> {
+      %d = divi %iv, %c3 unsigned : tile<i32>
+      %m = muli %d, %c3 : tile<i32>
+      %t = store_ptr_tko weak %p, %m : tile<ptr<i32>>, tile<i32> -> !cuda_tile.token
+      continue
     }
     return
   }

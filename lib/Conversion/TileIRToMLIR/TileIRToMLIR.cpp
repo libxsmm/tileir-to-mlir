@@ -25,6 +25,8 @@
 
 #include "mlir/Conversion/TileIRToMLIR/TileIRToMLIR.h"
 
+#include "PostConversion.h"
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -1724,20 +1726,13 @@ struct ConvertFma : public OpConversionPattern<cuda_tile::FmaOp> {
   }
 };
 
-/// Convert cuda_tile.for to scf.for.
+/// Convert cuda_tile.for to scf.for over `index`.
 ///
-///   - Create scf.ForOp with bounds cast to `index` and initial values
-///     forwarded.
-///   - If the induction variable indexes a `partition_view` along a statically
-///     known tile-shape axis (directly, or as the value-preserving
-///     `divi(muli(iv, N), N)`), rescale `lb`/`ub`/`step` from tile space to
-///     element space by that tile size and replace body uses of the IV with
-///     `divui(new_iv, tile_size)` so the tile-space index is recovered.
-///   - Convert the region types and merge the original body into the new one,
-///     replacing the induction-variable and iter-arg block arguments.
-///
-/// `unsignedCmp` maps to scf.for's `unsignedCmp`; the bounds are then
-/// zero-extended to `index`.
+/// The bounds are sign-extended to `index`, or zero-extended for `unsignedCmp`,
+/// which maps to scf.for's `unsignedCmp`. The body is merged into the new loop
+/// with the induction variable cast back to its original type. Loops whose
+/// induction variable indexes tiles are rescaled after the conversion (see
+/// rescaleTileLoops).
 struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -1755,112 +1750,6 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
     Value lb = toIndex(adaptor.getLowerBound());
     Value ub = toIndex(adaptor.getUpperBound());
     Value step = toIndex(adaptor.getStep());
-
-    // Infer the loop-axis tile size from the partition_view tile shapes at the
-    // load_view_tko/store_view_tko indices that are semantically the induction
-    // variable. The same tile shape is what buildTransferViewAccessPlan
-    // multiplies by when forming element-space memref indices, so deriving the
-    // loop step from it keeps step and per-tile index scaling consistent.
-    //
-    // Frontends sometimes materialize that tile-space index as
-    // `divi(muli(iv, N), N)` rather than a direct `%iv`. For round-to-zero
-    // division `(iv * N) / N == iv` exactly, so such indices are normalized to
-    // a direct IV use; that lets the merged body see the recovered tile index
-    // `divui(new_iv, N)` directly and keeps the transfer lowering on the same
-    // path as a plain `%iv` index. Detection is read-only; the normalization is
-    // applied through the rewriter only once we commit to rescaling.
-    Value origIV = op.getInductionVar();
-    auto stripAssume = [](Value value) {
-      while (auto assume = value.getDefiningOp<cuda_tile::AssumeOp>())
-        value = assume.getValue();
-      return value;
-    };
-    auto matchScalarI32Constant = [&](Value value) -> std::optional<int64_t> {
-      value = stripAssume(value);
-      DenseIntElementsAttr ints;
-      if (!matchPattern(value, m_Constant(&ints)) || !ints.isSplat())
-        return std::nullopt;
-      return ints.getSplatValue<APInt>().getSExtValue();
-    };
-    // Returns true when `idx` is semantically `origIV` as a tile index of the
-    // given size: either a direct use, or `divi(muli(iv, N), N)`
-    // (round-to-zero).
-    auto matchesLoopTileIndex = [&](Value idx, int64_t expectedTileSize) {
-      idx = stripAssume(idx);
-      if (idx == origIV)
-        return true;
-      auto div = idx.getDefiningOp<cuda_tile::DivIOp>();
-      if (!div || div.getRounding() != cuda_tile::RoundingMode::ZERO)
-        return false;
-      if (matchScalarI32Constant(div.getRhs()) != expectedTileSize)
-        return false;
-      auto mul = stripAssume(div.getLhs()).getDefiningOp<cuda_tile::MulIOp>();
-      if (!mul)
-        return false;
-      for (auto [maybeIV, maybeCst] :
-           {std::pair<Value, Value>(mul.getLhs(), mul.getRhs()),
-            std::pair<Value, Value>(mul.getRhs(), mul.getLhs())})
-        if (stripAssume(maybeIV) == origIV &&
-            matchScalarI32Constant(maybeCst) == expectedTileSize)
-          return true;
-      return false;
-    };
-
-    // Read-only scan: derive the tile size and remember which (op, operand)
-    // index positions need normalizing to a direct IV use.
-    int64_t tileSize = 0;
-    SmallVector<std::pair<Operation *, unsigned>> normalizeTargets;
-    auto inspectViewUse = [&](Operation *owner, Value view,
-                              OperandRange indices) -> bool {
-      auto pvTy = dyn_cast<cuda_tile::PartitionViewType>(view.getType());
-      if (!pvTy)
-        return true;
-      auto shape = pvTy.getTileShape().asArrayRef();
-      for (auto [pos, idx] : llvm::enumerate(indices)) {
-        if (pos >= shape.size())
-          return false;
-        int64_t sz = shape[pos];
-        if (sz <= 0)
-          return false;
-        if (!matchesLoopTileIndex(idx, sz))
-          continue;
-        if (tileSize != 0 && tileSize != sz)
-          return false;
-        tileSize = sz;
-        if (idx != origIV)
-          normalizeTargets.emplace_back(owner, pos);
-      }
-      return true;
-    };
-    WalkResult walkResult = op.getBody()->walk([&](Operation *bodyOp) {
-      bool ok = true;
-      if (auto ld = dyn_cast<cuda_tile::LoadViewTkoOp>(bodyOp))
-        ok = inspectViewUse(ld, ld.getView(), ld.getIndex());
-      else if (auto st = dyn_cast<cuda_tile::StoreViewTkoOp>(bodyOp))
-        ok = inspectViewUse(st, st.getView(), st.getIndex());
-      return ok ? WalkResult::advance() : WalkResult::interrupt();
-    });
-    if (walkResult.wasInterrupted())
-      tileSize = 0;
-
-    if (tileSize > 0) {
-      // Normalize the matched `divi(muli(iv, N), N)` indices to a direct IV use
-      // (value-preserving) so the merged body indexes with `divui(new_iv, N)`.
-      for (auto [owner, pos] : normalizeTargets) {
-        unsigned idxPos = pos;
-        MutableOperandRange indices =
-            isa<cuda_tile::LoadViewTkoOp>(owner)
-                ? cast<cuda_tile::LoadViewTkoOp>(owner).getIndexMutable()
-                : cast<cuda_tile::StoreViewTkoOp>(owner).getIndexMutable();
-        rewriter.modifyOpInPlace(
-            owner, [&] { indices.slice(idxPos, 1).assign(origIV); });
-      }
-      Value tileSizeVal =
-          arith::ConstantIndexOp::create(rewriter, loc, tileSize);
-      lb = arith::MulIOp::create(rewriter, loc, lb, tileSizeVal);
-      ub = arith::MulIOp::create(rewriter, loc, ub, tileSizeVal);
-      step = arith::MulIOp::create(rewriter, loc, step, tileSizeVal);
-    }
 
     auto newForOp = scf::ForOp::create(
         rewriter, loc, lb, ub, step, flattenValues(adaptor.getInitValues()),
@@ -1882,21 +1771,9 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
     SmallVector<Value> replacingValues;
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToStart(newBody);
-
-    Value ivSrc = newForOp.getInductionVar();
-    if (tileSize > 0) {
-      // The loop iterates in element space; recover the tile-space index
-      // that body ops expect with divui(iv, tileSize).
-      Value tileSizeVal =
-          arith::ConstantIndexOp::create(rewriter, loc, tileSize);
-      ivSrc = arith::DivUIOp::create(rewriter, loc, ivSrc, tileSizeVal);
-    }
-    Value iv = castValueToType(rewriter, loc, ivSrc,
-                               oldBody->getArgument(0).getType());
-    if (!iv)
-      return rewriter.notifyMatchFailure(
-          op, "for induction variable could not be converted to body type");
-    replacingValues.push_back(iv);
+    replacingValues.push_back(arith::IndexCastOp::create(
+        rewriter, loc, oldBody->getArgument(0).getType(),
+        newForOp.getInductionVar()));
     for (auto arg : newForOp.getRegionIterArgs())
       replacingValues.push_back(arg);
 
@@ -4014,6 +3891,7 @@ struct ConvertTileIRToMLIRPass
                                       std::move(patterns))))
       return signalPassFailure();
 
+    tileir::rescaleTileLoops(module);
     scopeLoopAllocations(module);
 
     // Fold select(mask, transfer_read(.., pad), splat(pad)) into a masked
@@ -4076,95 +3954,6 @@ struct ConvertTileIRToMLIRPass
         op.erase();
         readOp.erase();
       }
-    }
-
-    // Fold muli(index_cast(divui(iv, c)), c) -> index_cast(iv) when `iv` is
-    // the induction variable of a loop whose lower bound and step are both
-    // multiples of `c`. These patterns are produced when ConvertFor rescales
-    // loop bounds and inserts a divui in the body; once a transfer op then
-    // multiplies the recovered tile-space index by the same tile size, the
-    // round-trip collapses. The divui result may be wrapped in index_cast
-    // ops, and the two `c` operands may be distinct constants with different
-    // integer types.
-    //
-    // Collect the rewrites first and apply them afterwards: erasing the op
-    // currently being visited would invalidate the walker's iterator.
-    auto getIntegerConstant = [](Value value) -> std::optional<int64_t> {
-      while (auto cast = value.getDefiningOp<arith::IndexCastOp>())
-        value = cast.getIn();
-      if (auto constant = value.getDefiningOp<arith::ConstantIndexOp>())
-        return constant.value();
-      if (auto constant = value.getDefiningOp<arith::ConstantIntOp>())
-        return constant.value();
-      return std::nullopt;
-    };
-    auto isMultipleOf = [&](Value value, int64_t divisor) {
-      if (std::optional<int64_t> constant = getIntegerConstant(value))
-        return *constant % divisor == 0;
-      auto mul = value.getDefiningOp<arith::MulIOp>();
-      if (!mul)
-        return false;
-      for (Value operand : {mul.getLhs(), mul.getRhs()})
-        if (std::optional<int64_t> constant = getIntegerConstant(operand);
-            constant && *constant % divisor == 0)
-          return true;
-      return false;
-    };
-    auto isRescaledLoopInductionVar = [&](Value value, int64_t tileSize) {
-      while (auto cast = value.getDefiningOp<arith::IndexCastOp>())
-        value = cast.getIn();
-      auto inductionVar = dyn_cast<BlockArgument>(value);
-      if (!inductionVar)
-        return false;
-      auto forOp = dyn_cast<scf::ForOp>(
-          inductionVar.getOwner()->getParentOp());
-      return forOp && inductionVar == forOp.getInductionVar() &&
-             isMultipleOf(forOp.getLowerBound(), tileSize) &&
-             isMultipleOf(forOp.getStep(), tileSize);
-    };
-
-    SmallVector<std::pair<arith::MulIOp, Value>> mulFolds;
-    module.walk([&](arith::MulIOp op) {
-      for (auto [mulOperand, otherOperand] :
-           {std::pair(op.getLhs(), op.getRhs()),
-            std::pair(op.getRhs(), op.getLhs())}) {
-        Value v = mulOperand;
-        while (auto cast = v.getDefiningOp<arith::IndexCastOp>())
-          v = cast.getIn();
-        auto divOp = v.getDefiningOp<arith::DivUIOp>();
-        if (!divOp)
-          continue;
-        std::optional<int64_t> divisor = getIntegerConstant(divOp.getRhs());
-        std::optional<int64_t> multiplier =
-            getIntegerConstant(otherOperand);
-        if (!divisor || !multiplier || *divisor <= 0 ||
-            *divisor != *multiplier)
-          continue;
-        if (divOp.getLhs().getType() != op.getType() &&
-            !((isa<IndexType>(divOp.getLhs().getType()) &&
-               isa<IntegerType>(op.getType())) ||
-              (isa<IntegerType>(divOp.getLhs().getType()) &&
-               isa<IndexType>(op.getType()))))
-          continue;
-        if (!isRescaledLoopInductionVar(divOp.getLhs(), *divisor))
-          continue;
-        mulFolds.emplace_back(op, divOp.getLhs());
-        return;
-      }
-    });
-    for (auto [mulOp, replacement] : mulFolds) {
-      if (replacement.getType() != mulOp.getType()) {
-        OpBuilder builder(mulOp);
-        if (isa<IntegerType>(replacement.getType()) &&
-            isa<IndexType>(mulOp.getType()))
-          replacement = arith::IndexCastUIOp::create(
-              builder, mulOp.getLoc(), mulOp.getType(), replacement);
-        else
-          replacement = arith::IndexCastOp::create(
-              builder, mulOp.getLoc(), mulOp.getType(), replacement);
-      }
-      mulOp.replaceAllUsesWith(replacement);
-      mulOp->erase();
     }
 
     // Mark the module as a GPU container module when targeting the GPU. For the

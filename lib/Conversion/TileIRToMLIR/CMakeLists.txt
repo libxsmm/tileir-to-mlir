@@ -1,6 +1,7 @@
 add_library(TileIRToMLIR STATIC
   ConvertMemrefArgsToRankedMemref.cpp
   ConvertMemrefArgsToPtrArgs.cpp
+  PostConversion.cpp
   TileIRToMLIR.cpp
   TileIRPtrToView.cpp
 )
@@ -12,6 +13,7 @@ endif()
 
 target_link_libraries(TileIRToMLIR
   PRIVATE
+  MLIRAnalysis
   MLIRArithDialect
   MLIRFuncDialect
   MLIRGPUDialect

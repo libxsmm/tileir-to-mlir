@@ -503,16 +503,11 @@ module {
       // CHECK:   %[[C32:.*]] = constant <i32: 32> : tile<i32>
       // CHECK:   %[[DIV:.*]] = divi %[[IV]], %[[C32]] unsigned
       // CHECK:   load_view_tko weak %[[PV]][%[[DIV]]]
-      // The lowered transfer initially contains the exact casted round trip
-      // `muli(index_cast(divui(index_cast(iv), 32)), 32)`. The cleanup must
-      // replace it with an unsigned widening of the original i32 loop IV.
+      // The lowered transfer index `(iv / 32) * 32` is the induction variable
+      // itself because the loop starts at 0 and advances by 32.
       // CHECK-GPU: scf.for %[[LOOP_IV:.*]] =
-      // CHECK-GPU:   %[[LOOP_IV_I32:.*]] = arith.index_cast %[[LOOP_IV]] : index to i32
-      // CHECK-GPU:   %[[DIV_I32:.*]] = arith.divui %[[LOOP_IV_I32]], %{{.*}} : i32
-      // CHECK-GPU:   %[[DIV_INDEX:.*]] = arith.index_cast %[[DIV_I32]] : i32 to index
-      // CHECK-GPU-NOT: arith.muli %[[DIV_INDEX]], {{.*}} : index
-      // CHECK-GPU:   %[[FOLDED_INDEX:.*]] = arith.index_castui %[[LOOP_IV_I32]] : i32 to index
-      // CHECK-GPU:   vector.transfer_read %{{.*}}[%[[FOLDED_INDEX]]], %{{.*}} : memref<?xf32, strided<[1], offset: ?>>, vector<32xf32>
+      // CHECK-GPU-NOT: arith.divui
+      // CHECK-GPU:   vector.transfer_read %{{.*}}[%[[LOOP_IV]]], %{{.*}} : memref<?xf32, strided<[1], offset: ?>>, vector<32xf32>
       for %iv in (%c0 to %N, step %c32) : tile<i32> {
         %iv_1d = reshape %iv : tile<i32> -> tile<1xi32>
         %iv_bc = broadcast %iv_1d : tile<1xi32> -> tile<32xi32>
