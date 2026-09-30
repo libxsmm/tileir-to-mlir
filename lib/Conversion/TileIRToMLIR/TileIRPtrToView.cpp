@@ -50,8 +50,8 @@
 // load_ptr_tko/store_ptr_tko untouched whenever it cannot fully recover the
 // access, rather than fabricating a shape/stride. In particular it requires:
 //   * a global size recovered from the mask for every dimension, except for
-//     dimensions that a fully understood mask does not bound, which get a
-//     static extent of one tile;
+//     dimensions that a fully understood mask does not bound: the view spans
+//     one tile along them, and the base pointer moves to that tile;
 //   * the innermost dimension to be contiguous (unit stride) and every other
 //     dimension to carry an explicitly recovered stride (row-major layout);
 //   * exactly one loop-advancing (start-less) dimension when the access is
@@ -1169,6 +1169,9 @@ struct BuiltViews {
   SmallVector<Value> dynamicShape;
   SmallVector<Value> dynamicStride;
   SmallVector<Value> indices;
+  /// i64 element offsets that move the base pointer to the tile along the
+  /// dimensions that the mask does not bound.
+  SmallVector<Value> baseShifts;
 };
 
 /// Given a per-dim `start` scalar that is expected to be a sum of terms of the
@@ -1314,9 +1317,15 @@ static Value buildZeroI32(OpBuilder &b, Location loc) {
 ///
 /// When `access.loop` is set, the index for the advancing dimension becomes
 /// `initial_idx + loopIdx` (the loop induction variable).
+///
+/// A dimension that the mask does not bound has no known extent, so the view
+/// spans only the accessed tile along it: its index is 0, and its tile offset
+/// is returned in `out.baseShifts`, built right after the values it uses so
+/// that the views can still be hoisted.
 static LogicalResult buildViews(OpBuilder &b, Location loc,
                                 const PtrAccess &access, Type elementType,
-                                PaddingValueAttr padding, BuiltViews &out) {
+                                PaddingValueAttr padding, DominanceInfo &dom,
+                                Operation *anchor, BuiltViews &out) {
   MLIRContext *ctx = b.getContext();
   unsigned rank = access.dims.size();
 
@@ -1342,6 +1351,32 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
       return failure();
   }
 
+  // `factor * scale [* stride]` in i64, like the address arithmetic of views.
+  auto buildElementOffset = [&](Value factor, int64_t scale,
+                                Value stride) -> Value {
+    SmallVector<Value> operands{factor};
+    if (stride)
+      operands.push_back(stride);
+    OpBuilder sb(ctx);
+    setInsertionPointAfterLatestDef(sb, dom, operands, anchor);
+    auto i64Ty = TileType::get(ctx, {}, sb.getI64Type());
+    auto toI64 = [&](Value v) -> Value {
+      if (cast<TileType>(v.getType()).getElementType().isInteger(64))
+        return v;
+      return ExtIOp::create(sb, loc, i64Ty, v, Signedness::Signed);
+    };
+    Value offset = toI64(factor);
+    if (stride)
+      offset = MulIOp::create(sb, loc, offset, toI64(stride));
+    if (scale != 1) {
+      auto attr = DenseElementsAttr::get(i64Ty, APInt(64, scale));
+      Value scaleCst = ConstantOp::create(sb, loc, i64Ty,
+                                          cast<DenseTypedElementsAttr>(attr));
+      offset = MulIOp::create(sb, loc, offset, scaleCst);
+    }
+    return offset;
+  };
+
   // 1) Compute per-dim partition indices by stripping the `tileSize * idx`
   //    multiplication out of the `start` scalar.  Bail early when this fails
   //    (the rewrite would otherwise lose information about the alignment of
@@ -1360,6 +1395,15 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
     bool isLoopAdvancingDim = access.loop && !di.start;
 
     if (!di.start && !isLoopAdvancingDim) {
+      indices.push_back(buildZeroI32(b, loc));
+      continue;
+    }
+
+    bool bounded = di.size || di.staticSize;
+    int64_t staticStride = di.staticStride.value_or(1);
+    if (di.start && !bounded) {
+      out.baseShifts.push_back(
+          buildElementOffset(di.start, staticStride, di.stride));
       indices.push_back(buildZeroI32(b, loc));
       continue;
     }
@@ -1392,6 +1436,12 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
 
       // The partition index for this dim is just loopIdx (induction var).
       Value loopIdx = access.loop->inductionVar;
+      if (!bounded) {
+        out.baseShifts.push_back(
+            buildElementOffset(loopIdx, di.tileSize * staticStride, di.stride));
+        indices.push_back(buildZeroI32(b, loc));
+        continue;
+      }
       if (baseIdx) {
         baseIdx = AddIOp::create(b, loc, baseIdx, loopIdx);
       } else {
@@ -1409,9 +1459,9 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
   //        `K - loopIdx*tileSize`; recover the absolute `K` from it.
   //      * unmasked -- the source loads it unconditionally.  This is only sound
   //        when the entire mask was understood (`maskFullyRecognized`), so that
-  //        the dimension is *provably* unbounded; we then give it a static,
-  //        tile-sized extent which the lowering turns into an unchecked
-  //        (in-bounds) access, faithfully reproducing the source.
+  //        the dimension is *provably* unbounded; the view then spans the one
+  //        tile that step 1 moved the base pointer to, which the lowering turns
+  //        into an unchecked (in-bounds) access.
   //    Layout: only the innermost dimension may be contiguous (unit stride);
   //    every outer dimension must carry an explicitly recovered stride.  This
   //    matches the canonical layout produced by the TileIR frontend.
@@ -1442,8 +1492,7 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
   }
 
   // Build the tensor-view shape/strides.  Masked dims take a dynamic extent
-  // from the recovered absolute size; unmasked dims take a static tile-sized
-  // extent (a multiple of the tile size) so the access lowers unchecked.
+  // from the recovered absolute size; unmasked dims span one tile.
   // Strides are dynamic for the outer dims and a static 1 for the contiguous
   // innermost dim.
   SmallVector<int64_t> shape(rank, TensorViewType::kDynamic);
@@ -1644,10 +1693,16 @@ static LogicalResult lowerAccess(OpBuilder &b, Location loc, Value ptr,
   access.base = base;
 
   BuiltViews bv;
-  if (failed(buildViews(b, loc, access, elemTy, padding, bv))) {
+  if (failed(
+          buildViews(b, loc, access, elemTy, padding, fwd.dom, anchor, bv))) {
     if (failureReason)
       *failureReason = "view shape or partition index recovery";
     return failure();
+  }
+  for (Value shift : bv.baseShifts) {
+    OpBuilder sb(b.getContext());
+    setInsertionPointAfterLatestDef(sb, fwd.dom, {base, shift}, anchor);
+    base = OffsetOp::create(sb, loc, base.getType(), base, shift).getResult();
   }
 
   // Forward any `assume` metadata the source attached to the operands we reuse

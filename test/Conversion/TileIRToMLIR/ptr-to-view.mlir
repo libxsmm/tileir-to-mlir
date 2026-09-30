@@ -1158,8 +1158,9 @@ module {
     // residual form `K - loopIdx*16`; the M dimension is unmasked. PtrToView
     // must:
     //   * recover the absolute K extent (%K) from the residual bound,
-    //   * give the unmasked M dimension a static (in-bounds) extent of 64,
-    //   * use blockId for M and the induction var for K as partition indices,
+    //   * move the base pointer to the block's rows, where the view spans the
+    //     one tile of the unmasked M dimension (index 0),
+    //   * use the induction var as the K partition index,
     //   * hoist the now loop-invariant view out of the loop.
     // The advance (16 elements) equals step(1) * tileSize(16) * stride(1), so
     // the raw induction variable is a faithful K partition index.
@@ -1198,14 +1199,20 @@ module {
       %A_bc = broadcast %A_2d : tile<1x1xptr<f32>> -> tile<64x16xptr<f32>>
       %ptr_init = offset %A_bc, %off : tile<64x16xptr<f32>>, tile<64x16xi32> -> tile<64x16xptr<f32>>
 
-      // The view is loop-invariant: M is a static tile extent (unmasked), K is
+      // The view is loop-invariant: M spans the block's tile (unmasked), K is
       // the absolute extent recovered from the residual mask, row-major stride.
-      // CHECK: %[[TV:.*]] = make_tensor_view %{{.*}}, shape = [64, %{{.*}}], strides = [%{{.*}}, 1] : tile<i32> -> tensor_view<64x?xf32, strides=[?,1]>
+      // CHECK: %[[ROW_START:.*]] = muli %blockId_x, %{{.*}} : tile<i32>
+      // CHECK: %[[ROW_START64:.*]] = exti %[[ROW_START]] signed : tile<i32> -> tile<i64>
+      // CHECK: %[[STRIDE64:.*]] = exti %{{.*}} signed : tile<i32> -> tile<i64>
+      // CHECK: %[[ROW_OFF:.*]] = muli %[[ROW_START64]], %[[STRIDE64]] : tile<i64>
+      // CHECK: %[[BASE:.*]] = offset %{{.*}}, %[[ROW_OFF]] : tile<ptr<f32>>, tile<i64> -> tile<ptr<f32>>
+      // CHECK: %[[TV:.*]] = make_tensor_view %[[BASE]], shape = [64, %{{.*}}], strides = [%{{.*}}, 1] : tile<i32> -> tensor_view<64x?xf32, strides=[?,1]>
       // CHECK: %[[PV:.*]] = make_partition_view %[[TV]] : partition_view<tile=(64x16), {{.*}}>
       // CHECK: for %[[IV:.*]] in
-      // CHECK:   load_view_tko weak %[[PV]][%{{.*}}, %[[IV]]]
+      // CHECK:   %[[ZERO:.*]] = constant <i32: 0> : tile<i32>
+      // CHECK:   load_view_tko weak %[[PV]][%[[ZERO]], %[[IV]]]
       // CHECK-NOT: load_ptr_tko
-      // CHECK-GPU: memref.reinterpret_cast %{{.*}} to offset: [0], sizes: [64, %{{.*}}], strides: [%{{.*}}, 1]
+      // CHECK-GPU: memref.reinterpret_cast %{{.*}} to offset: [%{{.*}}], sizes: [64, %{{.*}}], strides: [%{{.*}}, 1]
       // CHECK-GPU: scf.for
       // CHECK-GPU:   vector.transfer_read %{{.*}}[%{{.*}}, %{{.*}}], %{{.*}} {in_bounds = [true, false]}
       %for = for %loopIdx in (%c0 to %K, step %c1) : tile<i32>
@@ -1217,6 +1224,65 @@ module {
         %resid_bc = broadcast %resid_2d : tile<1x1xi32> -> tile<1x16xi32>
         %kcmp = cmpi less_than %cols_2d, %resid_bc, signed : tile<1x16xi32> -> tile<1x16xi1>
         %mask = broadcast %kcmp : tile<1x16xi1> -> tile<64x16xi1>
+        %v, %t = load_ptr_tko weak %iterPtr, %mask, %pad : tile<64x16xptr<f32>>, tile<64x16xi1>, tile<64x16xf32> -> tile<64x16xf32>, !cuda_tile.token
+        %next = offset %iterPtr, %c16_2d : tile<64x16xptr<f32>>, tile<64x16xi32> -> tile<64x16xptr<f32>>
+        continue %next : tile<64x16xptr<f32>>
+      }
+      return
+    }
+
+    // As above, but only M is masked and the loop advances along the unmasked
+    // K dimension, so the base pointer moves to the K tile of each iteration.
+    // CHECK-LABEL: entry @matmul_lhs_loop_unmasked_k
+    // CHECK-GPU-LABEL: gpu.func @matmul_lhs_loop_unmasked_k
+    entry @matmul_lhs_loop_unmasked_k(%A: tile<ptr<f32>>, %M: tile<i32>, %K: tile<i32>, %stride_am: tile<i32>) {
+      %c0 = constant <i32: 0> : tile<i32>
+      %c1 = constant <i32: 1> : tile<i32>
+      %c64 = constant <i32: 64> : tile<i32>
+      %c16_2d = constant <i32: 16> : tile<64x16xi32>
+      %pad = constant <f32: 0.000000e+00> : tile<64x16xf32>
+
+      %blockId_x, %blockId_y, %blockId_z = get_tile_block_id : tile<i32>
+      %row_start = muli %blockId_x, %c64 : tile<i32>
+
+      %iota64 = iota : tile<64xi32>
+      %rs_1d = reshape %row_start : tile<i32> -> tile<1xi32>
+      %rs_bc = broadcast %rs_1d : tile<1xi32> -> tile<64xi32>
+      %rows = addi %rs_bc, %iota64 : tile<64xi32>
+      %rows_2d = reshape %rows : tile<64xi32> -> tile<64x1xi32>
+      %stride_2d = reshape %stride_am : tile<i32> -> tile<1x1xi32>
+      %stride_bc = broadcast %stride_2d : tile<1x1xi32> -> tile<64x1xi32>
+      %rows_strided = muli %rows_2d, %stride_bc : tile<64x1xi32>
+
+      %iota16 = iota : tile<16xi32>
+      %cols_2d = reshape %iota16 : tile<16xi32> -> tile<1x16xi32>
+
+      %rows_bc = broadcast %rows_strided : tile<64x1xi32> -> tile<64x16xi32>
+      %cols_bc = broadcast %cols_2d : tile<1x16xi32> -> tile<64x16xi32>
+      %off = addi %rows_bc, %cols_bc : tile<64x16xi32>
+      %A_2d = reshape %A : tile<ptr<f32>> -> tile<1x1xptr<f32>>
+      %A_bc = broadcast %A_2d : tile<1x1xptr<f32>> -> tile<64x16xptr<f32>>
+      %ptr_init = offset %A_bc, %off : tile<64x16xptr<f32>>, tile<64x16xi32> -> tile<64x16xptr<f32>>
+
+      %M_2d = reshape %M : tile<i32> -> tile<1x1xi32>
+      %M_bc = broadcast %M_2d : tile<1x1xi32> -> tile<64x1xi32>
+      %mcmp = cmpi less_than %rows_2d, %M_bc, signed : tile<64x1xi32> -> tile<64x1xi1>
+      %mask = broadcast %mcmp : tile<64x1xi1> -> tile<64x16xi1>
+
+      // CHECK: for %[[IV:.*]] in
+      // CHECK:   %[[IV64:.*]] = exti %[[IV]] signed : tile<i32> -> tile<i64>
+      // CHECK:   %[[TILE:.*]] = constant <i64: 16> : tile<i64>
+      // CHECK:   %[[K_OFF:.*]] = muli %[[IV64]], %[[TILE]] : tile<i64>
+      // CHECK:   %[[BASE:.*]] = offset %{{.*}}, %[[K_OFF]] : tile<ptr<f32>>, tile<i64> -> tile<ptr<f32>>
+      // CHECK:   %[[TV:.*]] = make_tensor_view %[[BASE]], shape = [%{{.*}}, 16], strides = [%{{.*}}, 1]
+      // CHECK:   %[[PV:.*]] = make_partition_view %[[TV]]
+      // CHECK:   %[[ZERO:.*]] = constant <i32: 0> : tile<i32>
+      // CHECK:   load_view_tko weak %[[PV]][%blockId_x, %[[ZERO]]]
+      // CHECK-NOT: load_ptr_tko
+      // CHECK-GPU: scf.for
+      // CHECK-GPU:   vector.transfer_read %{{.*}}[%{{.*}}, %{{.*}}], %{{.*}} {in_bounds = [false, true]}
+      %for = for %loopIdx in (%c0 to %K, step %c1) : tile<i32>
+          iter_values(%iterPtr = %ptr_init) -> (tile<64x16xptr<f32>>) {
         %v, %t = load_ptr_tko weak %iterPtr, %mask, %pad : tile<64x16xptr<f32>>, tile<64x16xi1>, tile<64x16xf32> -> tile<64x16xf32>, !cuda_tile.token
         %next = offset %iterPtr, %c16_2d : tile<64x16xptr<f32>>, tile<64x16xi32> -> tile<64x16xptr<f32>>
         continue %next : tile<64x16xptr<f32>>
