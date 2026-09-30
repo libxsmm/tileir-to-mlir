@@ -75,7 +75,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Conversion/TileIRToMLIR/TileIRPtrToView.h"
+#include "mlir/Conversion/TileIRToMLIR/Passes.h"
 
 #include "cuda_tile/Dialect/CudaTile/IR/Dialect.h"
 #include "cuda_tile/Dialect/CudaTile/IR/Ops.h"

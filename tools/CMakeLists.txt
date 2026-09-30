@@ -10,6 +10,8 @@ target_link_libraries(tileir-to-mlir
   MLIRFuncDialect
   MLIRFuncInlinerExtension
   MLIRGPUDialect
+  MLIRLLVMDialect
+  MLIRMathDialect
   MLIRMemRefDialect
   MLIRSCFDialect
   MLIRUBDialect

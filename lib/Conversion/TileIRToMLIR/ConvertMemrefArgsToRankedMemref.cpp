@@ -13,7 +13,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Conversion/TileIRToMLIR/ConvertMemrefArgsToRankedMemref.h"
+#include "mlir/Conversion/TileIRToMLIR/Passes.h"
 
 #include "ArgPromotionUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"

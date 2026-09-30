@@ -23,7 +23,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Conversion/TileIRToMLIR/TileIRToMLIR.h"
+#include "mlir/Conversion/TileIRToMLIR/Passes.h"
 
 #include "PostConversion.h"
 

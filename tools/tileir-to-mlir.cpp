@@ -10,15 +10,14 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Conversion/TileIRToMLIR/ConvertMemrefArgsToPtrArgs.h"
-#include "mlir/Conversion/TileIRToMLIR/ConvertMemrefArgsToRankedMemref.h"
-#include "mlir/Conversion/TileIRToMLIR/TileIRPtrToView.h"
-#include "mlir/Conversion/TileIRToMLIR/TileIRToMLIR.h"
+#include "mlir/Conversion/TileIRToMLIR/Passes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
@@ -27,14 +26,12 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Pass/PassManager.h"
-#include "mlir/Pass/PassOptions.h"
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 #include "mlir/Transforms/Passes.h"
 
 #include "llvm/ADT/StringRef.h"
-#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Process.h"
@@ -44,82 +41,37 @@
 #include "cuda_tile/Bytecode/Reader/BytecodeReader.h"
 #include "cuda_tile/Dialect/CudaTile/IR/Dialect.h"
 
-#include <iostream>
-
 int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
   registry.insert<
       mlir::arith::ArithDialect, mlir::func::FuncDialect, mlir::gpu::GPUDialect,
+      mlir::LLVM::LLVMDialect, mlir::math::MathDialect,
       mlir::memref::MemRefDialect, mlir::scf::SCFDialect, mlir::ub::UBDialect,
       mlir::vector::VectorDialect, mlir::cuda_tile::CudaTileDialect>();
 
   mlir::func::registerInlinerExtension(registry);
 
-  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
-    return mlir::createConvertTileIRToMLIRPass();
-  });
-  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
-    return mlir::createTileIRPtrToViewPass();
-  });
-  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
-    return mlir::createConvertMemrefArgsToPtrArgsPass();
-  });
-  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
-    return mlir::createConvertMemrefArgsToRankedMemrefPass();
-  });
+  mlir::registerTileIRToMLIRPasses();
 
-  // Composed pipeline covering the common path: raise Triton-style pointer
-  // arithmetic to view ops, then lower Tile IR to MLIR. All options of the
-  // core conversion pass are forwarded (--tileir-ptr-to-view has none). The
-  // arg-promotion passes are intentionally left out because they are a
-  // situational, mutually-exclusive ABI-shaping choice the caller adds
-  // explicitly.
-  struct TileIRToMLIRPipelineOptions
-      : public mlir::PassPipelineOptions<TileIRToMLIRPipelineOptions> {
-    Option<mlir::TileIRTarget> target{
-        *this, "target", llvm::cl::desc("Lowering target ('gpu' or 'cpu')"),
-        llvm::cl::init(mlir::TileIRTarget::GPU),
-        llvm::cl::values(
-            clEnumValN(mlir::TileIRTarget::GPU, "gpu",
-                       "Lower to a GPU container module"),
-            clEnumValN(mlir::TileIRTarget::CPU, "cpu",
-                       "Lower without the GPU container-module marker"))};
-    Option<bool> appendGridArgs{
-        *this, "append-grid-args",
-        llvm::cl::desc("Append six launch-coordinate i32 args to lowered entry "
-                       "signatures and source dim queries from them"),
-        llvm::cl::init(false)};
-    Option<bool> dropRoundingModes{
-        *this, "drop-rounding-modes",
-        llvm::cl::desc("Always drop source rounding-mode semantics and "
-                       "preserve them only as tir-dropped-rounding "
-                       "annotations"),
-        llvm::cl::init(false)};
-    Option<bool> assumeInBounds{
-        *this, "assume-in-bounds",
-        llvm::cl::desc("Assume all load and store ops are in bounds."),
-        llvm::cl::init(false)};
-    ListOption<int32_t> knownBlockSize{
-        *this, "known-block-size",
-        llvm::cl::desc("Block size (x, y, z) to set as the known_block_size "
-                       "attribute on generated gpu.func ops; must be empty or "
-                       "exactly three values")};
-  };
-  mlir::PassPipelineRegistration<TileIRToMLIRPipelineOptions>(
+  // The common path: raise Triton-style pointer arithmetic to view ops, then
+  // lower Tile IR. The arg-promotion passes are left out because they are
+  // mutually exclusive ABI choices that the caller adds explicitly.
+  mlir::registerPassPipeline(
       "tileir-to-mlir-pipeline",
-      "Raise Triton pointer arithmetic to view ops, then lower Tile IR to "
-      "GPU/vector/scf/arith/memref ops.",
-      [](mlir::OpPassManager &pm, const TileIRToMLIRPipelineOptions &opts) {
+      "Run --tileir-ptr-to-view, then --convert-tileir-to-mlir with the given "
+      "options",
+      [](mlir::OpPassManager &pm, llvm::StringRef options,
+         llvm::function_ref<mlir::LogicalResult(const llvm::Twine &)>
+             errorHandler) {
         pm.addPass(mlir::createTileIRPtrToViewPass());
-        mlir::ConvertTileIRToMLIRPassOptions passOpts;
-        passOpts.target = opts.target;
-        passOpts.appendGridArgs = opts.appendGridArgs;
-        passOpts.dropRoundingModes = opts.dropRoundingModes;
-        passOpts.assumeInBounds = opts.assumeInBounds;
-        passOpts.knownBlockSize.assign(opts.knownBlockSize.begin(),
-                                       opts.knownBlockSize.end());
-        pm.addPass(mlir::createConvertTileIRToMLIRPass(passOpts));
-      });
+        std::unique_ptr<mlir::Pass> convert =
+            mlir::createConvertTileIRToMLIRPass();
+        if (mlir::failed(convert->initializeOptions(options, errorHandler)))
+          return mlir::failure();
+        pm.addPass(std::move(convert));
+        return mlir::success();
+      },
+      [](llvm::function_ref<void(const mlir::detail::PassOptions &)>) {});
 
   mlir::registerTransformsPasses();
 
@@ -186,9 +138,6 @@ int main(int argc, char **argv) {
     module.get().getOperation()->print(os);
     os.flush();
     buffer = llvm::MemoryBuffer::getMemBufferCopy(text, inputFilename);
-    module.get().getOperation()->print(llvm::errs());
-    llvm::errs() << '\n';
-    
   } else {
     buffer = std::move(input);
   }

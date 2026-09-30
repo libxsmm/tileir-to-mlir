@@ -21,6 +21,7 @@ target_link_libraries(TileIRToMLIR
   MLIRGPUDialect
   MLIRLLVMCommonConversion
   MLIRLLVMDialect
+  MLIRMathDialect
   MLIRMemRefDialect
   MLIRSCFDialect
   MLIRUBDialect

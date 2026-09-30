@@ -30,7 +30,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Conversion/TileIRToMLIR/ConvertMemrefArgsToPtrArgs.h"
+#include "mlir/Conversion/TileIRToMLIR/Passes.h"
 
 #include "ArgPromotionUtils.h"
 #include "mlir/Conversion/LLVMCommon/MemRefBuilder.h"
