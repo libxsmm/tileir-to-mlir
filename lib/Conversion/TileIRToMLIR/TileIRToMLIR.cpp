@@ -2378,38 +2378,20 @@ struct ConvertPermute : public OpConversionPattern<cuda_tile::PermuteOp> {
 };
 
 /// Convert cuda_tile.ptr_to_ptr between pointers that convert to the same type,
-/// e.g. tf32 and f32 pointers on the CPU. Other casts fail: they would change
-/// the element type of an unranked memref, which memref.cast cannot.
-struct ConvertPtrToPtrCastOrFail
-    : public OpConversionPattern<cuda_tile::PtrToPtrOp> {
+/// e.g. tf32 and f32 pointers on the CPU, to its source. Other casts fail: they
+/// would change the element type of an unranked memref, which memref.cast
+/// cannot.
+struct ConvertPtrToPtr : public OpConversionPattern<cuda_tile::PtrToPtrOp> {
   using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::PtrToPtrOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto resultTy =
-        getConvertedResultTypeOrFail(op, this->getTypeConverter(), rewriter,
-                                     "cannot convert cast result type");
-    if (failed(resultTy))
-      return failure();
-
-    Value source = adaptor.getSource();
-    auto resultMemRefTy = dyn_cast<BaseMemRefType>(resultTy.value());
-    auto sourceMemRefTy = dyn_cast<BaseMemRefType>(source.getType());
-    if (!resultMemRefTy || !sourceMemRefTy)
+    if (adaptor.getSource().getType() !=
+        getTypeConverter()->convertType(op.getType()))
       return rewriter.notifyMatchFailure(
-          op, "ptr_to_ptr requires memref source/result after type conversion");
-
-    if (sourceMemRefTy == resultMemRefTy) {
-      rewriter.replaceOp(op, source);
-      return success();
-    }
-
-    if (!memref::CastOp::areCastCompatible(sourceMemRefTy, resultMemRefTy))
-      return rewriter.notifyMatchFailure(
-          op, "ptr_to_ptr cannot be represented as memref.cast");
-
-    rewriter.replaceOpWithNewOp<memref::CastOp>(op, resultTy.value(), source);
+          op, "ptr_to_ptr changes the converted pointer type");
+    rewriter.replaceOp(op, adaptor.getSource());
     return success();
   }
 };
@@ -2793,11 +2775,10 @@ static void populateTileIRToMLIRConversionPatterns(
       ConvertLoadPtrTkoRanked, ConvertLoadPtrTkoScalar, ConvertMakeTensorView,
       EraseTokenOp<cuda_tile::MakeTokenOp>, ConvertMaxF, ConvertMinF,
       ConvertMmaF, ConvertMmaI, ConvertMulhiI, ConvertMulI, ConvertOffsetRanked,
-      ConvertOffsetScalarPtr, ConvertNegI, ConvertPermute,
-      ConvertPtrToPtrCastOrFail, ConvertReduce, ConvertReshape, ConvertRsqrt,
-      ConvertScan, ConvertShLI, ConvertStorePtrTkoRanked,
-      ConvertStorePtrTkoScalar, ConvertSubI, ConvertTruncI, ConvertYield>(
-      converter, ctx);
+      ConvertOffsetScalarPtr, ConvertNegI, ConvertPermute, ConvertPtrToPtr,
+      ConvertReduce, ConvertReshape, ConvertRsqrt, ConvertScan, ConvertShLI,
+      ConvertStorePtrTkoRanked, ConvertStorePtrTkoScalar, ConvertSubI,
+      ConvertTruncI, ConvertYield>(converter, ctx);
 }
 
 //===----------------------------------------------------------------------===//
