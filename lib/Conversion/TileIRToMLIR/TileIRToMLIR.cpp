@@ -4132,6 +4132,9 @@ struct ConvertTileIRToMLIRPass
         auto readOp = op.getTrueValue().getDefiningOp<vector::TransferReadOp>();
         if (!readOp || !readOp->hasOneUse() || readOp.getMask())
           return;
+        // The mask is indexed in source (pre-permutation) order.
+        if (!readOp.getPermutationMap().isMinorIdentity())
+          return;
         // A scalar condition does not select per lane.
         if (!isa<VectorType>(op.getCondition().getType()))
           return;
