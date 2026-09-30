@@ -54,10 +54,11 @@ namespace {
 using tileir::signatureChangeIsSafe;
 
 /// Collect the casts of `arg` to ranked memrefs into `casts`, if `arg` is an
-/// unranked memref that nothing else uses. The casts may differ in rank and
-/// layout, as each one is replaced separately.
+/// unranked memref that nothing else uses and the casts can be rebuilt from a
+/// pointer. The casts may differ in rank and layout, as each one is replaced
+/// separately.
 static bool collectPromotableCasts(
-    BlockArgument arg,
+    BlockArgument arg, const LLVMTypeConverter &typeConverter,
     SmallVectorImpl<std::pair<Operation *, MemRefType>> &casts) {
   auto unranked = dyn_cast<UnrankedMemRefType>(arg.getType());
   if (!unranked)
@@ -78,6 +79,16 @@ static bool collectPromotableCasts(
     // Guaranteed by the op verifiers; checked defensively.
     if (source != arg || !resTy ||
         resTy.getElementType() != unranked.getElementType())
+      return false;
+    // The descriptor needs strides and a type of the memref-to-LLVM lowering. A
+    // plain cast would read the strides from the unranked descriptor, which a
+    // pointer does not have, so they must be static.
+    SmallVector<int64_t> strides;
+    int64_t offset;
+    if (failed(resTy.getStridesAndOffset(strides, offset)) ||
+        (isa<memref::CastOp>(user) &&
+         llvm::any_of(strides, ShapedType::isDynamic)) ||
+        !typeConverter.convertType(resTy))
       return false;
     casts.emplace_back(user, resTy);
   }
@@ -113,22 +124,16 @@ static void getLayout(OpBuilder &builder, Location loc, Operation *cast,
     return;
   }
 
-  // Plain `memref.cast`: the layout is taken from the ranked result type.
-  // Dynamic sizes are not recoverable once the unranked descriptor is dropped,
-  // but the consumers only use the base pointer, offset and strides, so a zero
-  // placeholder size is sufficient and never observed.
+  // A plain cast takes the static strides of its type. A dynamic offset is 0
+  // by the calling convention of pointer arguments. A pointer has no sizes, so
+  // dynamic ones are set to 0; the gathers and scatters of converted IR do not
+  // read them.
   auto constIndex = [&](int64_t v) -> Value {
     return LLVM::ConstantOp::create(
         builder, loc, indexTy,
         builder.getIntegerAttr(indexTy, ShapedType::isDynamic(v) ? 0 : v));
   };
-  SmallVector<int64_t> strideVals;
-  int64_t offsetVal;
-  if (failed(ranked.getStridesAndOffset(strideVals, offsetVal))) {
-    // Non-strided layout: fall back to an identity row-major interpretation.
-    offsetVal = 0;
-    strideVals.assign(ranked.getRank(), 1);
-  }
+  auto [strideVals, offsetVal] = ranked.getStridesAndOffset();
   offset = constIndex(offsetVal);
   for (int64_t size : ranked.getShape())
     sizes.push_back(constIndex(size));
@@ -158,7 +163,7 @@ static bool promoteFunctionArgs(FunctionOpInterface func) {
   for (unsigned i = 0, e = func.getNumArguments(); i < e; ++i) {
     BlockArgument arg = func.getArgument(i);
     SmallVector<std::pair<Operation *, MemRefType>> casts;
-    if (!collectPromotableCasts(arg, casts))
+    if (!collectPromotableCasts(arg, typeConverter, casts))
       continue;
 
     arg.setType(ptrTy);

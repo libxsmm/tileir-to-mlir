@@ -138,3 +138,28 @@ func.func private @coupled_offset(%arg0: memref<*xf32>, %arg1: i32, %arg2: i32) 
 func.func private @unused_pointer_args(%arg0: memref<*xbf16>, %arg1: memref<*xbf16>, %arg2: memref<*xi32>, %arg3: i32) {
   return
 }
+
+// A plain cast, here the base of a gather, takes the static strides of its
+// type. The pointer has offset 0 and no sizes, so the dynamic offset and size
+// become 0.
+// CHECK-LABEL: func.func private @gather_base(
+// CHECK-SAME:    %[[P:[^:]+]]: !llvm.ptr, %{{[^:]+}}: vector<4xindex>)
+// CHECK-NOT:     memref.cast
+// CHECK:         %[[OFF:.*]] = llvm.mlir.constant(0 : i64) : i64
+// CHECK:         %[[SIZE:.*]] = llvm.mlir.constant(0 : i64) : i64
+// CHECK:         %[[STRIDE:.*]] = llvm.mlir.constant(1 : i64) : i64
+// CHECK:         llvm.insertvalue %[[P]], %{{.*}}[0]
+// CHECK:         llvm.insertvalue %[[P]], %{{.*}}[1]
+// CHECK:         llvm.insertvalue %[[OFF]], %{{.*}}[2]
+// CHECK:         llvm.insertvalue %[[SIZE]], %{{.*}}[3, 0]
+// CHECK:         llvm.insertvalue %[[STRIDE]], %{{.*}}[4, 0]
+// CHECK:         %[[M:.*]] = builtin.unrealized_conversion_cast %{{.*}} to memref<?xf32, strided<[1], offset: ?>>
+// CHECK:         vector.gather %[[M]]
+func.func private @gather_base(%arg0: memref<*xf32>, %offsets: vector<4xindex>) -> vector<4xf32> {
+  %c0 = arith.constant 0 : index
+  %mask = arith.constant dense<true> : vector<4xi1>
+  %pass = arith.constant dense<0.0> : vector<4xf32>
+  %base = memref.cast %arg0 : memref<*xf32> to memref<?xf32, strided<[1], offset: ?>>
+  %g = vector.gather %base[%c0] [%offsets], %mask, %pass : memref<?xf32, strided<[1], offset: ?>>, vector<4xindex>, vector<4xi1>, vector<4xf32> into vector<4xf32>
+  return %g : vector<4xf32>
+}

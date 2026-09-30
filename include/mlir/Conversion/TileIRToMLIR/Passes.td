@@ -79,6 +79,9 @@ def ConvertMemrefArgsToPtrArgsPass : Pass<"convert-memref-args-to-ptr-args", "Mo
     element type. Matching casts need not have the same rank or layout. Each is
     replaced independently by a memref descriptor materialized from the pointer
     and wrapped in an `unrealized_conversion_cast` to its original ranked type.
+    The pointer carries no sizes or strides: a `memref.cast` must have static
+    strides, and its dynamic sizes become 0. Casts to memref types without an
+    LLVM descriptor, e.g. of `tf32`, are not supported.
 
     The rewrite is conservative. An argument is promoted only when:
       * it is an unranked-memref argument,
