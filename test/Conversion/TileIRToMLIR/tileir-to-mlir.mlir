@@ -627,7 +627,7 @@ cuda_tile.module @m {
     %x = constant <f32: 1.25> : tile<4xf32>
     // CHECK: %[[FTOF_TR:.*]] = arith.truncf %[[FTOF_IN]] to_nearest_even : vector<4xf32> to vector<4xf16>
     %tr = ftof %x rounding<nearest_even> : tile<4xf32> -> tile<4xf16>
-    // CHECK: %[[FTOF_EX:.*]] = arith.extf %[[FTOF_TR]] {{.*}}tir-dropped-rounding{{.*}} : vector<4xf16> to vector<4xf64>
+    // CHECK: %[[FTOF_EX:.*]] = arith.extf %[[FTOF_TR]] : vector<4xf16> to vector<4xf64>
     %ex = ftof %tr rounding<nearest_even> : tile<4xf16> -> tile<4xf64>
     // Formats of the same width convert with arith.convertf.
     // CHECK: arith.convertf %[[FTOF_TR]] to_nearest_even : vector<4xf16> to vector<4xbf16>
@@ -759,7 +759,7 @@ cuda_tile.module @m {
   entry @test_sqrt() {
     // CHECK: %[[SQRT_IN:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
     %in = constant <f32: [1.0, 4.0, 9.0, 16.0]> : tile<4xf32>
-    // CHECK: %[[SQRT_R:.*]] = math.sqrt %[[SQRT_IN]] {"tir-dropped-rounding" = "nearest_even"} : vector<4xf32>
+    // CHECK: %[[SQRT_R:.*]] = math.sqrt %[[SQRT_IN]] : vector<4xf32>
     %res = sqrt %in : tile<4xf32>
     return
   }
@@ -769,7 +769,7 @@ cuda_tile.module @m {
     entry @test_sqrt_approx_ftz() {
       // CHECK: %[[SQRTA_IN:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
       %in = constant <f32: [1.0, 4.0, 9.0, 16.0]> : tile<4xf32>
-      // CHECK: %[[SQRTA_R:.*]] = math.sqrt %[[SQRTA_IN]] fastmath<afn> {"tir-dropped-flush-to-zero", "tir-dropped-rounding" = "approx"} : vector<4xf32>
+      // CHECK: %[[SQRTA_R:.*]] = math.sqrt %[[SQRTA_IN]] fastmath<afn> {"tir-dropped-flush-to-zero"} : vector<4xf32>
       %res = sqrt %in rounding<approx> flush_to_zero : tile<4xf32>
       return
     }
@@ -964,7 +964,7 @@ cuda_tile.module @m {
     %rhs = constant <f32: [2.0, 3.0, 4.0, 5.0]> : tile<4xf32>
     // CHECK: %[[FMA_ACC:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
     %acc = constant <f32: [0.5, 0.5, 0.5, 0.5]> : tile<4xf32>
-    // CHECK: %[[FMA_R:.*]] = math.fma %[[FMA_LHS]], %[[FMA_RHS]], %[[FMA_ACC]] {"tir-dropped-rounding" = "nearest_even"} : vector<4xf32>
+    // CHECK: %[[FMA_R:.*]] = math.fma %[[FMA_LHS]], %[[FMA_RHS]], %[[FMA_ACC]] : vector<4xf32>
     %result = fma %lhs, %rhs, %acc : tile<4xf32>
     return
   }
@@ -1016,7 +1016,7 @@ cuda_tile.module @m {
     %f = constant <f32: 4.0> : tile<f32>
     // CHECK: %[[SM_I:.*]] = arith.constant -3 : i32
     %i = constant <i32: -3> : tile<i32>
-    // CHECK: %[[SM_SQRT:.*]] = math.sqrt %[[SM_F]] {"tir-dropped-rounding" = "nearest_even"} : f32
+    // CHECK: %[[SM_SQRT:.*]] = math.sqrt %[[SM_F]] : f32
     %sq = sqrt %f : tile<f32>
     // CHECK: %[[SM_ABSF:.*]] = math.absf %[[SM_F]] : f32
     %af = absf %f : tile<f32>
@@ -1066,7 +1066,7 @@ cuda_tile.module @m {
     %mul = mulf %a, %b : tile<f32>
     // CHECK: %[[SF_DIVF:.*]] = arith.divf %[[SF_A]], %[[SF_B]] : f32
     %div = divf %a, %b : tile<f32>
-    // CHECK: %[[SF_FMA:.*]] = math.fma %[[SF_A]], %[[SF_B]], %[[SF_C]] {"tir-dropped-rounding" = "nearest_even"} : f32
+    // CHECK: %[[SF_FMA:.*]] = math.fma %[[SF_A]], %[[SF_B]], %[[SF_C]] : f32
     %fm = fma %a, %b, %c : tile<f32>
     return
   }
@@ -1345,7 +1345,7 @@ cuda_tile.module @m {
   entry @test_tanh_approx() {
     // CHECK: %[[TA_IN:.*]] = arith.constant dense<1.000000e+00> : vector<4xf32>
     %in = constant <f32: 1.0> : tile<4xf32>
-    // CHECK: math.tanh %[[TA_IN]] fastmath<afn> {"tir-dropped-rounding" = "approx"} : vector<4xf32>
+    // CHECK: math.tanh %[[TA_IN]] fastmath<afn> : vector<4xf32>
     %r = tanh %in rounding<approx> : tile<4xf32>
     return
   }

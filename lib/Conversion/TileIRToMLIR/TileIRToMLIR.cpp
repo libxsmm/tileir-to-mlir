@@ -183,33 +183,57 @@ mapRoundingModeToArith(cuda_tile::RoundingMode rounding) {
   return std::nullopt;
 }
 
-/// Attach the discardable `tir-dropped-flush-to-zero` unit attribute to `newOp`
-/// when `flushToZero` is set. flush_to_zero has no arith/math equivalent, so it
-/// is preserved as an annotation.
+//===----------------------------------------------------------------------===//
+// Dropped semantics
+//
+// Source semantics that the lowered op cannot represent are recorded on it as
+// discardable attributes. Semantics that the lowered op represents are never
+// recorded, except for rounding modes under `drop-rounding-modes`.
+//===----------------------------------------------------------------------===//
+
+static constexpr StringLiteral kDroppedFlushToZero =
+    "tir-dropped-flush-to-zero";
+static constexpr StringLiteral kDroppedRounding = "tir-dropped-rounding";
+static constexpr StringLiteral kDroppedOverflow = "tir-dropped-overflow";
+static constexpr StringLiteral kDroppedOptimizationHints =
+    "tir-dropped-optimization-hints";
+static constexpr StringLiteral kDroppedMemoryOrdering =
+    "tir-dropped-memory-ordering";
+static constexpr StringLiteral kDroppedMemoryScope = "tir-dropped-memory-scope";
+
+/// Record a set `flush_to_zero`, which has no arith/math equivalent.
 static void preserveDroppedFlushToZero(OpBuilder &builder, bool flushToZero,
                                        Operation *newOp) {
   if (flushToZero)
-    newOp->setAttr("tir-dropped-flush-to-zero", builder.getUnitAttr());
+    newOp->setAttr(kDroppedFlushToZero, builder.getUnitAttr());
 }
 
-/// Attach the discardable `tir-dropped-rounding` string attribute to `newOp`,
-/// recording a source rounding mode that the target op cannot represent.
+/// Record a source rounding mode that `newOp` does not represent.
 static void preserveDroppedRounding(OpBuilder &builder,
                                     cuda_tile::RoundingMode rounding,
                                     Operation *newOp) {
   newOp->setAttr(
-      "tir-dropped-rounding",
+      kDroppedRounding,
       builder.getStringAttr(cuda_tile::stringifyRoundingMode(rounding)));
 }
 
-/// Attach `tir-dropped-rounding` when the source rounding mode is not
-/// represented by the lowered target op.
-static void
-preserveDroppedRoundingIfUnsupported(OpBuilder &builder,
-                                     cuda_tile::RoundingMode rounding,
-                                     bool isRepresented, Operation *newOp) {
-  if (!isRepresented)
-    preserveDroppedRounding(builder, rounding, newOp);
+/// Record integer-overflow flags that `newOp` does not represent. `none`
+/// carries no information and is not recorded.
+static void preserveDroppedOverflow(OpBuilder &builder,
+                                    cuda_tile::IntegerOverflow overflow,
+                                    Operation *newOp) {
+  if (overflow == cuda_tile::IntegerOverflow::NONE)
+    return;
+  newOp->setAttr(
+      kDroppedOverflow,
+      builder.getStringAttr(cuda_tile::stringifyIntegerOverflow(overflow)));
+}
+
+/// Record the `optimization_hints` of `op`, which the lowered ops do not use.
+template <typename OpT>
+static void preserveDroppedOptHints(OpT op, Operation *newOp) {
+  if (auto hints = op.getOptimizationHintsAttr())
+    newOp->setAttr(kDroppedOptimizationHints, hints.getValue());
 }
 
 /// Map cuda_tile integer-overflow flags to arith integer-overflow flags.
@@ -227,20 +251,6 @@ mapIntegerOverflowFlags(cuda_tile::IntegerOverflow overflow) {
     return arith::IntegerOverflowFlags::nsw | arith::IntegerOverflowFlags::nuw;
   }
   return arith::IntegerOverflowFlags::none;
-}
-
-/// Attach the discardable `tir-dropped-overflow` string attribute to `newOp`
-/// when the source carried a meaningful (non-`none`) integer-overflow flag that
-/// the lowered op does not represent. `none` carries no information, so it is
-/// not recorded.
-static void preserveDroppedOverflow(OpBuilder &builder,
-                                    cuda_tile::IntegerOverflow overflow,
-                                    Operation *newOp) {
-  if (overflow == cuda_tile::IntegerOverflow::NONE)
-    return;
-  newOp->setAttr(
-      "tir-dropped-overflow",
-      builder.getStringAttr(cuda_tile::stringifyIntegerOverflow(overflow)));
 }
 
 /// Cast between index and integer types when required by lowered ops.
@@ -473,11 +483,14 @@ struct ConvertUnaryFlushToZeroOp : public OpConversionPattern<SrcOp> {
   }
 };
 
-/// Convert a unary source-based op to a math op, mapping `rounding<approx>` to
-/// the `afn` (allow approximate functions) FastMath flag. The source rounding
-/// mode is always preserved as `tir-dropped-rounding`; when `PreserveFtz` is
-/// set, `flush_to_zero` is preserved as `tir-dropped-flush-to-zero`.
-template <typename SrcOp, typename DstOp, bool PreserveFtz>
+/// Convert a unary op with a rounding mode to a math op. `Exact` is the
+/// rounding the math op implements, and `rounding<approx>` maps to the `afn`
+/// (allow approximate functions) FastMath flag. Other modes, and all modes
+/// under `drop-rounding-modes`, are preserved as `tir-dropped-rounding`. When
+/// `PreserveFtz` is set, `flush_to_zero` is preserved as
+/// `tir-dropped-flush-to-zero`.
+template <typename SrcOp, typename DstOp, cuda_tile::RoundingMode Exact,
+          bool PreserveFtz>
 struct ConvertUnaryApproxMathOp : public OptionsPattern<SrcOp> {
   using OptionsPattern<SrcOp>::OptionsPattern;
 
@@ -485,15 +498,16 @@ struct ConvertUnaryApproxMathOp : public OptionsPattern<SrcOp> {
   matchAndRewrite(SrcOp op,
                   typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto rounding = op.getRoundingMode();
-    auto fmf = (!this->options.dropRoundingModes &&
-                rounding == cuda_tile::RoundingMode::APPROX)
-                   ? arith::FastMathFlags::afn
-                   : arith::FastMathFlags::none;
+    cuda_tile::RoundingMode rounding = op.getRoundingMode();
+    bool keepRounding = !this->options.dropRoundingModes;
+    bool approx = keepRounding && rounding == cuda_tile::RoundingMode::APPROX;
     auto newOp = rewriter.template replaceOpWithNewOp<DstOp>(
         op, adaptor.getSource(),
-        arith::FastMathFlagsAttr::get(rewriter.getContext(), fmf));
-    preserveDroppedRounding(rewriter, rounding, newOp);
+        arith::FastMathFlagsAttr::get(rewriter.getContext(),
+                                      approx ? arith::FastMathFlags::afn
+                                             : arith::FastMathFlags::none));
+    if (!approx && !(keepRounding && rounding == Exact))
+      preserveDroppedRounding(rewriter, rounding, newOp);
     if constexpr (PreserveFtz)
       preserveDroppedFlushToZero(rewriter, op.getFlushToZero(), newOp);
     return success();
@@ -540,8 +554,8 @@ struct ConvertBinaryFloatOp : public OptionsPattern<SrcOp> {
         op, adaptor.getLhs(), adaptor.getRhs(),
         arith::FastMathFlagsAttr::get(rewriter.getContext(), fmf),
         roundingAttr);
-    preserveDroppedRoundingIfUnsupported(rewriter, rounding,
-                                         roundingRepresented, newOp);
+    if (!roundingRepresented)
+      preserveDroppedRounding(rewriter, rounding, newOp);
     preserveDroppedFlushToZero(rewriter, ftz, newOp);
     return success();
   }
@@ -593,8 +607,8 @@ struct ConvertFromToSignednessCastWithRoundingOp
 
     Operation *newOp = replaceBySignedness<SignedDstOp, UnsignedDstOp>(
         rewriter, op, op.getSignedness(), resultTy.value(), adaptor.getFrom());
-    preserveDroppedRoundingIfUnsupported(rewriter, op.getRoundingMode(),
-                                         roundingRepresented, newOp);
+    if (!roundingRepresented)
+      preserveDroppedRounding(rewriter, op.getRoundingMode(), newOp);
     return success();
   }
 };
@@ -926,16 +940,6 @@ static LogicalResult checkCommonTkoGuards(TkoOp op,
     return rewriter.notifyMatchFailure(
         op, "memory_scope is not supported by this lowering");
   return success();
-}
-
-/// Preserve an `optimization_hints` attribute that this lowering otherwise
-/// drops. The attribute's inner builtin `DictionaryAttr` is attached to the
-/// produced target op as the discardable attribute
-/// `tir-dropped-optimization-hints`.
-template <typename TkoOp>
-static void preserveDroppedOptHints(TkoOp op, Operation *newOp) {
-  if (auto hints = op.getOptimizationHintsAttr())
-    newOp->setAttr("tir-dropped-optimization-hints", hints.getValue());
 }
 
 /// Keeps the information needed by vector.transfer_read / transfer_write to
@@ -1414,6 +1418,11 @@ struct ConvertEntry : public OptionsPattern<cuda_tile::EntryOp> {
   }
 };
 
+/// Convert cuda_tile.exp to math.exp, which has full precision.
+using ConvertExp = ConvertUnaryApproxMathOp<cuda_tile::ExpOp, math::ExpOp,
+                                            cuda_tile::RoundingMode::FULL,
+                                            /*PreserveFtz=*/false>;
+
 /// Convert cuda_tile.exp2 to math.exp2.
 ///
 /// `flush_to_zero` is not representable in math FastMath flags and is preserved
@@ -1518,11 +1527,11 @@ struct ConvertExtract : public OpConversionPattern<cuda_tile::ExtractOp> {
 
 /// Convert cuda_tile.fma to math.fma.
 ///
-/// `rounding_mode` and `flush_to_zero` are not representable in math FastMath
-/// flags and are preserved on the result as `tir-dropped-rounding` and
-/// `tir-dropped-flush-to-zero`.
-struct ConvertFma : public OpConversionPattern<cuda_tile::FmaOp> {
-  using OpConversionPattern::OpConversionPattern;
+/// math.fma rounds once to nearest even. Other rounding modes, and all modes
+/// under `drop-rounding-modes`, are preserved as `tir-dropped-rounding`;
+/// `flush_to_zero` is preserved as `tir-dropped-flush-to-zero`.
+struct ConvertFma : public OptionsPattern<cuda_tile::FmaOp> {
+  using OptionsPattern::OptionsPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::FmaOp op, OpAdaptor adaptor,
@@ -1531,7 +1540,9 @@ struct ConvertFma : public OpConversionPattern<cuda_tile::FmaOp> {
     bool ftz = op.getFlushToZero();
     auto newOp = rewriter.replaceOpWithNewOp<math::FmaOp>(
         op, adaptor.getLhs(), adaptor.getRhs(), adaptor.getAcc());
-    preserveDroppedRounding(rewriter, rounding, newOp);
+    if (options.dropRoundingModes ||
+        rounding != cuda_tile::RoundingMode::NEAREST_EVEN)
+      preserveDroppedRounding(rewriter, rounding, newOp);
     preserveDroppedFlushToZero(rewriter, ftz, newOp);
     return success();
   }
@@ -1598,9 +1609,8 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
 
 /// Convert cuda_tile.ftof to arith.extf / arith.truncf / arith.convertf.
 ///
-///   - Widening uses arith.extf, which has no rounding-mode attribute (float
-///     widening is exact); the source rounding mode is preserved on the result
-///     as the discardable attribute `tir-dropped-rounding`.
+///   - Widening uses arith.extf. It is exact, so the rounding mode does not
+///     matter and is only preserved under `drop-rounding-modes`.
 ///   - Narrowing uses arith.truncf and conversions between formats of the same
 ///     width use arith.convertf. Both carry a rounding-mode attribute, so the
 ///     source rounding mode is mapped onto it when possible and preserved as
@@ -1643,11 +1653,10 @@ struct ConvertFToF : public OptionsPattern<cuda_tile::FToFOp> {
                                          "ftof expects float or vector<float>");
 
     if (srcWidth < dstWidth) {
-      // arith.extf has no rounding-mode attribute; preserve the source rounding
-      // mode as a discardable annotation.
       auto extOp = rewriter.replaceOpWithNewOp<arith::ExtFOp>(
           op, resultTy.value(), adaptor.getFrom());
-      preserveDroppedRounding(rewriter, op.getRoundingMode(), extOp);
+      if (options.dropRoundingModes)
+        preserveDroppedRounding(rewriter, op.getRoundingMode(), extOp);
       return success();
     }
 
@@ -1667,8 +1676,8 @@ struct ConvertFToF : public OptionsPattern<cuda_tile::FToFOp> {
       castOp = rewriter.replaceOpWithNewOp<arith::ConvertFOp>(
           op, resultTy.value(), adaptor.getFrom(), roundingAttr,
           /*fastmath=*/arith::FastMathFlagsAttr{});
-    preserveDroppedRoundingIfUnsupported(rewriter, op.getRoundingMode(),
-                                         arithRounding.has_value(), castOp);
+    if (!arithRounding)
+      preserveDroppedRounding(rewriter, op.getRoundingMode(), castOp);
     return success();
   }
 };
@@ -2811,10 +2820,10 @@ struct ConvertAtomicRMWTko
                                            adaptor.getArg(), rc,
                                            /*indices=*/ValueRange{});
     rmw->setAttr(
-        "tir-dropped-memory-ordering",
+        kDroppedMemoryOrdering,
         rewriter.getStringAttr(cuda_tile::stringifyMemoryOrderingSemantics(
             op.getMemoryOrderingSemantics())));
-    rmw->setAttr("tir-dropped-memory-scope",
+    rmw->setAttr(kDroppedMemoryScope,
                  rewriter.getStringAttr(
                      cuda_tile::stringifyMemoryScope(op.getMemoryScope())));
     rewriter.replaceOp(op, {rmw.getResult(), Value()});
@@ -3050,14 +3059,11 @@ struct ConvertScan : public OpConversionPattern<cuda_tile::ScanOp> {
 using ConvertShLI =
     ConvertBinaryLhsRhsWithOverflowOp<cuda_tile::ShLIOp, arith::ShLIOp>;
 
-/// Convert cuda_tile.sqrt to math.sqrt.
-///
-/// `rounding<approx>` maps to the `afn` (allow approximate functions) FastMath
-/// flag. All other rounding modes and `flush_to_zero` are not representable in
-/// math FastMath flags and are preserved on the result as
-/// `tir-dropped-rounding` and `tir-dropped-flush-to-zero`.
-using ConvertSqrt = ConvertUnaryApproxMathOp<cuda_tile::SqrtOp, math::SqrtOp,
-                                             /*PreserveFtz=*/true>;
+/// Convert cuda_tile.sqrt to math.sqrt, which is correctly rounded.
+using ConvertSqrt =
+    ConvertUnaryApproxMathOp<cuda_tile::SqrtOp, math::SqrtOp,
+                             cuda_tile::RoundingMode::NEAREST_EVEN,
+                             /*PreserveFtz=*/true>;
 
 /// Convert cuda_tile.store_view_tko to vector.transfer_write.
 ///
@@ -3112,12 +3118,9 @@ using ConvertSubF = ConvertBinaryFloatOp<cuda_tile::SubFOp, arith::SubFOp>;
 using ConvertSubI =
     ConvertBinaryLhsRhsWithOverflowOp<cuda_tile::SubIOp, arith::SubIOp>;
 
-/// Convert cuda_tile.tanh to math.tanh.
-///
-/// rounding<approx> maps to the `afn` (allow approximate functions) FastMath
-/// flag on math.tanh. The `full` rounding mode has no equivalent in FastMath
-/// flags; both modes lower to math.tanh.
+/// Convert cuda_tile.tanh to math.tanh, which has full precision.
 using ConvertTanH = ConvertUnaryApproxMathOp<cuda_tile::TanHOp, math::TanhOp,
+                                             cuda_tile::RoundingMode::FULL,
                                              /*PreserveFtz=*/false>;
 
 /// Convert cuda_tile.trunci to arith.trunci while preserving overflow flags.
@@ -3232,10 +3235,10 @@ static void populateTileIRToMLIRConversionPatterns(
     const ConvertTileIRToMLIRPassOptions &options) {
   MLIRContext *ctx = patterns.getContext();
   patterns.add<ConvertAddF, ConvertSubF, ConvertMulF, ConvertDivF, ConvertEntry,
-               ConvertFToF, ConvertFToI, ConvertGetNumTileBlocks,
-               ConvertGetTileBlockId, ConvertIToF, ConvertLoadViewTko,
-               ConvertModule, ConvertReturn, ConvertSqrt, ConvertStoreViewTko,
-               ConvertTanH>(converter, ctx, options);
+               ConvertExp, ConvertFma, ConvertFToF, ConvertFToI,
+               ConvertGetNumTileBlocks, ConvertGetTileBlockId, ConvertIToF,
+               ConvertLoadViewTko, ConvertModule, ConvertReturn, ConvertSqrt,
+               ConvertStoreViewTko, ConvertTanH>(converter, ctx, options);
   // Ops that map to one target op with the same operands, or to one of their
   // operands.
   patterns.add<
@@ -3247,7 +3250,6 @@ static void populateTileIRToMLIRConversionPatterns(
       DirectConversion<cuda_tile::CeilOp, math::CeilOp>,
       DirectConversion<cuda_tile::CosOp, math::CosOp>,
       DirectConversion<cuda_tile::CosHOp, math::CoshOp>,
-      DirectConversion<cuda_tile::ExpOp, math::ExpOp>,
       DirectConversion<cuda_tile::FloorOp, math::FloorOp>,
       DirectConversion<cuda_tile::LogOp, math::LogOp>,
       DirectConversion<cuda_tile::Log2Op, math::Log2Op>,
@@ -3272,21 +3274,20 @@ static void populateTileIRToMLIRConversionPatterns(
       SignednessConversion<cuda_tile::RemIOp, arith::RemSIOp, arith::RemUIOp>,
       SignednessConversion<cuda_tile::ShRIOp, arith::ShRSIOp, arith::ShRUIOp>>(
       converter, ctx);
-  patterns
-      .add<ConvertAddI, ConvertAlloca, ConvertBroadcast, ConvertCat,
-           ConvertCmpF, ConvertCmpI, ConvertConstant, ConvertContinue,
-           ConvertAtomicRMWTko, ConvertDivI, ConvertExp2, ConvertExtract,
-           ConvertFma, ConvertFor, ConvertGetGlobal, ConvertGetIndexSpaceShape,
-           ConvertGetTensorShape, ConvertGlobal, ConvertIf, ConvertIota,
-           EraseTokenOp<cuda_tile::JoinTokensOp>, ConvertLoadPtrTkoRanked,
-           ConvertLoadPtrTkoScalar, ConvertMakeTensorView,
-           EraseTokenOp<cuda_tile::MakeTokenOp>, ConvertMaxF, ConvertMinF,
-           ConvertMmaF, ConvertMmaI, ConvertMulhiI, ConvertMulI,
-           ConvertOffsetRanked, ConvertOffsetScalarPtr, ConvertNegI,
-           ConvertPermute, ConvertPtrToPtrCastOrFail, ConvertReduce,
-           ConvertReshape, ConvertRsqrt, ConvertScan, ConvertShLI,
-           ConvertStorePtrTkoRanked, ConvertStorePtrTkoScalar, ConvertSubI,
-           ConvertTruncI, ConvertYield>(converter, ctx);
+  patterns.add<
+      ConvertAddI, ConvertAlloca, ConvertBroadcast, ConvertCat, ConvertCmpF,
+      ConvertCmpI, ConvertConstant, ConvertContinue, ConvertAtomicRMWTko,
+      ConvertDivI, ConvertExp2, ConvertExtract, ConvertFor, ConvertGetGlobal,
+      ConvertGetIndexSpaceShape, ConvertGetTensorShape, ConvertGlobal,
+      ConvertIf, ConvertIota, EraseTokenOp<cuda_tile::JoinTokensOp>,
+      ConvertLoadPtrTkoRanked, ConvertLoadPtrTkoScalar, ConvertMakeTensorView,
+      EraseTokenOp<cuda_tile::MakeTokenOp>, ConvertMaxF, ConvertMinF,
+      ConvertMmaF, ConvertMmaI, ConvertMulhiI, ConvertMulI, ConvertOffsetRanked,
+      ConvertOffsetScalarPtr, ConvertNegI, ConvertPermute,
+      ConvertPtrToPtrCastOrFail, ConvertReduce, ConvertReshape, ConvertRsqrt,
+      ConvertScan, ConvertShLI, ConvertStorePtrTkoRanked,
+      ConvertStorePtrTkoScalar, ConvertSubI, ConvertTruncI, ConvertYield>(
+      converter, ctx);
 }
 
 //===----------------------------------------------------------------------===//

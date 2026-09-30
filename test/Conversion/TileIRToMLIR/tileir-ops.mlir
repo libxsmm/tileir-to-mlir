@@ -174,6 +174,8 @@ cuda_tile.module @ops_module {
     %in = constant <f32: [0.0, 1.0, 2.0, 3.0]> : tile<4xf32>
     // CHECK: %[[EXP_RES:.*]] = math.exp %[[EXP_IN]] : vector<4xf32>
     %res = exp %in : tile<4xf32>
+    // CHECK: math.exp %[[EXP_IN]] fastmath<afn> : vector<4xf32>
+    %res_approx = exp %in rounding<approx> : tile<4xf32>
     return
   }
 
@@ -419,7 +421,7 @@ cuda_tile.module @ops_module {
   entry @test_tanh() {
     // CHECK: %[[TANH_IN:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
     %in = constant <f32: [0.0, 1.0, 2.0, 3.0]> : tile<4xf32>
-    // CHECK: %[[TANH_R:.*]] = math.tanh %[[TANH_IN]] {"tir-dropped-rounding" = "full"} : vector<4xf32>
+    // CHECK: %[[TANH_R:.*]] = math.tanh %[[TANH_IN]] : vector<4xf32>
     %res0 = tanh %in : tile<4xf32>
     return
   }

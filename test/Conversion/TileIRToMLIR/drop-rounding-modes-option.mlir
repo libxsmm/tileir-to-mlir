@@ -15,8 +15,11 @@
 // CHECK: arith.sitofp %{{.*}} {"tir-dropped-rounding" = "nearest_even"}
 // CHECK: math.sqrt %{{.*}} {"tir-dropped-rounding" = "approx"}
 // CHECK: math.tanh %{{.*}} {"tir-dropped-rounding" = "approx"}
+// CHECK: math.exp %{{.*}} {"tir-dropped-rounding" = "approx"}
 // CHECK-NOT: fastmath<afn>
 // CHECK: math.fma %{{.*}}, %{{.*}}, %{{.*}} {"tir-dropped-rounding" = "zero"}
+// CHECK: math.fma %{{.*}}, %{{.*}}, %{{.*}} {"tir-dropped-rounding" = "nearest_even"}
+// CHECK: arith.extf %{{.*}} {"tir-dropped-rounding" = "nearest_even"}
 
 cuda_tile.module @m {
   entry @drop_rounding_modes(%x: tile<f32>, %y: tile<f32>, %ix: tile<i32>, %iy: tile<i32>) {
@@ -29,7 +32,10 @@ cuda_tile.module @m {
     %f = itof %ix signed rounding<nearest_even> : tile<i32> -> tile<f32>
     %g = sqrt %x rounding<approx> : tile<f32>
     %h = tanh %x rounding<approx> : tile<f32>
+    %h2 = exp %x rounding<approx> : tile<f32>
     %i = fma %x, %y, %x rounding<zero> : tile<f32>
+    %i2 = fma %x, %y, %x : tile<f32>
+    %j = ftof %x rounding<nearest_even> : tile<f32> -> tile<f64>
     return
   }
 }
