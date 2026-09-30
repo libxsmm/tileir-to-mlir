@@ -39,6 +39,8 @@ jobs:
       - name: Configure LLVM, MLIR, and TileIRToMLIR
         run: |
           cmake -S "$LLVM_SOURCE_DIR/llvm" -B "$BUILD_DIR" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_ASSERTIONS=ON \
             -DLLVM_ENABLE_PROJECTS=mlir \
             -DLLVM_EXTERNAL_PROJECTS=tileir-to-mlir \
             -DLLVM_EXTERNAL_TILEIR_TO_MLIR_SOURCE_DIR="$GITHUB_WORKSPACE" \
