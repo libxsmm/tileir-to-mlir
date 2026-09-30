@@ -20,8 +20,9 @@ def ConvertTileIRToMLIRPass : Pass<"convert-tileir-to-mlir", "ModuleOp"> {
     launch-coordinate arguments (block-id x/y/z and grid-dim x/y/z), and
     whether dim-query ops read those arguments (`true`) or lower to gpu
     dim-query ops (`false`, GPU target only). `drop-rounding-modes` forces all
-    lowering patterns for rounding-carrying ops to preserve source rounding
-    only as discardable `tir-dropped-rounding` attributes.
+    lowering patterns for floating-point rounding-carrying ops to preserve
+    source rounding only as discardable `tir-dropped-rounding` attributes; the
+    rounding of integer `divi` defines its result and is always lowered exactly.
     `assume-in-bounds` forces all generated vector.transfer_read and
     vector.transfer_write ops to carry fully in-bounds flags.
     `known-block-size`, when given three values, sets the `known_block_size`

@@ -838,6 +838,12 @@ cuda_tile.module @m {
     %s = divi %lhs, %rhs signed : tile<4xi32>
     // CHECK: %[[DIVI_U:.*]] = arith.divui %[[DIVI_LHS]], %[[DIVI_RHS]] : vector<4xi32>
     %u = divi %lhs, %rhs unsigned : tile<4xi32>
+    // CHECK: arith.ceildivsi %[[DIVI_LHS]], %[[DIVI_RHS]] : vector<4xi32>
+    %sc = divi %lhs, %rhs signed rounding<positive_inf> : tile<4xi32>
+    // CHECK: arith.floordivsi %[[DIVI_LHS]], %[[DIVI_RHS]] : vector<4xi32>
+    %sf = divi %lhs, %rhs signed rounding<negative_inf> : tile<4xi32>
+    // CHECK: arith.ceildivui %[[DIVI_LHS]], %[[DIVI_RHS]] : vector<4xi32>
+    %uc = divi %lhs, %rhs unsigned rounding<positive_inf> : tile<4xi32>
     return
   }
 

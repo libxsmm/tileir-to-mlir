@@ -1,13 +1,15 @@
 // RUN: tileir-to-mlir --convert-tileir-to-mlir='target=gpu append-grid-args=false drop-rounding-modes=true' %s | FileCheck %s
 
 // Verifies drop-rounding-modes=true forces rounding to be preserved only as
-// tir-dropped-rounding, even for modes that are otherwise representable.
+// tir-dropped-rounding, even for modes that are otherwise representable. The
+// divi rounding mode defines the integer result and is never dropped.
 
 // CHECK-LABEL: gpu.func @drop_rounding_modes
 // CHECK: arith.addf %{{.*}}, %{{.*}} {"tir-dropped-rounding" = "nearest_even"}
 // CHECK: arith.divf %{{.*}}, %{{.*}} {"tir-dropped-rounding" = "approx"}
 // CHECK-NOT: fastmath<arcp>
-// CHECK: arith.divsi %{{.*}}, %{{.*}} {"tir-dropped-rounding" = "zero"}
+// CHECK: arith.divsi %{{.*}}, %{{.*}} : i32
+// CHECK: arith.ceildivsi %{{.*}}, %{{.*}} : i32
 // CHECK: arith.truncf %{{.*}} {"tir-dropped-rounding" = "nearest_even"}
 // CHECK: arith.fptosi %{{.*}} {"tir-dropped-rounding" = "nearest_int_to_zero"}
 // CHECK: arith.sitofp %{{.*}} {"tir-dropped-rounding" = "nearest_even"}
@@ -21,6 +23,7 @@ cuda_tile.module @m {
     %a = addf %x, %y : tile<f32>
     %b = divf %x, %y rounding<approx> : tile<f32>
     %c = divi %ix, %iy signed : tile<i32>
+    %c2 = divi %ix, %iy signed rounding<positive_inf> : tile<i32>
     %d = ftof %x rounding<nearest_even> : tile<f32> -> tile<f16>
     %e = ftoi %x signed rounding<nearest_int_to_zero> : tile<f32> -> tile<i32>
     %f = itof %ix signed rounding<nearest_even> : tile<i32> -> tile<f32>

@@ -1385,27 +1385,38 @@ using ConvertCosH = ConvertUnarySourceOp<cuda_tile::CosHOp, math::CoshOp>;
 using ConvertDivF = ConvertBinaryFloatOp<cuda_tile::DivFOp, arith::DivFOp,
                                          arith::FastMathFlags::arcp>;
 
-/// Convert cuda_tile.divi to arith.divsi/divui.
+/// Convert cuda_tile.divi to the arith division with the same rounding:
+/// zero -> divsi/divui, positive_inf -> ceildivsi/ceildivui, negative_inf ->
+/// floordivsi (unsigned floor division is divui).
 ///
-/// `rounding<zero>` is represented by the integer division semantics; other
-/// rounding modes are preserved as `tir-dropped-rounding`.
+/// The rounding mode defines the integer result, so it is never dropped, not
+/// even under `drop-rounding-modes`.
 struct ConvertDivI : public OpConversionPattern<cuda_tile::DivIOp> {
-  ConvertDivI(const TypeConverter &tc, MLIRContext *ctx, bool dropRoundingModes)
-      : OpConversionPattern(tc, ctx), dropRoundingModes(dropRoundingModes) {}
+  using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::DivIOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    bool roundingRepresented =
-        !dropRoundingModes && op.getRounding() == cuda_tile::RoundingMode::ZERO;
-    Operation *newOp = replaceBySignedness<arith::DivSIOp, arith::DivUIOp>(
-        rewriter, op, op.getSignedness(), adaptor.getLhs(), adaptor.getRhs());
-    preserveDroppedRoundingIfUnsupported(rewriter, op.getRounding(),
-                                         roundingRepresented, newOp);
-    return success();
+    Value lhs = adaptor.getLhs();
+    Value rhs = adaptor.getRhs();
+    cuda_tile::Signedness signedness = op.getSignedness();
+    switch (op.getRounding()) {
+    case cuda_tile::RoundingMode::ZERO:
+      replaceBySignedness<arith::DivSIOp, arith::DivUIOp>(rewriter, op,
+                                                          signedness, lhs, rhs);
+      return success();
+    case cuda_tile::RoundingMode::POSITIVE_INF:
+      replaceBySignedness<arith::CeilDivSIOp, arith::CeilDivUIOp>(
+          rewriter, op, signedness, lhs, rhs);
+      return success();
+    case cuda_tile::RoundingMode::NEGATIVE_INF:
+      replaceBySignedness<arith::FloorDivSIOp, arith::DivUIOp>(
+          rewriter, op, signedness, lhs, rhs);
+      return success();
+    default:
+      return rewriter.notifyMatchFailure(op, "unsupported divi rounding mode");
+    }
   }
-
-  bool dropRoundingModes;
 };
 
 /// Convert cuda_tile.entry to gpu.func (gpu target) or func.func (cpu target).
@@ -3880,8 +3891,8 @@ static void populateTileIRToMLIRConversionPatterns(
   patterns.add<ConvertGetNumTileBlocks, ConvertGetTileBlockId>(
       converter, ctx, target, appendGridArgs);
   patterns.add<ConvertModule, ConvertReturn>(converter, ctx, target);
-  patterns.add<ConvertAddF, ConvertSubF, ConvertMulF, ConvertDivF, ConvertDivI,
-               ConvertFToF, ConvertFToI, ConvertIToF, ConvertSqrt, ConvertTanH>(
+  patterns.add<ConvertAddF, ConvertSubF, ConvertMulF, ConvertDivF, ConvertFToF,
+               ConvertFToI, ConvertIToF, ConvertSqrt, ConvertTanH>(
       converter, ctx, dropRoundingModes);
   patterns.add<ConvertLoadViewTko, ConvertStoreViewTko>(converter, ctx,
                                                         assumeInBounds);
@@ -3889,15 +3900,15 @@ static void populateTileIRToMLIRConversionPatterns(
       ConvertAbsF, ConvertAbsI, ConvertAddI, ConvertAlloca, ConvertAndI,
       ConvertAssume, ConvertAtan2, ConvertBitcast, ConvertBroadcast, ConvertCat,
       ConvertCeil, ConvertCmpF, ConvertCmpI, ConvertConstant, ConvertContinue,
-      ConvertCos, ConvertCosH, ConvertAtomicRMWTko, ConvertExp, ConvertExp2,
-      ConvertExtI, ConvertExtract, ConvertFloor, ConvertFma, ConvertFor,
-      ConvertGetGlobal, ConvertGetIndexSpaceShape, ConvertGetTensorShape,
-      ConvertGlobal, ConvertIf, ConvertIota, ConvertJoinTokens,
-      ConvertLoadPtrTkoRanked, ConvertLoadPtrTkoScalar, ConvertLog, ConvertLog2,
-      ConvertMakeGatherScatterView, ConvertMakePartitionView,
-      ConvertMakeStridedView, ConvertMakeTensorView, ConvertMakeToken,
-      ConvertMaxF, ConvertMaxI, ConvertMinF, ConvertMinI, ConvertMmaF,
-      ConvertMmaI, ConvertMulhiI, ConvertMulI, ConvertOffsetRanked,
+      ConvertCos, ConvertCosH, ConvertAtomicRMWTko, ConvertDivI, ConvertExp,
+      ConvertExp2, ConvertExtI, ConvertExtract, ConvertFloor, ConvertFma,
+      ConvertFor, ConvertGetGlobal, ConvertGetIndexSpaceShape,
+      ConvertGetTensorShape, ConvertGlobal, ConvertIf, ConvertIota,
+      ConvertJoinTokens, ConvertLoadPtrTkoRanked, ConvertLoadPtrTkoScalar,
+      ConvertLog, ConvertLog2, ConvertMakeGatherScatterView,
+      ConvertMakePartitionView, ConvertMakeStridedView, ConvertMakeTensorView,
+      ConvertMakeToken, ConvertMaxF, ConvertMaxI, ConvertMinF, ConvertMinI,
+      ConvertMmaF, ConvertMmaI, ConvertMulhiI, ConvertMulI, ConvertOffsetRanked,
       ConvertOffsetScalarPtr, ConvertNegF, ConvertNegI, ConvertOrI, ConvertPack,
       ConvertPermute, ConvertPow, ConvertPtrToPtrCastOrFail, ConvertReduce,
       ConvertRemF, ConvertRemI, ConvertReshape, ConvertRsqrt, ConvertScan,
