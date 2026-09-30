@@ -68,10 +68,11 @@ namespace {
 /// (possibly non-zero) offset for it to survive make_tensor_view and the
 /// downstream transfer lowering. Strides come straight from the tensor_view
 /// (and may themselves be dynamic).
-static MemRefType tensorViewToMemRefType(cuda_tile::TensorViewType tvTy) {
+static MemRefType tensorViewToMemRefType(cuda_tile::TensorViewType tvTy,
+                                         const TypeConverter &converter) {
   auto shape = tvTy.getShape();
   auto strides = tvTy.getStrides();
-  Type elemTy = tvTy.getElementType();
+  Type elemTy = converter.convertType(tvTy.getElementType());
 
   SmallVector<int64_t> memrefShape(shape.begin(), shape.end());
   SmallVector<int64_t> memrefStrides(strides.begin(), strides.end());
@@ -351,17 +352,28 @@ static SmallVector<int64_t> getReducedVectorShape(VectorType sourceType,
   return shape;
 }
 
-/// Rebuild `denseAttr` as a DenseElementsAttr of `newType`, preserving its
-/// values and splat-ness. Used to move a constant payload between container
-/// types with the same element count (e.g. tile->vector or tile->tensor).
+/// Convert `value` to the semantics of `type`. Only used for the exact tf32 ->
+/// f32 widening of the CPU target.
+static APFloat convertFloat(APFloat value, FloatType type) {
+  bool losesInfo = false;
+  value.convert(type.getFloatSemantics(), APFloat::rmNearestTiesToEven,
+                &losesInfo);
+  assert(!losesInfo && "expected an exact float conversion");
+  return value;
+}
+
+/// Rebuild `denseAttr` as a DenseElementsAttr of `newType`, which has the same
+/// number of elements and whose element type may differ by the element type
+/// conversion of the type converter (e.g. tile->vector or tile->tensor).
 static DenseElementsAttr retypeDenseElements(DenseElementsAttr denseAttr,
                                              ShapedType newType) {
-  if (denseAttr.isSplat())
-    return DenseElementsAttr::get(newType,
-                                  denseAttr.getSplatValue<Attribute>());
-  SmallVector<Attribute> values(denseAttr.getValues<Attribute>().begin(),
-                                denseAttr.getValues<Attribute>().end());
-  return DenseElementsAttr::get(newType, values);
+  if (auto floatTy = dyn_cast<FloatType>(newType.getElementType());
+      floatTy && floatTy != denseAttr.getElementType())
+    denseAttr = cast<DenseFPElementsAttr>(denseAttr).mapValues(
+        floatTy, [&](const APFloat &value) {
+          return convertFloat(value, floatTy).bitcastToAPInt();
+        });
+  return denseAttr.reshape(newType);
 }
 
 /// Build the ranked memref type corresponding to a cuda_tile.global
@@ -370,11 +382,10 @@ static DenseElementsAttr retypeDenseElements(DenseElementsAttr denseAttr,
 /// cuda_tile.global stores a DenseElementsAttr payload and semantically
 /// materializes a static allocation initialized at module load time. We lower
 /// that allocation to memref.global with a ranked static memref type matching
-/// the payload shape/element type.
-static FailureOr<MemRefType>
-getGlobalMemRefTypeOrFail(cuda_tile::GlobalOp globalOp,
-                          ConversionPatternRewriter &rewriter,
-                          Operation *diagnosticOp) {
+/// the payload shape and converted element type.
+static FailureOr<MemRefType> getGlobalMemRefTypeOrFail(
+    cuda_tile::GlobalOp globalOp, const TypeConverter &converter,
+    ConversionPatternRewriter &rewriter, Operation *diagnosticOp) {
   auto initTy = dyn_cast<ShapedType>(globalOp.getValue().getType());
   if (!initTy || !initTy.hasStaticShape())
     return rewriter.notifyMatchFailure(
@@ -387,7 +398,8 @@ getGlobalMemRefTypeOrFail(cuda_tile::GlobalOp globalOp,
         diagnosticOp,
         "global initializer must be 1-D to match cuda_tile.global semantics");
 
-  return MemRefType::get(initTy.getShape(), initTy.getElementType());
+  return MemRefType::get(initTy.getShape(),
+                         converter.convertType(initTy.getElementType()));
 }
 
 struct MmaContractionSpec {
@@ -1320,50 +1332,28 @@ struct ConvertCmpI : public OpConversionPattern<cuda_tile::CmpIOp> {
   }
 };
 
-/// Convert cuda_tile.constant to arith/vector constants.
-///
-///   - Scalar tiles (rank 0): Convert to scalar arith ops
-///   - Ranked tiles: Convert to an arith.constant with a DenseElementsAttr of
-///     the target vector type (splat values use the splat form, e.g.
-///     `arith.constant dense<7> : vector<1x1xi32>`).
-///   - Scalar integer conversion preserves the integer type; casts to `index`
-///     are inserted at the ops that require them.
-///   - Scalar pointer tiles are forwarded unchanged; the type converter maps
-///     them to `memref<*xT>`.
+/// Convert cuda_tile.constant to an arith.constant of the converted type:
+/// a scalar attribute for rank-0 tiles, a DenseElementsAttr of the target
+/// vector type otherwise.
 struct ConvertConstant : public OpConversionPattern<cuda_tile::ConstantOp> {
   using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::ConstantOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto tileType = op.getType();
-    Type resultType = getTypeConverter()->convertType(tileType);
-    if (!resultType)
-      return failure();
+    Type resultType = getTypeConverter()->convertType(op.getType());
+    if (!resultType ||
+        !(isa<VectorType>(resultType) || resultType.isIntOrFloat()))
+      return rewriter.notifyMatchFailure(op, "unsupported constant type");
 
-    auto denseVal = op.getValue();
-
-    if (tileType.getShape().empty()) {
-      // Scalar tile -> scalar constant
-      auto elemTy = tileType.getElementType();
-      if (isa<IntegerType>(elemTy)) {
-        auto splat = denseVal.getSplatValue<APInt>();
-        rewriter.replaceOpWithNewOp<arith::ConstantIntOp>(op, resultType,
-                                                          splat.getSExtValue());
-      } else if (isa<FloatType>(elemTy)) {
-        auto splat = denseVal.getSplatValue<APFloat>();
-        rewriter.replaceOpWithNewOp<arith::ConstantFloatOp>(
-            op, cast<FloatType>(resultType), splat);
-      } else {
-        return failure();
-      }
-    } else {
-      // Tile -> vector constant (splat or dense), emitted directly as
-      // arith.constant with a DenseElementsAttr of the target vector type.
-      auto vecTy = cast<VectorType>(resultType);
-      DenseElementsAttr vecAttr = retypeDenseElements(denseVal, vecTy);
-      rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, vecTy, vecAttr);
-    }
+    auto shapedTy = dyn_cast<VectorType>(resultType);
+    DenseElementsAttr value = retypeDenseElements(
+        op.getValue(), shapedTy ? ShapedType(shapedTy)
+                                : RankedTensorType::get({}, resultType));
+    TypedAttr attr = shapedTy
+                         ? TypedAttr(value)
+                         : cast<TypedAttr>(value.getSplatValue<Attribute>());
+    rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, resultType, attr);
     return success();
   }
 };
@@ -1957,7 +1947,8 @@ struct ConvertGetGlobal : public OpConversionPattern<cuda_tile::GetGlobalOp> {
 
     FailureOr<MemRefType> rankedMemRefTy = failure();
     if (auto tileirGlobal = dyn_cast<cuda_tile::GlobalOp>(symbolOp)) {
-      rankedMemRefTy = getGlobalMemRefTypeOrFail(tileirGlobal, rewriter, op);
+      rankedMemRefTy = getGlobalMemRefTypeOrFail(
+          tileirGlobal, *getTypeConverter(), rewriter, op);
     } else if (auto memrefGlobal = dyn_cast<memref::GlobalOp>(symbolOp)) {
       auto memrefTy = dyn_cast<MemRefType>(memrefGlobal.getType());
       if (!memrefTy)
@@ -2147,7 +2138,8 @@ struct ConvertGlobal : public OpConversionPattern<cuda_tile::GlobalOp> {
   LogicalResult
   matchAndRewrite(cuda_tile::GlobalOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto memrefTy = getGlobalMemRefTypeOrFail(op, rewriter, op);
+    auto memrefTy =
+        getGlobalMemRefTypeOrFail(op, *getTypeConverter(), rewriter, op);
     if (failed(memrefTy))
       return failure();
 
@@ -3174,7 +3166,9 @@ struct ConvertLoadPtrTkoRanked
 
     Location loc = op.getLoc();
     auto shape = tileTy.getShape();
-    Type elemTy = tileTy.getElementType();
+    auto resultVecTy =
+        cast<VectorType>(getTypeConverter()->convertType(tileTy));
+    Type elemTy = resultVecTy.getElementType();
 
     bool useRowLoads = shape.size() >= 2 &&
                        hasUnitMinorStride(adaptor.getSource(), shape.back());
@@ -3187,7 +3181,6 @@ struct ConvertLoadPtrTkoRanked
       return failure();
 
     // Passthrough.
-    auto resultVecTy = VectorType::get(shape, elemTy);
     Value passThru;
     if (op.getPaddingValue()) {
       passThru = adaptor.getPaddingValue();
@@ -3250,7 +3243,9 @@ struct ConvertStorePtrTkoRanked
 
     Location loc = op.getLoc();
     auto shape = valTileTy.getShape();
-    Type elemTy = valTileTy.getElementType();
+    Value valVec = adaptor.getValue();
+    auto valVecTy = cast<VectorType>(valVec.getType());
+    Type elemTy = valVecTy.getElementType();
 
     Value baseMemref, mask, indexVec;
     if (failed(deriveAccessMemRefAndMask(
@@ -3259,11 +3254,8 @@ struct ConvertStorePtrTkoRanked
             /*flatten=*/true, baseMemref, mask, indexVec)))
       return failure();
 
-    Value valVec = adaptor.getValue();
-
     // vector.scatter lowers to LLVM only for rank-1 vectors. The index/mask
     // were flattened to rank-1 in the helper; flatten the value to match.
-    auto valVecTy = cast<VectorType>(valVec.getType());
     if (valVecTy.getRank() != 1) {
       auto flatValTy = VectorType::get({valVecTy.getNumElements()}, elemTy);
       valVec = vector::ShapeCastOp::create(rewriter, loc, flatValTy, valVec);
@@ -3815,60 +3807,62 @@ static void populateTileIRToMLIRTypeConverter(TypeConverter &converter,
   // Fallback: keep types unchanged.
   converter.addConversion([](Type type) { return type; });
 
+  // CPU has no tf32 representation; widen it (exactly) to f32 wherever it is
+  // used as an element type.
+  if (target == TileIRTarget::CPU)
+    converter.addConversion(
+        [ctx](FloatTF32Type) -> Type { return Float32Type::get(ctx); });
+
   // cuda_tile.tile<MxNxelemTy> -> vector<MxNxelemTy> (ranked tiles)
   // cuda_tile.tile<elemTy> (scalar, rank 0):
   //   - ints        -> preserved scalar integer type
   //   - float       -> preserved scalar type
   //   - ptr<T>      -> memref<*xT> (unranked memref backing the pointer)
-  converter.addConversion([ctx, target](cuda_tile::TileType tileTy) -> Type {
-    auto shape = tileTy.getShape();
-    auto elemTy = tileTy.getElementType();
+  converter.addConversion(
+      [ctx, &converter](cuda_tile::TileType tileTy) -> Type {
+        auto shape = tileTy.getShape();
+        Type elemTy = tileTy.getElementType();
 
-    // CPU has no tf32 representation; lower tf32 tiles to f32 so the resulting
-    // vector/arith ops are valid on the host target.
-    if (target == TileIRTarget::CPU && isa<FloatTF32Type>(elemTy))
-      elemTy = Float32Type::get(ctx);
-
-    if (shape.empty()) {
-      if (isa<IntegerType>(elemTy)) {
-        return elemTy;
-      }
-
-      if (isa<FloatType>(elemTy))
-        return elemTy;
-      if (auto ptrTy = dyn_cast<cuda_tile::PointerType>(elemTy))
-        return UnrankedMemRefType::get(ptrTy.getPointeeType(), {});
-      return Type();
-    }
-    if (auto ptrTy = dyn_cast<cuda_tile::PointerType>(elemTy)) {
-      // Ranked pointer tiles represent per-element offsets from a base
-      // buffer.  Lower to vector<...xindex> so that broadcast/reshape/offset
-      // become trivial vector arithmetic and loads/stores lower to
-      // vector.gather/scatter.
-      return VectorType::get(shape, IndexType::get(ctx));
-    }
-    return VectorType::get(shape, elemTy);
-  });
+        if (auto ptrTy = dyn_cast<cuda_tile::PointerType>(elemTy)) {
+          if (shape.empty())
+            return UnrankedMemRefType::get(
+                converter.convertType(ptrTy.getPointeeType()), {});
+          // Ranked pointer tiles represent per-element offsets from a base
+          // buffer.  Lower to vector<...xindex> so that
+          // broadcast/reshape/offset become trivial vector arithmetic and
+          // loads/stores lower to vector.gather/scatter.
+          return VectorType::get(shape, IndexType::get(ctx));
+        }
+        elemTy = converter.convertType(elemTy);
+        if (!elemTy || !elemTy.isIntOrFloat())
+          return Type();
+        if (shape.empty())
+          return elemTy;
+        return VectorType::get(shape, elemTy);
+      });
 
   // tensor_view / partition_view -> ranked memref describing the same buffer.
   // (partition_view inherits its memref layout from the underlying tensor_view;
   // tile_shape / dim_map / padding_value are read off the source op's type at
   // each use site.)
-  converter.addConversion([](cuda_tile::TensorViewType tvTy) -> Type {
-    return tensorViewToMemRefType(tvTy);
+  converter.addConversion([&converter](cuda_tile::TensorViewType tvTy) -> Type {
+    return tensorViewToMemRefType(tvTy, converter);
   });
-  converter.addConversion([](cuda_tile::PartitionViewType pvTy) -> Type {
-    return tensorViewToMemRefType(pvTy.getTensorView());
-  });
+  converter.addConversion(
+      [&converter](cuda_tile::PartitionViewType pvTy) -> Type {
+        return tensorViewToMemRefType(pvTy.getTensorView(), converter);
+      });
   // strided_view / gather_scatter_view likewise alias the underlying
   // tensor_view buffer; tile_shape / traversal_strides / dim_map / sparse_dim /
   // padding_value are read off the view type at each consumer use site.
-  converter.addConversion([](cuda_tile::StridedViewType svTy) -> Type {
-    return tensorViewToMemRefType(svTy.getTensorView());
-  });
-  converter.addConversion([](cuda_tile::GatherScatterViewType gsTy) -> Type {
-    return tensorViewToMemRefType(gsTy.getTensorView());
-  });
+  converter.addConversion(
+      [&converter](cuda_tile::StridedViewType svTy) -> Type {
+        return tensorViewToMemRefType(svTy.getTensorView(), converter);
+      });
+  converter.addConversion(
+      [&converter](cuda_tile::GatherScatterViewType gsTy) -> Type {
+        return tensorViewToMemRefType(gsTy.getTensorView(), converter);
+      });
   converter.addConversion(
       [](cuda_tile::TokenType tokTy) -> Type { return tokTy; });
 
