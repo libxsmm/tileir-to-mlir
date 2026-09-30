@@ -658,6 +658,66 @@ struct ConvertFromToSignednessCastWithRoundingOp
   bool dropRoundingModes;
 };
 
+/// Flatten the 1:N adaptor operands of a pattern into a single value list.
+static SmallVector<Value> flattenValues(ArrayRef<ValueRange> values) {
+  SmallVector<Value> flat;
+  for (ValueRange range : values)
+    llvm::append_range(flat, range);
+  return flat;
+}
+
+/// Group `newValues` by the number of types each of `origTypes` converts to,
+/// e.g. to replace the results of an op whose token results were dropped.
+static SmallVector<ValueRange>
+groupByConvertedTypes(const TypeConverter &converter, TypeRange origTypes,
+                      ValueRange newValues) {
+  SmallVector<ValueRange> groups;
+  for (Type type : origTypes) {
+    SmallVector<Type> convertedTypes;
+    (void)converter.convertType(type, convertedTypes);
+    groups.push_back(newValues.take_front(convertedTypes.size()));
+    newValues = newValues.drop_front(convertedTypes.size());
+  }
+  return groups;
+}
+
+/// Base for patterns of ops with token operands. Tokens convert to no values
+/// (see the type converter), so their operands are null in the 1:1 adaptor.
+template <typename SourceOp>
+struct TokenDroppingPattern : public OpConversionPattern<SourceOp> {
+  using OpConversionPattern<SourceOp>::OpConversionPattern;
+  using OpAdaptor = typename OpConversionPattern<SourceOp>::OpAdaptor;
+  using OneToNOpAdaptor =
+      typename OpConversionPattern<SourceOp>::OneToNOpAdaptor;
+
+  LogicalResult
+  matchAndRewrite(SourceOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const final {
+    SmallVector<Value> operands;
+    for (ValueRange values : adaptor.getOperands()) {
+      if (values.size() > 1)
+        return rewriter.notifyMatchFailure(op, "unexpected 1:N operand");
+      operands.push_back(values.empty() ? Value() : values.front());
+    }
+    const OpConversionPattern<SourceOp> &self = *this;
+    return self.matchAndRewrite(op, OpAdaptor(operands, adaptor), rewriter);
+  }
+};
+
+/// Erase token-producing ops (make_token / join_tokens).
+template <typename SrcOp>
+struct EraseTokenOp : public TokenDroppingPattern<SrcOp> {
+  using TokenDroppingPattern<SrcOp>::TokenDroppingPattern;
+
+  LogicalResult
+  matchAndRewrite(SrcOp op,
+                  typename TokenDroppingPattern<SrcOp>::OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 /// Convert cuda_tile terminators (continue / yield) to scf.yield.
 template <typename SrcOp>
 struct ConvertToScfYield : public OpConversionPattern<SrcOp> {
@@ -665,10 +725,10 @@ struct ConvertToScfYield : public OpConversionPattern<SrcOp> {
 
   LogicalResult
   matchAndRewrite(SrcOp op,
-                  typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
+                  typename OpConversionPattern<SrcOp>::OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    rewriter.template replaceOpWithNewOp<scf::YieldOp>(op,
-                                                       adaptor.getOperands());
+    rewriter.template replaceOpWithNewOp<scf::YieldOp>(
+        op, flattenValues(adaptor.getOperands()));
     return success();
   }
 };
@@ -947,9 +1007,6 @@ static LogicalResult checkCommonTkoGuards(TkoOp op,
   if (op.getMemoryScope())
     return rewriter.notifyMatchFailure(
         op, "memory_scope is not supported by this lowering");
-  if (!op.getResultToken().use_empty())
-    return rewriter.notifyMatchFailure(
-        op, "result_token has live uses; this lowering drops the token");
   return success();
 }
 
@@ -1685,14 +1742,15 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
   using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
-  matchAndRewrite(cuda_tile::ForOp op, OpAdaptor adaptor,
+  matchAndRewrite(cuda_tile::ForOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     Type indexTy = rewriter.getIndexType();
-    auto toIndex = [&](Value bound) -> Value {
+    auto toIndex = [&](ValueRange bound) -> Value {
       if (op.getUnsignedCmp())
-        return arith::IndexCastUIOp::create(rewriter, loc, indexTy, bound);
-      return arith::IndexCastOp::create(rewriter, loc, indexTy, bound);
+        return arith::IndexCastUIOp::create(rewriter, loc, indexTy,
+                                            bound.front());
+      return arith::IndexCastOp::create(rewriter, loc, indexTy, bound.front());
     };
     Value lb = toIndex(adaptor.getLowerBound());
     Value ub = toIndex(adaptor.getUpperBound());
@@ -1804,9 +1862,9 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
       step = arith::MulIOp::create(rewriter, loc, step, tileSizeVal);
     }
 
-    auto newForOp =
-        scf::ForOp::create(rewriter, loc, lb, ub, step, adaptor.getInitValues(),
-                           /*bodyBuilder=*/nullptr, op.getUnsignedCmp());
+    auto newForOp = scf::ForOp::create(
+        rewriter, loc, lb, ub, step, flattenValues(adaptor.getInitValues()),
+        /*bodyBuilder=*/nullptr, op.getUnsignedCmp());
 
     // Convert region types
     if (failed(
@@ -1843,7 +1901,9 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
       replacingValues.push_back(arg);
 
     rewriter.mergeBlocks(oldBody, newBody, replacingValues);
-    rewriter.replaceOp(op, newForOp.getResults());
+    rewriter.replaceOpWithMultiple(
+        op, groupByConvertedTypes(*getTypeConverter(), op.getResultTypes(),
+                                  newForOp.getResults()));
     return success();
   }
 };
@@ -2173,7 +2233,7 @@ struct ConvertIf : public OpConversionPattern<cuda_tile::IfOp> {
   using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
-  matchAndRewrite(cuda_tile::IfOp op, OpAdaptor adaptor,
+  matchAndRewrite(cuda_tile::IfOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     SmallVector<Type> resultTypes;
     if (failed(
@@ -2182,7 +2242,7 @@ struct ConvertIf : public OpConversionPattern<cuda_tile::IfOp> {
 
     bool hasElse = !op.getElseRegion().empty();
     auto newIfOp = scf::IfOp::create(rewriter, op.getLoc(), resultTypes,
-                                     adaptor.getCondition(), hasElse);
+                                     adaptor.getCondition().front(), hasElse);
 
     // Replace the auto-created (empty) scf.if block by the cuda_tile.if one.
     auto moveBody = [&](Block *oldBlock, Block *newBlock) {
@@ -2194,7 +2254,9 @@ struct ConvertIf : public OpConversionPattern<cuda_tile::IfOp> {
     if (hasElse)
       moveBody(op.getElseBlock(), newIfOp.elseBlock());
 
-    rewriter.replaceOp(op, newIfOp.getResults());
+    rewriter.replaceOpWithMultiple(
+        op, groupByConvertedTypes(*getTypeConverter(), op.getResultTypes(),
+                                  newIfOp.getResults()));
     return success();
   }
 };
@@ -2248,16 +2310,15 @@ using ConvertIToF = ConvertFromToSignednessCastWithRoundingOp<
 /// Restrictions (return notifyMatchFailure on violation):
 ///   - Only `weak` memory_ordering_semantics is supported.
 ///   - `memory_scope` is not supported.
-///   - `result_token` must have no live uses; this lowering drops the token.
 ///
 /// `optimization_hints`, when present, is preserved on the produced
 /// vector.transfer_read as the discardable attribute
 /// `tir-dropped-optimization-hints`.
 struct ConvertLoadViewTko
-    : public OpConversionPattern<cuda_tile::LoadViewTkoOp> {
+    : public TokenDroppingPattern<cuda_tile::LoadViewTkoOp> {
   ConvertLoadViewTko(const TypeConverter &tc, MLIRContext *ctx,
                      bool assumeInBounds)
-      : OpConversionPattern(tc, ctx), assumeInBounds(assumeInBounds) {}
+      : TokenDroppingPattern(tc, ctx), assumeInBounds(assumeInBounds) {}
 
   LogicalResult
   matchAndRewrite(cuda_tile::LoadViewTkoOp op, OpAdaptor adaptor,
@@ -2357,34 +2418,6 @@ struct ConvertMakeStridedView
   matchAndRewrite(cuda_tile::MakeStridedViewOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     rewriter.replaceOp(op, adaptor.getTensorView());
-    return success();
-  }
-};
-
-/// Convert cuda_tile.make_token by erasing it.
-///
-/// TKO tokens are currently ignored during lowering; this pattern erases the
-/// generator op. It assumes other patterns (load_tko etc.) have already
-/// dropped their dependency on this token.
-struct ConvertMakeToken : public OpConversionPattern<cuda_tile::MakeTokenOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(cuda_tile::MakeTokenOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    rewriter.eraseOp(op);
-    return success();
-  }
-};
-
-/// Convert cuda_tile.join_tokens by erasing it.
-struct ConvertJoinTokens : public OpConversionPattern<cuda_tile::JoinTokensOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(cuda_tile::JoinTokensOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    rewriter.eraseOp(op);
     return success();
   }
 };
@@ -2822,8 +2855,8 @@ struct ConvertNegI : public OpConversionPattern<cuda_tile::NegIOp> {
 /// `optimization_hints`, when present, is preserved on the produced memref.load
 /// as the discardable attribute `tir-dropped-optimization-hints`.
 struct ConvertLoadPtrTkoScalar
-    : public OpConversionPattern<cuda_tile::LoadPtrTkoOp> {
-  using OpConversionPattern::OpConversionPattern;
+    : public TokenDroppingPattern<cuda_tile::LoadPtrTkoOp> {
+  using TokenDroppingPattern::TokenDroppingPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::LoadPtrTkoOp op, OpAdaptor adaptor,
@@ -2858,8 +2891,8 @@ struct ConvertLoadPtrTkoScalar
 /// `optimization_hints`, when present, is preserved on the produced
 /// memref.store as the discardable attribute `tir-dropped-optimization-hints`.
 struct ConvertStorePtrTkoScalar
-    : public OpConversionPattern<cuda_tile::StorePtrTkoOp> {
-  using OpConversionPattern::OpConversionPattern;
+    : public TokenDroppingPattern<cuda_tile::StorePtrTkoOp> {
+  using TokenDroppingPattern::TokenDroppingPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::StorePtrTkoOp op, OpAdaptor adaptor,
@@ -3158,8 +3191,8 @@ static Value buildRowWiseMaskedLoad(cuda_tile::LoadPtrTkoOp op,
 /// `optimization_hints`, when present, is preserved on the produced
 /// memory ops as the discardable attribute `tir-dropped-optimization-hints`.
 struct ConvertLoadPtrTkoRanked
-    : public OpConversionPattern<cuda_tile::LoadPtrTkoOp> {
-  using OpConversionPattern::OpConversionPattern;
+    : public TokenDroppingPattern<cuda_tile::LoadPtrTkoOp> {
+  using TokenDroppingPattern::TokenDroppingPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::LoadPtrTkoOp op, OpAdaptor adaptor,
@@ -3235,8 +3268,8 @@ struct ConvertLoadPtrTkoRanked
 /// vector.scatter as the discardable attribute
 /// `tir-dropped-optimization-hints`.
 struct ConvertStorePtrTkoRanked
-    : public OpConversionPattern<cuda_tile::StorePtrTkoOp> {
-  using OpConversionPattern::OpConversionPattern;
+    : public TokenDroppingPattern<cuda_tile::StorePtrTkoOp> {
+  using TokenDroppingPattern::TokenDroppingPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::StorePtrTkoOp op, OpAdaptor adaptor,
@@ -3330,8 +3363,8 @@ mapAtomicRMWMode(cuda_tile::AtomicRMWMode mode) {
 ///
 /// Higher-rank atomics are not lowered in this pass.
 struct ConvertAtomicRMWTko
-    : public OpConversionPattern<cuda_tile::AtomicRMWTkoOp> {
-  using OpConversionPattern::OpConversionPattern;
+    : public TokenDroppingPattern<cuda_tile::AtomicRMWTkoOp> {
+  using TokenDroppingPattern::TokenDroppingPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::AtomicRMWTkoOp op, OpAdaptor adaptor,
@@ -3354,9 +3387,6 @@ struct ConvertAtomicRMWTko
         return rewriter.notifyMatchFailure(
             op, "masked scalar atomic_rmw_tko is not supported");
     }
-    if (!op.getResultToken().use_empty())
-      return rewriter.notifyMatchFailure(
-          op, "result_token has live uses; this lowering drops the token");
 
     if (!isa<UnrankedMemRefType>(adaptor.getPointers().getType()))
       return rewriter.notifyMatchFailure(
@@ -3422,13 +3452,8 @@ struct ConvertPow : public OpConversionPattern<cuda_tile::PowOp> {
 
 /// Convert cuda_tile.ptr_to_ptr using memref.cast when representable.
 ///
-/// Pointer model in this pass: tile<ptr<T>> -> memref<*xT>
-///
-///   1. Convert the result pointer tile type to a memref type.
-///   2. Recover the converted memref source when the adaptor provides a
-///      temporary unrealized_conversion_cast wrapper.
-///   3. Require memref.cast compatibility and emit memref.cast.
-///   4. Fail the pattern if ptr_to_ptr cannot be represented as memref.cast.
+/// Pointer model in this pass: tile<ptr<T>> -> memref<*xT>. The pattern fails
+/// if the conversion cannot be represented as a memref.cast.
 struct ConvertPtrToPtrCastOrFail
     : public OpConversionPattern<cuda_tile::PtrToPtrOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -3443,15 +3468,6 @@ struct ConvertPtrToPtrCastOrFail
       return failure();
 
     Value source = adaptor.getSource();
-    // During conversion, ptr_to_ptr often receives a target-materialized
-    // operand (unrealized_conversion_cast) to the still-illegal source type.
-    // Peel that wrapper to recover the already-converted memref input.
-    if (auto materialize = source.getDefiningOp<UnrealizedConversionCastOp>()) {
-      if (materialize.getInputs().size() == 1 &&
-          isa<BaseMemRefType>(materialize.getInputs()[0].getType()))
-        source = materialize.getInputs()[0];
-    }
-
     auto resultMemRefTy = dyn_cast<BaseMemRefType>(resultTy.value());
     auto sourceMemRefTy = dyn_cast<BaseMemRefType>(source.getType());
     if (!resultMemRefTy || !sourceMemRefTy)
@@ -3702,16 +3718,15 @@ using ConvertSqrt = ConvertUnaryApproxMathOp<cuda_tile::SqrtOp, math::SqrtOp,
 /// Restrictions / guards:
 ///   - Only `weak` memory_ordering_semantics is supported.
 ///   - `memory_scope` is not supported.
-///   - `result_token` must be unused (we drop the token).
 ///
 /// `optimization_hints`, when present, is preserved on the produced
 /// vector.transfer_write as the discardable attribute
 /// `tir-dropped-optimization-hints`.
 struct ConvertStoreViewTko
-    : public OpConversionPattern<cuda_tile::StoreViewTkoOp> {
+    : public TokenDroppingPattern<cuda_tile::StoreViewTkoOp> {
   ConvertStoreViewTko(const TypeConverter &tc, MLIRContext *ctx,
                       bool assumeInBounds)
-      : OpConversionPattern(tc, ctx), assumeInBounds(assumeInBounds) {}
+      : TokenDroppingPattern(tc, ctx), assumeInBounds(assumeInBounds) {}
 
   LogicalResult
   matchAndRewrite(cuda_tile::StoreViewTkoOp op, OpAdaptor adaptor,
@@ -3811,8 +3826,12 @@ using ConvertYield = ConvertToScfYield<cuda_tile::YieldOp>;
 static void populateTileIRToMLIRTypeConverter(TypeConverter &converter,
                                               MLIRContext *ctx,
                                               TileIRTarget target) {
-  // Fallback: keep types unchanged.
-  converter.addConversion([](Type type) { return type; });
+  // Types of other dialects are kept; cuda_tile types must be converted below.
+  converter.addConversion([](Type type) -> std::optional<Type> {
+    if (isa<cuda_tile::CudaTileDialect>(type.getDialect()))
+      return std::nullopt;
+    return type;
+  });
 
   // CPU has no tf32 representation; widen it (exactly) to f32 wherever it is
   // used as an element type.
@@ -3870,17 +3889,11 @@ static void populateTileIRToMLIRTypeConverter(TypeConverter &converter,
       [&converter](cuda_tile::GatherScatterViewType gsTy) -> Type {
         return tensorViewToMemRefType(gsTy.getTensorView(), converter);
       });
-  converter.addConversion(
-      [](cuda_tile::TokenType tokTy) -> Type { return tokTy; });
 
-  // Source/target materialization: both insert an unrealized_conversion_cast.
-  auto materializeCast = [](OpBuilder &builder, Type resultType,
-                            ValueRange inputs, Location loc) -> Value {
-    return UnrealizedConversionCastOp::create(builder, loc, resultType, inputs)
-        .getResult(0);
-  };
-  converter.addSourceMaterialization(materializeCast);
-  converter.addTargetMaterialization(materializeCast);
+  // Tokens only order memory operations, which the lowered IR orders by
+  // program order, so they convert to no values.
+  converter.addConversion(
+      [](cuda_tile::TokenType, SmallVectorImpl<Type> &) { return success(); });
 }
 
 /// Register all cuda_tile -> gpu/vector conversion patterns.
@@ -3901,159 +3914,33 @@ static void populateTileIRToMLIRConversionPatterns(
       converter, ctx, dropRoundingModes);
   patterns.add<ConvertLoadViewTko, ConvertStoreViewTko>(converter, ctx,
                                                         assumeInBounds);
-  patterns.add<
-      ConvertAbsF, ConvertAbsI, ConvertAddI, ConvertAlloca, ConvertAndI,
-      ConvertAssume, ConvertAtan2, ConvertBitcast, ConvertBroadcast, ConvertCat,
-      ConvertCeil, ConvertCmpF, ConvertCmpI, ConvertConstant, ConvertContinue,
-      ConvertCos, ConvertCosH, ConvertAtomicRMWTko, ConvertDivI, ConvertExp,
-      ConvertExp2, ConvertExtI, ConvertExtract, ConvertFloor, ConvertFma,
-      ConvertFor, ConvertGetGlobal, ConvertGetIndexSpaceShape,
-      ConvertGetTensorShape, ConvertGlobal, ConvertIf, ConvertIota,
-      ConvertJoinTokens, ConvertLoadPtrTkoRanked, ConvertLoadPtrTkoScalar,
-      ConvertLog, ConvertLog2, ConvertMakeGatherScatterView,
-      ConvertMakePartitionView, ConvertMakeStridedView, ConvertMakeTensorView,
-      ConvertMakeToken, ConvertMaxF, ConvertMaxI, ConvertMinF, ConvertMinI,
-      ConvertMmaF, ConvertMmaI, ConvertMulhiI, ConvertMulI, ConvertOffsetRanked,
-      ConvertOffsetScalarPtr, ConvertNegF, ConvertNegI, ConvertOrI, ConvertPack,
-      ConvertPermute, ConvertPow, ConvertPtrToPtrCastOrFail, ConvertReduce,
-      ConvertRemF, ConvertRemI, ConvertReshape, ConvertRsqrt, ConvertScan,
-      ConvertSelect, ConvertShLI, ConvertShRI, ConvertSin, ConvertSinH,
-      ConvertStorePtrTkoRanked, ConvertStorePtrTkoScalar, ConvertSubI,
-      ConvertTan, ConvertTruncI, ConvertUnpack, ConvertXOrI, ConvertYield>(
-      converter, ctx);
+  patterns
+      .add<ConvertAbsF, ConvertAbsI, ConvertAddI, ConvertAlloca, ConvertAndI,
+           ConvertAssume, ConvertAtan2, ConvertBitcast, ConvertBroadcast,
+           ConvertCat, ConvertCeil, ConvertCmpF, ConvertCmpI, ConvertConstant,
+           ConvertContinue, ConvertCos, ConvertCosH, ConvertAtomicRMWTko,
+           ConvertDivI, ConvertExp, ConvertExp2, ConvertExtI, ConvertExtract,
+           ConvertFloor, ConvertFma, ConvertFor, ConvertGetGlobal,
+           ConvertGetIndexSpaceShape, ConvertGetTensorShape, ConvertGlobal,
+           ConvertIf, ConvertIota, EraseTokenOp<cuda_tile::JoinTokensOp>,
+           ConvertLoadPtrTkoRanked, ConvertLoadPtrTkoScalar, ConvertLog,
+           ConvertLog2, ConvertMakeGatherScatterView, ConvertMakePartitionView,
+           ConvertMakeStridedView, ConvertMakeTensorView,
+           EraseTokenOp<cuda_tile::MakeTokenOp>, ConvertMaxF, ConvertMaxI,
+           ConvertMinF, ConvertMinI, ConvertMmaF, ConvertMmaI, ConvertMulhiI,
+           ConvertMulI, ConvertOffsetRanked, ConvertOffsetScalarPtr,
+           ConvertNegF, ConvertNegI, ConvertOrI, ConvertPack, ConvertPermute,
+           ConvertPow, ConvertPtrToPtrCastOrFail, ConvertReduce, ConvertRemF,
+           ConvertRemI, ConvertReshape, ConvertRsqrt, ConvertScan,
+           ConvertSelect, ConvertShLI, ConvertShRI, ConvertSin, ConvertSinH,
+           ConvertStorePtrTkoRanked, ConvertStorePtrTkoScalar, ConvertSubI,
+           ConvertTan, ConvertTruncI, ConvertUnpack, ConvertXOrI, ConvertYield>(
+          converter, ctx);
 }
 
 //===----------------------------------------------------------------------===//
 // Pass Definition
 //===----------------------------------------------------------------------===//
-
-/// Pre-conversion cleanup: strips token-typed loop-carried values from
-/// `cuda_tile.for` because target dialects cannot represent `!cuda_tile.token`
-/// in `scf.for` iter args.
-///
-/// Stripping tokens is semantics-preserving (specifically, a conservative
-/// over-approximation) because lowered memory operations carry read/write
-/// memory effects, so program order and sequential loop execution naturally
-/// subsume token-imposed partial execution orderings. Leftover dangling
-/// references to dropped token block-args/results are mapped to dummy
-/// `make_token` ops, which are then cleaned up by normal conversion patterns.
-///
-/// NOTE: This workaround is required because `cuda_tile.for` does not implement
-/// loop/region-branch interfaces. It can be replaced or removed if proper
-/// token propagation or conversion is introduced in the future.
-static void dropLoopCarriedTokens(ModuleOp module) {
-  MLIRContext *ctx = module.getContext();
-  auto isToken = [](Type t) { return isa<cuda_tile::TokenType>(t); };
-
-  SmallVector<cuda_tile::ForOp> forOps;
-  module.walk([&](cuda_tile::ForOp op) { forOps.push_back(op); });
-
-  for (cuda_tile::ForOp forOp : forOps) {
-    unsigned numIter = forOp.getNumResults();
-    unsigned numInduction = forOp.getNumInductionVars();
-    Block *oldBody = forOp.getBody();
-
-    SmallVector<unsigned> keepIter;
-    for (unsigned i = 0; i < numIter; ++i)
-      if (!isToken(forOp.getResult(i).getType()))
-        keepIter.push_back(i);
-    if (keepIter.size() == numIter)
-      continue; // no token iter values to drop
-
-    OpBuilder builder(forOp);
-
-    // Redirect remaining uses of dropped token block arguments (e.g. a tko op's
-    // `token` operand, or a nested loop's token init) to a fresh make_token, so
-    // the body stays valid once the block argument is gone.
-    builder.setInsertionPointToStart(oldBody);
-    for (unsigned i = 0; i < numIter; ++i) {
-      if (!isToken(forOp.getResult(i).getType()))
-        continue;
-      BlockArgument arg = oldBody->getArgument(numInduction + i);
-      if (arg.use_empty())
-        continue;
-      auto tok = cuda_tile::MakeTokenOp::create(builder, forOp.getLoc(),
-                                                cuda_tile::TokenType::get(ctx));
-      arg.replaceAllUsesWith(tok.getResult());
-    }
-
-    SmallVector<Value> newInits;
-    for (unsigned i : keepIter)
-      newInits.push_back(forOp.getInitValues()[i]);
-
-    builder.setInsertionPoint(forOp);
-    auto newFor = cuda_tile::ForOp::create(
-        builder, forOp.getLoc(), forOp.getLowerBound(), forOp.getUpperBound(),
-        forOp.getStep(), newInits);
-
-    // Map old block args -> new block args (induction var + kept iter args).
-    Block *newBody = newFor.getBody();
-    oldBody->getArgument(0).replaceAllUsesWith(newBody->getArgument(0));
-    for (unsigned newIdx = 0; newIdx < keepIter.size(); ++newIdx)
-      oldBody->getArgument(numInduction + keepIter[newIdx])
-          .replaceAllUsesWith(newBody->getArgument(numInduction + newIdx));
-
-    // Splice the old body into the new one, dropping the auto-generated
-    // terminator of the freshly created body.
-    if (newBody->mightHaveTerminator())
-      newBody->getTerminator()->erase();
-    newBody->getOperations().splice(newBody->end(), oldBody->getOperations());
-
-    // Rebuild the continue to only yield the kept values.
-    auto contOp = cast<cuda_tile::ContinueOp>(newBody->getTerminator());
-    SmallVector<Value> newYields;
-    for (unsigned i : keepIter)
-      newYields.push_back(contOp.getOperand(i));
-    builder.setInsertionPoint(contOp);
-    cuda_tile::ContinueOp::create(builder, contOp.getLoc(), newYields);
-    contOp.erase();
-
-    // Redirect kept results, then redirect any remaining use of a dropped token
-    // result (e.g. carried by an enclosing loop) to a fresh make_token.
-    for (unsigned newIdx = 0; newIdx < keepIter.size(); ++newIdx)
-      forOp.getResult(keepIter[newIdx])
-          .replaceAllUsesWith(newFor.getResult(newIdx));
-    builder.setInsertionPointAfter(newFor);
-    for (unsigned i = 0; i < numIter; ++i) {
-      if (!isToken(forOp.getResult(i).getType()))
-        continue;
-      Value res = forOp.getResult(i);
-      if (res.use_empty())
-        continue;
-      auto tok = cuda_tile::MakeTokenOp::create(builder, forOp.getLoc(),
-                                                cuda_tile::TokenType::get(ctx));
-      res.replaceAllUsesWith(tok.getResult());
-    }
-
-    forOp.erase();
-  }
-}
-
-/// Disconnect straight-line TKO result-token chains before conversion.
-///
-/// The target memory operations carry side effects, and the replacement token
-/// is inserted immediately after its producer, so downstream token users stay
-/// ordered after the producing memory operation. This leaves each TKO result
-/// token unused, as required by the existing conversion patterns.
-static void dropTkoResultTokenUses(ModuleOp module) {
-  SmallVector<Value> liveTkoTokens;
-  module.walk([&](Operation *op) {
-    if (!op->getName().getStringRef().ends_with("_tko"))
-      return;
-    for (Value result : op->getResults())
-      if (isa<cuda_tile::TokenType>(result.getType()) && !result.use_empty())
-        liveTkoTokens.push_back(result);
-  });
-
-  for (Value token : liveTkoTokens) {
-    Operation *producer = token.getDefiningOp();
-    OpBuilder builder(producer);
-    builder.setInsertionPointAfter(producer);
-    auto replacement = cuda_tile::MakeTokenOp::create(
-        builder, producer->getLoc(), token.getType());
-    token.replaceAllUsesWith(replacement.getResult());
-  }
-}
 
 /// cuda_tile.for is an automatic allocation scope but scf.for is not: wrap the
 /// body of every lowered loop that allocates in a memref.alloca_scope so that
@@ -4098,12 +3985,6 @@ struct ConvertTileIRToMLIRPass
       return signalPassFailure();
     }
 
-    // Strip loop-carried tokens before conversion: the target dialects cannot
-    // represent `!cuda_tile.token` scf.for iter args, and the token ordering is
-    // subsumed by program order among the lowered side-effecting ops.
-    dropLoopCarriedTokens(module);
-    dropTkoResultTokenUses(module);
-
     TypeConverter typeConverter;
     populateTileIRToMLIRTypeConverter(typeConverter, ctx, target);
 
@@ -4112,20 +3993,22 @@ struct ConvertTileIRToMLIRPass
                                            appendGridArgs, dropRoundingModes,
                                            assumeInBounds, knownBlockSize);
 
+    // TileIR ops are illegal; the ops they lower to are legal once all their
+    // types are legal.
     ConversionTarget conversionTarget(*ctx);
-
-    // GPU/vector/arith/scf/memref/ub/func ops are legal.
-    if (target == TileIRTarget::GPU)
-      conversionTarget.addLegalDialect<gpu::GPUDialect>();
-    if (target == TileIRTarget::CPU)
-      conversionTarget.addLegalDialect<func::FuncDialect>();
-    conversionTarget.addLegalDialect<arith::ArithDialect, math::MathDialect,
-                                     memref::MemRefDialect, scf::SCFDialect,
-                                     ub::UBDialect, vector::VectorDialect>();
-    conversionTarget.addLegalOp<UnrealizedConversionCastOp>();
-
-    // TileIR ops are illegal (target of conversion).
     conversionTarget.addIllegalDialect<cuda_tile::CudaTileDialect>();
+    auto hasLegalTypes = [&](Operation *op) {
+      return typeConverter.isLegal(op);
+    };
+    if (target == TileIRTarget::GPU)
+      conversionTarget.addDynamicallyLegalDialect<gpu::GPUDialect>(
+          hasLegalTypes);
+    else
+      conversionTarget.addDynamicallyLegalDialect<func::FuncDialect>(
+          hasLegalTypes);
+    conversionTarget.addDynamicallyLegalDialect<
+        arith::ArithDialect, math::MathDialect, memref::MemRefDialect,
+        scf::SCFDialect, ub::UBDialect, vector::VectorDialect>(hasLegalTypes);
 
     if (failed(applyPartialConversion(module, conversionTarget,
                                       std::move(patterns))))
@@ -4283,15 +4166,6 @@ struct ConvertTileIRToMLIRPass
       mulOp.replaceAllUsesWith(replacement);
       mulOp->erase();
     }
-
-    // Erase unrealized_conversion_casts left dead by pattern application.
-    // Casts have no regions, so a cast always precedes its cast users in walk
-    // order; sweeping in reverse therefore collapses whole chains in one pass.
-    SmallVector<Operation *> casts;
-    module.walk([&](UnrealizedConversionCastOp op) { casts.push_back(op); });
-    for (Operation *op : llvm::reverse(casts))
-      if (op->use_empty())
-        op->erase();
 
     // Mark the module as a GPU container module when targeting the GPU. For the
     // CPU target the GPU container-module marker is intentionally omitted.
