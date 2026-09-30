@@ -629,6 +629,9 @@ cuda_tile.module @m {
     %tr = ftof %x rounding<nearest_even> : tile<4xf32> -> tile<4xf16>
     // CHECK: %[[FTOF_EX:.*]] = arith.extf %[[FTOF_TR]] {{.*}}tir-dropped-rounding{{.*}} : vector<4xf16> to vector<4xf64>
     %ex = ftof %tr rounding<nearest_even> : tile<4xf16> -> tile<4xf64>
+    // Formats of the same width convert with arith.convertf.
+    // CHECK: arith.convertf %[[FTOF_TR]] to_nearest_even : vector<4xf16> to vector<4xbf16>
+    %cv = ftof %tr rounding<nearest_even> : tile<4xf16> -> tile<4xbf16>
     return
   }
 
@@ -901,8 +904,8 @@ cuda_tile.module @m {
     // Unspecified rounding defaults to nearest_even.
     // CHECK: %[[ADDF_R:.*]] = arith.addf %[[ADDF_LHS]], %[[ADDF_RHS]] : vector<4xf32>
     %result = addf %lhs, %rhs : tile<4xf32>
-    // Explicit rounding<zero> is not representable here; preserve it.
-    // CHECK: %[[ADDF_RZ:.*]] = arith.addf %[[ADDF_LHS]], %[[ADDF_RHS]] {"tir-dropped-rounding" = "zero"} : vector<4xf32>
+    // Explicit rounding<zero> maps to the arith rounding mode.
+    // CHECK: %[[ADDF_RZ:.*]] = arith.addf %[[ADDF_LHS]], %[[ADDF_RHS]] toward_zero : vector<4xf32>
     %result_z = addf %lhs, %rhs rounding<zero> : tile<4xf32>
     return
   }
@@ -916,8 +919,8 @@ cuda_tile.module @m {
     %rhs = constant <f32: [1.0, 2.0, 3.0, 4.0]> : tile<4xf32>
     // CHECK: %[[SUBF_R:.*]] = arith.subf %[[SUBF_LHS]], %[[SUBF_RHS]] : vector<4xf32>
     %result = subf %lhs, %rhs : tile<4xf32>
-    // Explicit rounding<negative_inf> is not representable here; preserve it.
-    // CHECK: %[[SUBF_RN:.*]] = arith.subf %[[SUBF_LHS]], %[[SUBF_RHS]] {"tir-dropped-rounding" = "negative_inf"} : vector<4xf32>
+    // Explicit rounding<negative_inf> maps to the arith rounding mode.
+    // CHECK: %[[SUBF_RN:.*]] = arith.subf %[[SUBF_LHS]], %[[SUBF_RHS]] downward : vector<4xf32>
     %result_n = subf %lhs, %rhs rounding<negative_inf> : tile<4xf32>
     return
   }
@@ -931,8 +934,8 @@ cuda_tile.module @m {
     %rhs = constant <f32: [2.0, 3.0, 4.0, 5.0]> : tile<4xf32>
     // CHECK: %[[MULF_R:.*]] = arith.mulf %[[MULF_LHS]], %[[MULF_RHS]] : vector<4xf32>
     %result = mulf %lhs, %rhs : tile<4xf32>
-    // Explicit rounding<positive_inf> is not representable here; preserve it.
-    // CHECK: %[[MULF_RP:.*]] = arith.mulf %[[MULF_LHS]], %[[MULF_RHS]] {"tir-dropped-rounding" = "positive_inf"} : vector<4xf32>
+    // Explicit rounding<positive_inf> maps to the arith rounding mode.
+    // CHECK: %[[MULF_RP:.*]] = arith.mulf %[[MULF_LHS]], %[[MULF_RHS]] upward : vector<4xf32>
     %result_p = mulf %lhs, %rhs rounding<positive_inf> : tile<4xf32>
     return
   }
@@ -1277,14 +1280,14 @@ cuda_tile.module @m {
     return
   }
 
-  // --- addf: non-representable rounding + flush_to_zero are preserved ---
+  // --- addf: directed rounding is mapped, flush_to_zero is preserved ---
   // CHECK-LABEL: gpu.func @test_addf_dropped_flags
   entry @test_addf_dropped_flags() {
     // CHECK-DAG: %[[DF_LHS:.*]] = arith.constant dense<1.000000e+00> : vector<4xf32>
     %lhs = constant <f32: 1.0> : tile<4xf32>
     // CHECK-DAG: %[[DF_RHS:.*]] = arith.constant dense<2.000000e+00> : vector<4xf32>
     %rhs = constant <f32: 2.0> : tile<4xf32>
-    // CHECK: arith.addf %[[DF_LHS]], %[[DF_RHS]] {"tir-dropped-flush-to-zero", "tir-dropped-rounding" = "zero"} : vector<4xf32>
+    // CHECK: arith.addf %[[DF_LHS]], %[[DF_RHS]] toward_zero {"tir-dropped-flush-to-zero"} : vector<4xf32>
     %r = addf %lhs, %rhs rounding<zero> flush_to_zero : tile<4xf32>
     return
   }
@@ -1301,14 +1304,14 @@ cuda_tile.module @m {
     return
   }
 
-  // --- divf rounding<zero>: non-representable rounding is preserved ---
+  // --- divf rounding<zero>: directed rounding is mapped ---
   // CHECK-LABEL: gpu.func @test_divf_rounding_dropped
   entry @test_divf_rounding_dropped() {
     // CHECK-DAG: %[[DR_LHS:.*]] = arith.constant dense<1.000000e+00> : vector<4xf32>
     %lhs = constant <f32: 1.0> : tile<4xf32>
     // CHECK-DAG: %[[DR_RHS:.*]] = arith.constant dense<2.000000e+00> : vector<4xf32>
     %rhs = constant <f32: 2.0> : tile<4xf32>
-    // CHECK: arith.divf %[[DR_LHS]], %[[DR_RHS]] {"tir-dropped-rounding" = "zero"} : vector<4xf32>
+    // CHECK: arith.divf %[[DR_LHS]], %[[DR_RHS]] toward_zero : vector<4xf32>
     %r = divf %lhs, %rhs rounding<zero> : tile<4xf32>
     return
   }

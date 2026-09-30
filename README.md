@@ -7,7 +7,7 @@ The tool accepts textual and binary TileIR as input.
 * **`--convert-tileir-to-mlir`**: Lowers Tile IR to a mix of standard dialects.
   * `target={gpu|cpu}` (default: `gpu`): The `gpu` target wraps the result in a GPU container module; `cpu` lowers without the container marker.
   * `append-grid-args={true|false}` (default: `false`): If `true`, appends six `i32` launch-coordinate arguments (block-id x/y/z, grid-dim x/y/z) to entry functions and sources dimension queries from them. Required on the `cpu` target when dimension queries are present.
-  * `drop-rounding-modes={true|false}`(default: `false`): If true, always drop source rounding-mode semantics and preserve them only as tir-dropped-rounding annotations.
+  * `drop-rounding-modes={true|false}`(default: `false`): If true, always drop source floating-point rounding-mode semantics and preserve them only as tir-dropped-rounding annotations. The rounding of integer `divi` defines its result and is always lowered exactly.
   * `assume-in-bounds={true|false}`(default: `false`): If true, assume all load and store ops are in bounds.
   * `known-block-size=x,y,z` (default: unset): If given exactly three values, sets the `known_block_size` attribute on the generated `gpu.func` ops; if omitted, the attribute is not set.
 * **`--tileir-ptr-to-view`**: Recognizes gather/scatter-style pointer arithmetic (iota, reshape, broadcast, offset) feeding `load_ptr_tko` or `store_ptr_tko` and lifts them into higher-level "view" operations for more efficient lowering in `--convert-tileir-to-mlir`.

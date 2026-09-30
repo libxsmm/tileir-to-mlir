@@ -535,12 +535,12 @@ struct ConvertUnaryApproxMathOp : public OpConversionPattern<SrcOp> {
 
 /// Convert float binary ops to arith float ops.
 ///
-/// On current supported LLVM versions these arith ops do not expose a
-/// rounding-mode attribute, so only the default nearest-even behavior is
-/// represented natively. `ApproxFlag`, when not `none`, additionally represents
-/// `rounding<approx>` through that FastMath flag (e.g. `arcp` for divf). Any
-/// other rounding mode is preserved as `tir-dropped-rounding`. `flush_to_zero`
-/// has no arith equivalent and is preserved as `tir-dropped-flush-to-zero`.
+/// `rounding<nearest_even>` is the default arith semantics and the directed
+/// modes map to the op's `roundingmode`. `ApproxFlag`, when not `none`,
+/// represents `rounding<approx>` through that FastMath flag (e.g. `arcp` for
+/// divf). Any other rounding mode, and every mode under `drop-rounding-modes`,
+/// is preserved as `tir-dropped-rounding`. `flush_to_zero` has no arith
+/// equivalent and is preserved as `tir-dropped-flush-to-zero`.
 template <typename SrcOp, typename DstOp,
           arith::FastMathFlags ApproxFlag = arith::FastMathFlags::none>
 struct ConvertBinaryFloatOp : public OpConversionPattern<SrcOp> {
@@ -556,16 +556,26 @@ struct ConvertBinaryFloatOp : public OpConversionPattern<SrcOp> {
     auto rounding = op.getRoundingMode();
     bool ftz = op.getFlushToZero();
     arith::FastMathFlags fmf = arith::FastMathFlags::none;
-    bool roundingRepresented =
-        !dropRoundingModes && rounding == cuda_tile::RoundingMode::NEAREST_EVEN;
-    if (!dropRoundingModes && ApproxFlag != arith::FastMathFlags::none &&
-        rounding == cuda_tile::RoundingMode::APPROX) {
-      fmf = ApproxFlag;
-      roundingRepresented = true;
+    arith::RoundingModeAttr roundingAttr;
+    bool roundingRepresented = false;
+    if (!dropRoundingModes) {
+      if (rounding == cuda_tile::RoundingMode::NEAREST_EVEN) {
+        roundingRepresented = true;
+      } else if (ApproxFlag != arith::FastMathFlags::none &&
+                 rounding == cuda_tile::RoundingMode::APPROX) {
+        fmf = ApproxFlag;
+        roundingRepresented = true;
+      } else if (std::optional<arith::RoundingMode> mode =
+                     mapRoundingModeToArith(rounding)) {
+        roundingAttr =
+            arith::RoundingModeAttr::get(rewriter.getContext(), *mode);
+        roundingRepresented = true;
+      }
     }
     auto newOp = rewriter.template replaceOpWithNewOp<DstOp>(
         op, adaptor.getLhs(), adaptor.getRhs(),
-        arith::FastMathFlagsAttr::get(rewriter.getContext(), fmf));
+        arith::FastMathFlagsAttr::get(rewriter.getContext(), fmf),
+        roundingAttr);
     preserveDroppedRoundingIfUnsupported(rewriter, rounding,
                                          roundingRepresented, newOp);
     preserveDroppedFlushToZero(rewriter, ftz, newOp);
@@ -1838,15 +1848,15 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
   }
 };
 
-/// Convert cuda_tile.ftof to arith.extf / arith.truncf.
+/// Convert cuda_tile.ftof to arith.extf / arith.truncf / arith.convertf.
 ///
-///   - Source and destination element widths must differ.
 ///   - Widening uses arith.extf, which has no rounding-mode attribute (float
 ///     widening is exact); the source rounding mode is preserved on the result
 ///     as the discardable attribute `tir-dropped-rounding`.
-///   - Narrowing uses arith.truncf, which carries a rounding-mode attribute, so
-///     the source rounding mode is mapped onto it when possible and preserved
-///     as `tir-dropped-rounding` otherwise.
+///   - Narrowing uses arith.truncf and conversions between formats of the same
+///     width use arith.convertf. Both carry a rounding-mode attribute, so the
+///     source rounding mode is mapped onto it when possible and preserved as
+///     `tir-dropped-rounding` otherwise.
 ///
 /// Works for both scalar float and vector<float> types.
 struct ConvertFToF : public OpConversionPattern<cuda_tile::FToFOp> {
@@ -1893,29 +1903,26 @@ struct ConvertFToF : public OpConversionPattern<cuda_tile::FToFOp> {
       preserveDroppedRounding(rewriter, op.getRoundingMode(), extOp);
       return success();
     }
-    if (srcWidth > dstWidth) {
-      // arith.truncf carries a rounding-mode attribute; map it when possible
-      // and preserve non-representable modes as a discardable annotation.
-      auto arithRounding = dropRoundingModes
-                               ? std::optional<arith::RoundingMode>()
-                               : mapRoundingModeToArith(op.getRoundingMode());
-      arith::RoundingModeAttr roundingAttr;
-      bool roundingRepresented = false;
-      if (arithRounding) {
-        roundingAttr =
-            arith::RoundingModeAttr::get(rewriter.getContext(), *arithRounding);
-        roundingRepresented = true;
-      }
-      auto truncOp = rewriter.replaceOpWithNewOp<arith::TruncFOp>(
+
+    auto arithRounding = dropRoundingModes
+                             ? std::optional<arith::RoundingMode>()
+                             : mapRoundingModeToArith(op.getRoundingMode());
+    arith::RoundingModeAttr roundingAttr;
+    if (arithRounding)
+      roundingAttr =
+          arith::RoundingModeAttr::get(rewriter.getContext(), *arithRounding);
+    Operation *castOp;
+    if (srcWidth > dstWidth)
+      castOp = rewriter.replaceOpWithNewOp<arith::TruncFOp>(
           op, resultTy.value(), adaptor.getFrom(), roundingAttr,
           /*fastmath=*/arith::FastMathFlagsAttr{});
-      preserveDroppedRoundingIfUnsupported(rewriter, op.getRoundingMode(),
-                                           roundingRepresented, truncOp);
-      return success();
-    }
-
-    return rewriter.notifyMatchFailure(op,
-                                       "ftof source/result widths must differ");
+    else
+      castOp = rewriter.replaceOpWithNewOp<arith::ConvertFOp>(
+          op, resultTy.value(), adaptor.getFrom(), roundingAttr,
+          /*fastmath=*/arith::FastMathFlagsAttr{});
+    preserveDroppedRoundingIfUnsupported(rewriter, op.getRoundingMode(),
+                                         arithRounding.has_value(), castOp);
+    return success();
   }
 
   bool dropRoundingModes;
