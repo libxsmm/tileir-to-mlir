@@ -107,8 +107,10 @@ def ConvertMemrefArgsToRankedMemrefPass : Pass<"convert-memref-args-to-ranked-me
 
     For each unranked memref argument (`memref<*xT>`), the pass matches the
     canonical pattern where every use is an identical, zero-offset
-    `memref.reinterpret_cast` to the same ranked result type. The argument type
-    is updated to that ranked memref type and the redundant casts are erased.
+    `memref.reinterpret_cast` to the same ranked result type, whose sizes and
+    strides are fixed per call: values of the entry block, or computed from
+    them by pure ops. The argument type is updated to that ranked memref type
+    and the redundant casts are erased.
 
     Scalar arguments that were originally used to materialize the matched
     cast's dynamic sizes/strides are rewritten to equivalent memref queries

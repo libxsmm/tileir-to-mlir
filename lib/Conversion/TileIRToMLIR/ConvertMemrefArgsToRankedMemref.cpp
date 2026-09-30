@@ -10,11 +10,12 @@
 // --convert-tileir-to-mlir accesses pointer arguments through
 // reinterpret_casts, whose dynamic sizes and strides are often further scalar
 // arguments. If all uses of a pointer argument are the same reinterpret_cast at
-// offset 0, the argument takes the type of the cast and replaces it. The scalar
-// arguments that the cast uses as sizes or strides are recomputed from the
-// memref with memref.dim and memref.extract_strided_metadata, and unused
-// arguments are removed as the `remove-unused` option selects. Callers must
-// pass the promoted argument with the sizes and strides the cast computed.
+// offset 0, with a layout that is fixed per call, the argument takes the type
+// of the cast and replaces it. The scalar arguments that the cast uses as sizes
+// or strides are recomputed from the memref with memref.dim and
+// memref.extract_strided_metadata, and unused arguments are removed as the
+// `remove-unused` option selects. Callers must pass the promoted argument with
+// the sizes and strides the cast computed.
 //
 //===----------------------------------------------------------------------===//
 
@@ -71,9 +72,22 @@ struct PtrPromotionPlan {
   memref::ReinterpretCastOp canonicalCast;
 };
 
+/// Whether `value` is the same wherever the function with entry block `entry`
+/// computes it: a value of the entry block, or computed from such values by
+/// pure ops.
+static bool isFixedPerCall(Value value, Block &entry) {
+  if (value.getParentBlock() == &entry)
+    return true;
+  Operation *def = value.getDefiningOp();
+  return def && isPure(def) && def->getNumRegions() == 0 &&
+         llvm::all_of(def->getOperands(), [&](Value operand) {
+           return isFixedPerCall(operand, entry);
+         });
+}
+
 /// Plan the promotion of `arg` if it is an unranked memref whose uses are all
-/// the same reinterpret_cast at a static zero offset. The argument replaces the
-/// casts, so they must not offset it.
+/// the same reinterpret_cast. The argument replaces the casts, so they must not
+/// offset it, and their layout must be the same in every execution.
 static bool collectPtrPromotionPlan(BlockArgument arg, PtrPromotionPlan &plan) {
   auto unranked = dyn_cast<UnrankedMemRefType>(arg.getType());
   if (!unranked || arg.use_empty())
@@ -92,6 +106,10 @@ static bool collectPtrPromotionPlan(BlockArgument arg, PtrPromotionPlan &plan) {
       return false;
     SmallVector<OpFoldResult> offsets = rc.getMixedOffsets();
     if (offsets.size() != 1 || !isZeroInteger(offsets[0]))
+      return false;
+    if (!llvm::all_of(rc->getOperands().drop_front(), [&](Value operand) {
+          return isFixedPerCall(operand, *arg.getOwner());
+        }))
       return false;
 
     if (!canonical) {
