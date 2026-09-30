@@ -2865,19 +2865,14 @@ struct ConvertOffsetRanked : public OpConversionPattern<cuda_tile::OffsetOp> {
   }
 };
 
-/// Derive the flat base memref plus the mask and index vectors of an access.
-///
-/// `flatten` collapses the mask and indices to rank-1, which the gather/scatter
-/// lowering requires; row loads pass false to keep the source shape so they can
-/// slice contiguous minor-dimension rows.
+/// Derive the flat base memref and the mask of a pointer tile access.
 static LogicalResult deriveAccessMemRefAndMask(
     Operation *op, Value origPtr, Value cvtPtr, Value origMask, Value cvtMask,
     Type elemTy, ArrayRef<int64_t> shape, ConversionPatternRewriter &rewriter,
-    bool flatten, Value &baseMemref, Value &mask, Value &indexVec) {
+    Value &baseMemref, Value &mask) {
   Location loc = op->getLoc();
 
-  indexVec = cvtPtr;
-  auto ptrVecTy = dyn_cast<VectorType>(indexVec.getType());
+  auto ptrVecTy = dyn_cast<VectorType>(cvtPtr.getType());
   if (!ptrVecTy || !isa<IndexType>(ptrVecTy.getElementType()))
     return rewriter.notifyMatchFailure(
         op, "expected vector<...xindex> for ranked pointer");
@@ -2916,157 +2911,14 @@ static LogicalResult deriveAccessMemRefAndMask(
     mask = vector::BroadcastOp::create(rewriter, loc, maskTy, trueVal);
   }
 
-  // Flatten the index and mask to rank-1 so the gather/scatter is legal for
-  // the Vector->LLVM lowering (which only supports rank-1).
-  if (flatten && ptrVecTy.getRank() != 1) {
-    int64_t numElts = ptrVecTy.getNumElements();
-    auto flatIdxTy = VectorType::get({numElts}, rewriter.getIndexType());
-    indexVec = vector::ShapeCastOp::create(rewriter, loc, flatIdxTy, indexVec);
-    auto flatMaskTy = VectorType::get({numElts}, rewriter.getI1Type());
-    mask = vector::ShapeCastOp::create(rewriter, loc, flatMaskTy, mask);
-  }
-
   return success();
 }
 
-//===----------------------------------------------------------------------===//
-// Row-wise masked load support
-//
-// A pointer tile holds one absolute element offset per lane, so a load is only
-// a sequence of contiguous row loads when, within every row, the offsets grow
-// by exactly one from column to column. `hasUnitMinorStride` establishes that
-// structurally on the converted index vector: it walks down to the `vector.step`
-// that supplies the iota, allowing replication across leading dimensions and
-// any number of minor-invariant shifts (row bases, strides, buffer offsets) at
-// any level. That covers the canonical `row_base + column_iota` address form as
-// well as the equally common `broadcast(start + iota)` spelling.
-//
-// Everything is a conservative structural match: an unrecognised expression
-// simply falls back to the gather lowering below.
-//===----------------------------------------------------------------------===//
-
-/// Strip casts that change only the element type and preserve the lane layout.
-static Value lookThroughElementCast(Value value) {
-  while (Operation *def = value.getDefiningOp()) {
-    if (!isa<arith::IndexCastOp, arith::IndexCastUIOp, arith::ExtSIOp,
-             arith::ExtUIOp>(def))
-      break;
-    value = def->getOperand(0);
-  }
-  return value;
-}
-
-/// True when `ty` varies *only* along the minor dimension, i.e. its trailing
-/// extent is `minorSize` and every other extent is 1. Comparing element counts
-/// alone would also accept transposed shapes such as `vector<Nx1>`, whose
-/// values vary across rows rather than across columns.
-static bool isMinorOnlyShape(VectorType ty, int64_t minorSize) {
-  return ty && ty.getRank() > 0 && ty.getShape().back() == minorSize &&
-         ty.getNumElements() == minorSize;
-}
-
-/// Match a value that is constant along the minor dimension, so adding it
-/// shifts a whole row without disturbing its unit spacing.
-static bool isMinorInvariant(Value value) {
-  value = lookThroughElementCast(value);
-  auto valueTy = dyn_cast<VectorType>(value.getType());
-  if (!valueTy)
-    return true;
-  DenseElementsAttr elements;
-  if (matchPattern(value, m_Constant(&elements)) && elements.isSplat())
-    return true;
-  auto broadcast = value.getDefiningOp<vector::BroadcastOp>();
-  if (!broadcast)
-    return false;
-  // `vector.broadcast` aligns trailing dimensions, so a source whose minor
-  // extent is 1 (or a scalar source) is stretched uniformly across columns.
-  auto sourceTy = dyn_cast<VectorType>(broadcast.getSource().getType());
-  return !sourceTy ||
-         (sourceTy.getRank() > 0 && sourceTy.getShape().back() == 1);
-}
-
-/// Prove that offsets within each row increase by exactly one per column.
-static bool hasUnitMinorStride(Value value, int64_t minorSize) {
-  value = lookThroughElementCast(value);
-  // Base case: the iota itself, which must span exactly the minor dimension.
-  if (auto step = value.getDefiningOp<vector::StepOp>())
-    return isMinorOnlyShape(step.getType(), minorSize);
-  // Replication preserves the step only when the source already carries it
-  // along its own minor dimension; the shape guard rejects transposed sources.
-  if (auto shapeCast = value.getDefiningOp<vector::ShapeCastOp>())
-    return isMinorOnlyShape(shapeCast.getSourceVectorType(), minorSize) &&
-           hasUnitMinorStride(shapeCast.getSource(), minorSize);
-  if (auto broadcast = value.getDefiningOp<vector::BroadcastOp>()) {
-    // A scalar source cannot carry a step, so a vector source is required.
-    auto sourceTy = dyn_cast<VectorType>(broadcast.getSource().getType());
-    return isMinorOnlyShape(sourceTy, minorSize) &&
-           hasUnitMinorStride(broadcast.getSource(), minorSize);
-  }
-  // Shifting by a minor-invariant term moves a row without restriding it. The
-  // shift may sit either side of a replication, e.g. `broadcast(start + iota)`.
-  if (auto add = value.getDefiningOp<arith::AddIOp>())
-    return (hasUnitMinorStride(add.getLhs(), minorSize) &&
-            isMinorInvariant(add.getRhs())) ||
-           (hasUnitMinorStride(add.getRhs(), minorSize) &&
-            isMinorInvariant(add.getLhs()));
-  return false;
-}
-
-/// Replace a minor-contiguous pointer load by one masked load per row.
-///
-/// Leading dimensions are collapsed first, so a rank-N access becomes
-/// `rows x columns` regardless of N. Each row then loads from its own first
-/// offset: because the offsets step by one across a row, lane `j` resolves to
-/// the same address the gather would have used, and masked-off lanes are never
-/// accessed, so a row whose base offset lies outside the buffer stays safe.
-static Value buildRowWiseMaskedLoad(cuda_tile::LoadPtrTkoOp op,
-                                    Value baseMemref, Value indexVec,
-                                    Value mask, Value passThru,
-                                    ConversionPatternRewriter &rewriter) {
-  Location loc = op.getLoc();
-  auto resultTy = cast<VectorType>(passThru.getType());
-  int64_t columns = resultTy.getShape().back();
-  int64_t rows = resultTy.getNumElements() / columns;
-  auto rowTy = VectorType::get({columns}, resultTy.getElementType());
-  bool needsCollapse = resultTy.getRank() != 2;
-
-  if (needsCollapse) {
-    auto collapse = [&](Value value, Type elementType) {
-      auto ty = VectorType::get({rows, columns}, elementType);
-      return vector::ShapeCastOp::create(rewriter, loc, ty, value).getResult();
-    };
-    indexVec = collapse(indexVec, rewriter.getIndexType());
-    mask = collapse(mask, rewriter.getI1Type());
-    passThru = collapse(passThru, resultTy.getElementType());
-  }
-
-  Value result = passThru;
-  for (int64_t row = 0; row < rows; ++row) {
-    Value baseIndex = vector::ExtractOp::create(rewriter, loc, indexVec,
-                                                ArrayRef<int64_t>{row, 0});
-    Value maskRow = vector::ExtractOp::create(rewriter, loc, mask, row);
-    Value passThruRow = vector::ExtractOp::create(rewriter, loc, passThru, row);
-    auto load = vector::MaskedLoadOp::create(
-        rewriter, loc, rowTy, baseMemref, ValueRange{baseIndex}, maskRow,
-        passThruRow, llvm::MaybeAlign());
-    preserveDroppedOptHints(op, load);
-    result =
-        vector::InsertOp::create(rewriter, loc, load.getResult(), result, row);
-  }
-
-  if (needsCollapse)
-    result = vector::ShapeCastOp::create(rewriter, loc, resultTy, result);
-  return result;
-}
-
-/// Convert ranked cuda_tile.load_ptr_tko to masked row loads or vector.gather.
+/// Convert ranked cuda_tile.load_ptr_tko to vector.gather.
 ///
 /// The pointer tile (vector<...xindex>) holds per-element offsets from the
-/// buffer base. Minor-contiguous accesses use independent masked row loads;
-/// all other accesses are flattened into a 1-D vector.gather.
-///
-/// `optimization_hints`, when present, is preserved on the produced
-/// memory ops as the discardable attribute `tir-dropped-optimization-hints`.
+/// buffer base. `optimization_hints`, when present, is preserved on the gather
+/// as the discardable attribute `tir-dropped-optimization-hints`.
 struct ConvertLoadPtrTkoRanked
     : public TokenDroppingPattern<cuda_tile::LoadPtrTkoOp> {
   using TokenDroppingPattern::TokenDroppingPattern;
@@ -3082,19 +2934,14 @@ struct ConvertLoadPtrTkoRanked
       return failure();
 
     Location loc = op.getLoc();
-    auto shape = tileTy.getShape();
     auto resultVecTy =
         cast<VectorType>(getTypeConverter()->convertType(tileTy));
-    Type elemTy = resultVecTy.getElementType();
 
-    bool useRowLoads = shape.size() >= 2 &&
-                       hasUnitMinorStride(adaptor.getSource(), shape.back());
-
-    Value baseMemref, mask, indexVec;
+    Value baseMemref, mask;
     if (failed(deriveAccessMemRefAndMask(
             op, op.getSource(), adaptor.getSource(), op.getMask(),
-            adaptor.getMask(), elemTy, shape, rewriter,
-            /*flatten=*/!useRowLoads, baseMemref, mask, indexVec)))
+            adaptor.getMask(), resultVecTy.getElementType(), tileTy.getShape(),
+            rewriter, baseMemref, mask)))
       return failure();
 
     // Passthrough.
@@ -3107,34 +2954,12 @@ struct ConvertLoadPtrTkoRanked
           arith::ConstantOp::create(rewriter, loc, resultVecTy, zeroAttr);
     }
 
-    // Row-wise masked loads retain the source mask while exposing contiguity.
-    if (useRowLoads) {
-      Value result = buildRowWiseMaskedLoad(op, baseMemref, indexVec, mask,
-                                            passThru, rewriter);
-      rewriter.replaceOp(op, {result, Value()});
-      return success();
-    }
-
-    // vector.gather lowers to LLVM only for rank-1 vectors. The index/mask were
-    // flattened to rank-1 in the helper; flatten the passthrough to match,
-    // emit a 1-D gather, then shape_cast the result back to the tile shape.
-    auto flatResTy = VectorType::get({resultVecTy.getNumElements()}, elemTy);
-    if (resultVecTy.getRank() != 1)
-      passThru =
-          vector::ShapeCastOp::create(rewriter, loc, flatResTy, passThru);
-
-    // Emit vector.gather.
     Value c0 = arith::ConstantIndexOp::create(rewriter, loc, 0);
-    auto gatherOp =
-        vector::GatherOp::create(rewriter, loc, flatResTy, baseMemref,
-                                 ValueRange{c0}, indexVec, mask, passThru);
+    auto gatherOp = vector::GatherOp::create(
+        rewriter, loc, resultVecTy, baseMemref, ValueRange{c0},
+        adaptor.getSource(), mask, passThru);
     preserveDroppedOptHints(op, gatherOp);
-
-    Value result = gatherOp.getResult();
-    if (resultVecTy.getRank() != 1)
-      result = vector::ShapeCastOp::create(rewriter, loc, resultVecTy, result);
-
-    rewriter.replaceOp(op, {result, Value()});
+    rewriter.replaceOp(op, {gatherOp.getResult(), Value()});
     return success();
   }
 };
@@ -3159,30 +2984,20 @@ struct ConvertStorePtrTkoRanked
       return failure();
 
     Location loc = op.getLoc();
-    auto shape = valTileTy.getShape();
     Value valVec = adaptor.getValue();
-    auto valVecTy = cast<VectorType>(valVec.getType());
-    Type elemTy = valVecTy.getElementType();
 
-    Value baseMemref, mask, indexVec;
+    Value baseMemref, mask;
     if (failed(deriveAccessMemRefAndMask(
             op, op.getDestination(), adaptor.getDestination(), op.getMask(),
-            adaptor.getMask(), elemTy, shape, rewriter,
-            /*flatten=*/true, baseMemref, mask, indexVec)))
+            adaptor.getMask(),
+            cast<VectorType>(valVec.getType()).getElementType(),
+            valTileTy.getShape(), rewriter, baseMemref, mask)))
       return failure();
 
-    // vector.scatter lowers to LLVM only for rank-1 vectors. The index/mask
-    // were flattened to rank-1 in the helper; flatten the value to match.
-    if (valVecTy.getRank() != 1) {
-      auto flatValTy = VectorType::get({valVecTy.getNumElements()}, elemTy);
-      valVec = vector::ShapeCastOp::create(rewriter, loc, flatValTy, valVec);
-    }
-
-    // Emit vector.scatter.
     Value c0 = arith::ConstantIndexOp::create(rewriter, loc, 0);
     auto scatterOp = vector::ScatterOp::create(
         rewriter, loc, /*resultType=*/Type(), baseMemref, ValueRange{c0},
-        indexVec, mask, valVec);
+        adaptor.getDestination(), mask, valVec);
     preserveDroppedOptHints(op, scatterOp);
     rewriter.eraseOp(op);
     return success();
