@@ -21,10 +21,9 @@
 namespace mlir {
 namespace tileir {
 
-/// Returns `true` iff changing `func`'s signature is safe, i.e. the function is
-/// not referenced (called / launched) from within its nearest
-/// symbol table. A non-`SymbolOpInterface` or an unresolved use set is treated
-/// conservatively as "unsafe".
+/// Whether the signature of `func` can change without breaking a symbol use:
+/// `func` is a symbol without uses in its nearest symbol table. Uses outside
+/// that table, e.g. launches from host code, are not checked.
 inline bool signatureChangeIsSafe(FunctionOpInterface func) {
   auto symbol = dyn_cast<SymbolOpInterface>(func.getOperation());
   if (!symbol)

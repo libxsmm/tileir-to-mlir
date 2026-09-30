@@ -5,8 +5,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Simple mlir-opt-style driver that registers the TileIRToMLIR conversion
-// pass together with the dialects it depends on.
+// mlir-opt-style driver for the Tile IR passes. It reads textual MLIR or Tile
+// IR bytecode, and registers the passes of this project, the dialects they
+// consume and produce, and the tileir-to-mlir-pipeline.
 //
 //===----------------------------------------------------------------------===//
 
@@ -77,9 +78,8 @@ int main(int argc, char **argv) {
 
   llvm::InitLLVM y(argc, argv);
 
-  // Register and parse the command line options up front so we can decide how
-  // to load the input (textual MLIR vs. TileIR bytecode) before handing the
-  // already-parsed IR to MlirOptMain.
+  // Parse the command line up front to know the input, which bytecode must be
+  // translated to text for MlirOptMain.
   std::string inputFilename, outputFilename;
   std::tie(inputFilename, outputFilename) = mlir::registerAndParseCLIOptions(
       argc, argv, "TileIRToMLIR optimizer driver\n", registry);
@@ -117,12 +117,9 @@ int main(int argc, char **argv) {
 
   std::unique_ptr<llvm::MemoryBuffer> buffer;
   if (isBytecode) {
-    // Decode the bytecode into a TileIR module and re-serialize it as textual
-    // MLIR so it can flow through the regular MlirOptMain processing pipeline.
-    // Round-tripping through text (rather than handing MlirOptMain the parsed
-    // module directly) is intentional: it keeps a single IR-entry path through
-    // MlirOptMain and lets all of its standard options (--split-input-file,
-    // diagnostics, etc.) apply uniformly to both textual and bytecode inputs.
+    // Print the decoded module, so that bytecode and text take the same path
+    // through MlirOptMain and all its options (e.g. --split-input-file) apply
+    // to both.
     mlir::MLIRContext context(registry);
     context.loadAllAvailableDialects();
     mlir::OwningOpRef<mlir::cuda_tile::ModuleOp> module =
@@ -146,7 +143,6 @@ int main(int argc, char **argv) {
           mlir::MlirOptMain(output->os(), std::move(buffer), registry, config)))
     return EXIT_FAILURE;
 
-  // Keep the output file if the invocation of MlirOptMain was successful.
   output->keep();
   return EXIT_SUCCESS;
 }

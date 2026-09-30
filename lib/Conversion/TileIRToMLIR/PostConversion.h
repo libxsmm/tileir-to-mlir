@@ -17,19 +17,20 @@ class Operation;
 class RewritePatternSet;
 namespace tileir {
 
-/// Make vector transfers index loops over tiles by the loop induction variable:
+/// Index vector transfers directly by loop induction variables:
 ///   - a loop whose induction variable `iv` indexes transfers as `iv * T` is
-///     rescaled to iterate over `iv * T`, and
-///   - a transfer index `(iv / T) * T` of a loop whose induction variable is a
-///     multiple of `T` becomes `iv`.
-/// Every rewrite is proven exact with integer range analysis.
+///     rescaled to step over element indices, which makes those indices `iv`;
+///     other uses get `iv / T`;
+///   - a transfer index `(iv / T) * T`, where `iv` is always a multiple of
+///     `T`, becomes `iv`.
+/// Integer range analysis proves every rewrite exact.
 void rescaleTileLoops(Operation *root);
 
 /// Wrap the body of every scf.for that allocates on the stack in a
 /// memref.alloca_scope, which cuda_tile.for implies but scf.for does not.
 void scopeLoopAllocations(Operation *root);
 
-/// Collect the patterns that optimize the converted IR locally.
+/// Collect the local rewrite patterns for the converted IR.
 void populatePostConversionPatterns(RewritePatternSet &patterns);
 
 } // namespace tileir

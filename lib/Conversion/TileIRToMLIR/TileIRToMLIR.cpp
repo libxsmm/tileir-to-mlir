@@ -5,21 +5,31 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Conversion pass from Tile IR to GPU/vector/scf/arith/memref ops.
+// Lowers Tile IR (the cuda_tile dialect) to the gpu or func, scf, arith, math,
+// memref, vector and ub dialects. It is a strict dialect conversion: every
+// cuda_tile op and type must be converted, or the pass fails.
 //
-// The patterns registered in populateTileIRToMLIRConversionPatterns are the
-// authoritative list of supported ops. Any cuda_tile op left without a pattern
-// stays illegal and makes the pass fail with a conversion diagnostic.
+// The type converter defines the value model:
+//   - a tile becomes a vector, a rank-0 tile a scalar;
+//   - a pointer becomes an unranked memref `memref<*xT>`, and a ranked pointer
+//     tile becomes its base pointer plus a `vector<...xindex>` of lane
+//     offsets, so accesses through it become gathers and scatters;
+//   - tensor, partition and strided views become the strided memref of their
+//     buffer; each access reads the tiling from the view type;
+//   - tokens become nothing, as the lowered memory ops keep program order.
+// Semantics that a target op cannot express are either rejected (e.g. non-weak
+// ordering of loads) or recorded as `tir-dropped-*` attributes (see "Dropped
+// semantics").
 //
-// A few ops are intentionally not lowered because they have no faithful
-// representation in the target dialects; they must be removed by an earlier
-// pass or are rejected here: AssertOp, AtomicCASTkoOp, AtomicRedViewTkoOp,
-// BreakOp, IntToPtrOp, LoopOp, MmafScaledOp, PrintTkoOp, PtrToIntOp. A
-// gather_scatter_view can be created but not accessed.
+// The file holds shared helpers and pattern templates, the patterns roughly in
+// alphabetical order of the cuda_tile op, the type converter and pattern list,
+// and the pass, which applies the rewrites of PostConversion.h afterwards.
 //
-// Ranked pointer tiles are lowered to gathers and scatters. The
-// --tileir-ptr-to-view pass raises the ones it can to view accesses first.
-// AtomicRMWTkoOp is only lowered for scalar pointers.
+// Not lowered: AssertOp, AtomicCASTkoOp, AtomicRedViewTkoOp, BreakOp,
+// IntToPtrOp, LoopOp, MmafScaledOp, PrintTkoOp, PtrToIntOp, accesses through a
+// gather_scatter_view, and atomic_rmw_tko on pointer tiles. The
+// --tileir-ptr-to-view pass raises the pointer accesses it recognizes to view
+// accesses beforehand.
 //
 //===----------------------------------------------------------------------===//
 
@@ -62,16 +72,9 @@ using namespace mlir;
 
 namespace {
 
-/// Derive the ranked MemRefType that corresponds to a tensor_view type.
-///
-/// The memref always carries a *dynamic* offset in its strided layout. A
-/// tensor_view may start at an arbitrary position within its buffer when its
-/// base pointer was pre-shifted by a scalar `offset` op (e.g. a per-batch /
-/// per-channel output base). `memref.reinterpret_cast`'s offset is absolute to
-/// the underlying buffer, so the memref type must be able to represent that
-/// (possibly non-zero) offset for it to survive make_tensor_view and the
-/// downstream transfer lowering. Strides come straight from the tensor_view
-/// (and may themselves be dynamic).
+/// The ranked memref type of a tensor_view. Its offset is dynamic because the
+/// view's base pointer may have been advanced, e.g. to a batch, and
+/// reinterpret_cast offsets are absolute to the buffer.
 static MemRefType tensorViewToMemRefType(cuda_tile::TensorViewType tvTy,
                                          const TypeConverter &converter) {
   auto shape = tvTy.getShape();
@@ -85,12 +88,8 @@ static MemRefType tensorViewToMemRefType(cuda_tile::TensorViewType tvTy,
   return MemRefType::get(memrefShape, elemTy, layout);
 }
 
-/// Build a 1-D memref type with unit stride and dynamic offset.
-///
-/// This is the canonical transient view type used when lowering unranked
-/// pointer values (`memref<*xT>`) through reinterpret_cast-based arithmetic or
-/// metadata extraction. `size` is either a static extent (e.g. 1) or
-/// `ShapedType::kDynamic`.
+/// `memref<size x T, strided<[1], offset: ?>>`: a 1-D view at a pointer whose
+/// offset is known only at runtime.
 static MemRefType get1DDynamicOffsetMemRefType(Type elemTy, int64_t size,
                                                Attribute memorySpace = {}) {
   return MemRefType::get({size}, elemTy,
@@ -100,34 +99,24 @@ static MemRefType get1DDynamicOffsetMemRefType(Type elemTy, int64_t size,
                          memorySpace);
 }
 
-/// Layout information extracted from a tile-view operand at a use site.
-///
-/// Covers both `partition_view` and `strided_view`, which share the same
-/// "rectangular tile laid out on a grid" access shape. The only structural
-/// difference is how far the tile base advances between adjacent index-space
-/// positions:
-///   - partition_view: the base advances by `tile_shape[i]` (tiles tile the
-///     tensor exactly, no overlap, no gaps).
-///   - strided_view:   the base advances by `traversal_strides[i]` (tiles may
-///     overlap when stride < tile, or leave gaps when stride > tile).
-/// This advance is captured in `viewStrides`; everything downstream (memref
-/// offset, index-space-shape, in-bounds analysis) is expressed in terms of it.
+/// The layout of an access through a partition_view or strided_view. Both
+/// place tiles on a grid and differ only in how far the tile base advances per
+/// index step (`viewStrides`): by the tile size for a partition_view, and by
+/// the traversal stride for a strided_view, whose tiles may overlap or leave
+/// gaps.
 struct ViewInfo {
   Value memref;                   // Converted memref backing the view
   SmallVector<int64_t> tileShape; // Tile dimensions (per tile dim)
   SmallVector<int64_t>
       viewStrides;             // Base advance per index step (per tile dim)
   SmallVector<int32_t> dimMap; // Mapping from tile dims to tensor_view dims
-  // Optional padding value attribute from the view type; null if the view does
-  // not specify one (i.e. OOB loads yield unspecified values).
+  // Null if out-of-bounds loads yield unspecified values.
   cuda_tile::PaddingValueAttr paddingValue;
 };
 
-/// Extract tile-view layout info from `view`'s type and pair it with the
-/// already type-converted memref `convertedView`. Returns failure (with a
-/// match-failure note) for view kinds that the transfer-based lowering cannot
-/// model (e.g. gather_scatter_view, whose sparse dimension requires gather /
-/// scatter rather than a contiguous transfer).
+/// The layout of `view`, whose converted memref is `convertedView`. Fails for
+/// a gather_scatter_view, whose sparse dimension needs a gather rather than a
+/// transfer.
 ///
 /// The view type verifiers guarantee that the tile and the tensor_view have
 /// the same rank, that dim_map is a permutation, and that tile sizes and
@@ -138,7 +127,6 @@ static FailureOr<ViewInfo> getViewInfo(Operation *op, Value view,
   ViewInfo info;
   info.memref = convertedView;
 
-  // partition_view and strided_view differ only in the per-dim base advance.
   auto fill = [&](auto viewTy, ArrayRef<int32_t> advance) {
     ArrayRef<int32_t> tile = viewTy.getTileShape().asArrayRef();
     info.tileShape.assign(tile.begin(), tile.end());
@@ -147,13 +135,11 @@ static FailureOr<ViewInfo> getViewInfo(Operation *op, Value view,
     info.paddingValue = viewTy.getPaddingValue();
   };
 
-  // partition_view tiles tile the tensor exactly: advance == tile extent.
   if (auto pvType = dyn_cast<cuda_tile::PartitionViewType>(view.getType())) {
     fill(pvType, pvType.getTileShape().asArrayRef());
     return info;
   }
 
-  // strided_view advances the tile base by the traversal stride.
   if (auto svType = dyn_cast<cuda_tile::StridedViewType>(view.getType())) {
     fill(svType, svType.getTraversalStrides().asArrayRef());
     return info;
@@ -255,11 +241,8 @@ mapIntegerOverflowFlags(cuda_tile::IntegerOverflow overflow) {
   return arith::IntegerOverflowFlags::none;
 }
 
-/// Cast between index and integer types when required by lowered ops.
-///
-/// Returns a null Value if the cast is not supported (only index<->integer and
-/// the identity case are handled). Callers must check the result and bail (via
-/// notifyMatchFailure) on null.
+/// Cast between `index` and an integer type with a sign-extending index_cast.
+/// Returns null for other types.
 static Value castValueToType(OpBuilder &builder, Location loc, Value value,
                              Type targetType) {
   if (value.getType() == targetType)
@@ -320,9 +303,8 @@ static APFloat convertFloat(APFloat value, FloatType type) {
   return value;
 }
 
-/// Rebuild `denseAttr` as a DenseElementsAttr of `newType`, which has the same
-/// number of elements and whose element type may differ by the element type
-/// conversion of the type converter (e.g. tile->vector or tile->tensor).
+/// `denseAttr` as elements of `newType`, which has as many elements and the
+/// converted element type; floats are converted (tf32 -> f32 on the CPU).
 static DenseElementsAttr retypeDenseElements(DenseElementsAttr denseAttr,
                                              ShapedType newType) {
   if (auto floatTy = dyn_cast<FloatType>(newType.getElementType());
@@ -334,13 +316,8 @@ static DenseElementsAttr retypeDenseElements(DenseElementsAttr denseAttr,
   return denseAttr.reshape(newType);
 }
 
-/// Build the ranked memref type corresponding to a cuda_tile.global
-/// definition.
-///
-/// cuda_tile.global stores a DenseElementsAttr payload and semantically
-/// materializes a static allocation initialized at module load time. We lower
-/// that allocation to memref.global with a ranked static memref type matching
-/// the payload shape and converted element type.
+/// The static memref type of a cuda_tile.global: the shape of its 1-D
+/// initializer with the converted element type.
 static FailureOr<MemRefType> getGlobalMemRefTypeOrFail(
     cuda_tile::GlobalOp globalOp, const TypeConverter &converter,
     ConversionPatternRewriter &rewriter, Operation *diagnosticOp) {
@@ -350,7 +327,6 @@ static FailureOr<MemRefType> getGlobalMemRefTypeOrFail(
         diagnosticOp,
         "global initializer must be a statically shaped elements attribute");
 
-  // cuda_tile.global semantics are linear and 1-D in the source dialect.
   if (initTy.getRank() != 1)
     return rewriter.notifyMatchFailure(
         diagnosticOp,
@@ -360,6 +336,8 @@ static FailureOr<MemRefType> getGlobalMemRefTypeOrFail(
                          converter.convertType(initTy.getElementType()));
 }
 
+/// The indexing maps and iterator types of a vector.contract that computes a
+/// matrix product.
 struct MmaContractionSpec {
   AffineMap mapA;
   AffineMap mapB;
@@ -367,12 +345,8 @@ struct MmaContractionSpec {
   SmallVector<Attribute> iterTypes;
 };
 
-/// Build vector.contract indexing maps and iterator attributes for
-/// matmul-style contractions used by both mmaf and mmai lowerings.
-///
-/// Supported ranks:
-///   - rank 2 result: unbatched [M, N]
-///   - rank 3 result: batched   [B, M, N]
+/// The contraction of an mmaf or mmai with a result of rank 2 ([M, N]) or
+/// rank 3 (batched, [B, M, N]).
 static FailureOr<MmaContractionSpec>
 buildMmaContractionSpec(MLIRContext *ctx, int64_t resultRank) {
   if (resultRank != 2 && resultRank != 3)
@@ -468,8 +442,8 @@ struct OptionsPattern : public Base {
   ConvertTileIRToMLIRPassOptions options;
 };
 
-/// Convert a unary source-based op to a math op that takes no FastMath flags,
-/// preserving `flush_to_zero` as `tir-dropped-flush-to-zero` when set.
+/// Convert a unary op with `flush_to_zero` to a math op, recording a set
+/// `flush_to_zero` as dropped.
 template <typename SrcOp, typename DstOp>
 struct ConvertUnaryFlushToZeroOp : public OpConversionPattern<SrcOp> {
   using OpConversionPattern<SrcOp>::OpConversionPattern;
@@ -487,10 +461,9 @@ struct ConvertUnaryFlushToZeroOp : public OpConversionPattern<SrcOp> {
 
 /// Convert a unary op with a rounding mode to a math op. `Exact` is the
 /// rounding the math op implements, and `rounding<approx>` maps to the `afn`
-/// (allow approximate functions) FastMath flag. Other modes, and all modes
-/// under `drop-rounding-modes`, are preserved as `tir-dropped-rounding`. When
-/// `PreserveFtz` is set, `flush_to_zero` is preserved as
-/// `tir-dropped-flush-to-zero`.
+/// (allow approximate functions) flag. Other modes, and all modes under
+/// `drop-rounding-modes`, are recorded as dropped, as is a set `flush_to_zero`
+/// when `PreserveFtz` is set.
 template <typename SrcOp, typename DstOp, cuda_tile::RoundingMode Exact,
           bool PreserveFtz>
 struct ConvertUnaryApproxMathOp : public OptionsPattern<SrcOp> {
@@ -516,14 +489,12 @@ struct ConvertUnaryApproxMathOp : public OptionsPattern<SrcOp> {
   }
 };
 
-/// Convert float binary ops to arith float ops.
+/// Convert a float binary op to its arith op.
 ///
-/// `rounding<nearest_even>` is the default arith semantics and the directed
-/// modes map to the op's `roundingmode`. `ApproxFlag`, when not `none`,
-/// represents `rounding<approx>` through that FastMath flag (e.g. `arcp` for
-/// divf). Any other rounding mode, and every mode under `drop-rounding-modes`,
-/// is preserved as `tir-dropped-rounding`. `flush_to_zero` has no arith
-/// equivalent and is preserved as `tir-dropped-flush-to-zero`.
+/// arith computes `rounding<nearest_even>` by default and the directed modes
+/// with its `roundingmode`. `ApproxFlag`, unless `none`, is the fastmath flag
+/// that expresses `rounding<approx>`. Other modes, all modes under
+/// `drop-rounding-modes`, and a set `flush_to_zero` are recorded as dropped.
 template <typename SrcOp, typename DstOp,
           arith::FastMathFlags ApproxFlag = arith::FastMathFlags::none>
 struct ConvertBinaryFloatOp : public OptionsPattern<SrcOp> {
@@ -563,7 +534,7 @@ struct ConvertBinaryFloatOp : public OptionsPattern<SrcOp> {
   }
 };
 
-/// Convert integer binary ops that carry overflow flags (addi, subi, shli).
+/// Convert an integer binary op with overflow flags (addi, subi, muli, shli).
 template <typename SrcOp, typename DstOp>
 struct ConvertBinaryLhsRhsWithOverflowOp : public OpConversionPattern<SrcOp> {
   using OpConversionPattern<SrcOp>::OpConversionPattern;
@@ -580,14 +551,8 @@ struct ConvertBinaryLhsRhsWithOverflowOp : public OpConversionPattern<SrcOp> {
   }
 };
 
-/// Convert signedness-directed casts that also require an exact rounding mode.
-///
-/// Used by:
-///   - cuda_tile.ftoi  -> arith.fptosi / arith.fptoui
-///   - cuda_tile.itof  -> arith.sitofp / arith.uitofp
-///
-/// The cast is emitted regardless of the source rounding mode; a mode differing
-/// from `ExpectedRounding` is preserved as `tir-dropped-rounding`.
+/// Convert ftoi or itof to the signed or unsigned arith cast, which rounds as
+/// `ExpectedRounding`, the only mode the op verifier accepts.
 template <typename SrcOp, typename SignedDstOp, typename UnsignedDstOp,
           cuda_tile::RoundingMode ExpectedRounding>
 struct ConvertFromToSignednessCastWithRoundingOp
@@ -623,8 +588,8 @@ static SmallVector<Value> flattenValues(ArrayRef<ValueRange> values) {
   return flat;
 }
 
-/// Group `newValues` by the number of types each of `origTypes` converts to,
-/// e.g. to replace the results of an op whose token results were dropped.
+/// Split `newValues` into one range per type of `origTypes`, sized by what the
+/// type converts to: none for a token, two for a pointer tile.
 static SmallVector<ValueRange>
 groupByConvertedTypes(const TypeConverter &converter, TypeRange origTypes,
                       ValueRange newValues) {
@@ -638,8 +603,8 @@ groupByConvertedTypes(const TypeConverter &converter, TypeRange origTypes,
   return groups;
 }
 
-/// Base for patterns of ops with token operands. Tokens convert to no values
-/// (see the type converter), so their operands are null in the 1:1 adaptor.
+/// Base for patterns of ops with token operands. Tokens convert to no values,
+/// so they are null in the 1:1 adaptor; other 1:N operands fail the match.
 template <typename SourceOp>
 struct TokenDroppingPattern : public OpConversionPattern<SourceOp> {
   using OpConversionPattern<SourceOp>::OpConversionPattern;
@@ -690,23 +655,15 @@ struct ConvertToScfYield : public OpConversionPattern<SrcOp> {
   }
 };
 
-/// Layout of the six trailing launch-coordinate arguments appended when
-/// `append-grid-args=true` (see ConvertEntry). They appear in
-/// the order: tile block id x/y/z, then grid dim x/y/z.
+/// The six launch coordinates that `append-grid-args` appends to the arguments
+/// of entry functions: tile block id x/y/z, then grid dimension x/y/z.
 struct AppendedGridArgLayout {
-  /// Total number of trailing launch-coordinate arguments.
   static constexpr unsigned kNumArgs = 6;
-  /// Offset of the tile-block-id triple from the start of the launch
-  /// coordinates.
   static constexpr unsigned kBlockIdBase = 0;
-  /// Offset of the grid-dimension triple from the start of the launch
-  /// coordinates.
   static constexpr unsigned kGridDimBase = 3;
 
-  /// Look up the appended function-argument index carrying the value for the
-  /// query
-  /// whose triple starts at offset `argBase` (kBlockIdBase or kGridDimBase)
-  /// along `dim`.
+  /// The argument index of coordinate `dim` of the triple at `argBase`, in a
+  /// function with `numArgs` arguments.
   static unsigned argIndex(unsigned numArgs, unsigned argBase,
                            gpu::Dimension dim) {
     unsigned startIdx = numArgs - kNumArgs;
@@ -722,19 +679,9 @@ struct AppendedGridArgLayout {
   }
 };
 
-/// Convert a cuda_tile op that returns three i32 values (one per grid
-/// dimension) into the launch coordinates for the active target.
-///
-///   - GPU: three GPU dimension-query ops (x, y, z), e.g.
-///     get_tile_block_id -> gpu.block_id and get_num_tile_blocks ->
-///     gpu.grid_dim.
-///   - appendGridArgs=true: read matching trailing function arguments,
-///     whose indices are looked up via AppendedGridArgLayout starting at
-///     `ArgBase`.
-///   - appendGridArgs=false: lower to gpu dimension-query ops only when
-///     `target=gpu`; otherwise fail conversion.
-///
-/// Each result is cast to the converted result type as needed.
+/// Convert a query of three grid coordinates (get_tile_block_id,
+/// get_num_tile_blocks) to the appended function arguments at `ArgBase` under
+/// `append-grid-args`, and to `GpuDimOp` ops on the GPU target otherwise.
 template <typename SrcOp, typename GpuDimOp, unsigned ArgBase>
 struct ConvertDimQueryOp : public OptionsPattern<SrcOp> {
   using OptionsPattern<SrcOp>::OptionsPattern;
@@ -748,8 +695,6 @@ struct ConvertDimQueryOp : public OptionsPattern<SrcOp> {
     if (!resultTy)
       return rewriter.notifyMatchFailure(op, "cannot convert result type");
 
-    // When requested, source launch coordinates from trailing function
-    // arguments (of any function-like parent, e.g. func.func or gpu.func).
     FunctionOpInterface parentFunc;
     if (this->options.appendGridArgs) {
       parentFunc = op->template getParentOfType<FunctionOpInterface>();
@@ -783,11 +728,8 @@ struct ConvertDimQueryOp : public OptionsPattern<SrcOp> {
   }
 };
 
-/// Convert cuda_tile.maxf/minf based on propagate_nan.
-///
-/// propagate_nan dispatches to arith.maximumf/minimumf (NaN propagating) vs
-/// arith.maxnumf/minnumf (NaN suppressing). flush_to_zero has no arith
-/// equivalent and is preserved as `tir-dropped-flush-to-zero`.
+/// Convert maxf or minf to the arith op that propagates NaNs (maximumf,
+/// minimumf) or not (maxnumf, minnumf), as `propagate_nan` requests.
 template <typename SrcOp, typename NanPropagatingOp, typename NanSuppressingOp>
 struct ConvertMinMaxFOp : public OpConversionPattern<SrcOp> {
   using OpConversionPattern<SrcOp>::OpConversionPattern;
@@ -811,12 +753,9 @@ struct ConvertMinMaxFOp : public OpConversionPattern<SrcOp> {
   }
 };
 
-/// Common pre-flight checks for cuda_tile.reduce/scan lowerings.
-///
-/// Extracts the combining kind from the body, validates that the op has a
-/// single operand and a vector-typed converted source, and returns the
-/// identity attribute. On failure, calls `notifyMatchFailure` with an
-/// appropriate reason.
+/// Match a single-operand reduce or scan whose body applies one binary op to
+/// its two arguments. Returns the vector combining kind of that op, the
+/// converted operand and its type, and the identity.
 template <typename OpT>
 static FailureOr<
     std::tuple<vector::CombiningKind, Value, VectorType, TypedAttr>>
@@ -922,15 +861,12 @@ matchSingleOperandCombiningOp(OpT op, ValueRange convertedOperands,
   return std::make_tuple(*kind, source, srcVecTy, identityAttr);
 }
 
-/// Validate shared load/store_tko constraints before lowering.
+/// Reject load/store_tko orderings and scopes that the lowering would weaken.
 ///
-/// load/store_tko lower to *non-atomic* memref.load/memref.store, which provide
-/// no ordering guarantees. Accepting anything stronger than `weak` (e.g.
-/// acquire/release) would therefore silently weaken the program's semantics, so
-/// such ordering is rejected rather than dropped. This differs deliberately
-/// from atomic_rmw_tko, whose target op (memref.atomic_rmw) is acq_rel and thus
-/// always at least as strong as the requested ordering, allowing it to accept
-/// and merely annotate the dropped ordering/scope.
+/// They lower to plain memref and vector accesses without ordering, so only
+/// `weak` without a scope is accepted. atomic_rmw_tko differs: its
+/// memref.atomic_rmw is acq_rel, at least as strong as any ordering, so it
+/// records the ordering as dropped instead.
 template <typename TkoOp>
 static LogicalResult checkCommonTkoGuards(TkoOp op,
                                           ConversionPatternRewriter &rewriter) {
@@ -944,8 +880,7 @@ static LogicalResult checkCommonTkoGuards(TkoOp op,
   return success();
 }
 
-/// Keeps the information needed by vector.transfer_read / transfer_write to
-/// access a memref through a tile view (partition_view or strided_view).
+/// The operands of the vector.transfer_read/write for a view access.
 struct TransferViewAccessPlan {
   ViewInfo viewInfo;
   SmallVector<Value> memrefIndices;
@@ -953,22 +888,13 @@ struct TransferViewAccessPlan {
   SmallVector<bool> inBounds;
 };
 
-/// Build a TransferViewAccessPlan for a load_view_tko or store_view_tko.
+/// Plan the transfer that accesses tile `convertedIndices` of `view`.
 ///
-/// Translate tile-view indices into the concrete memref indices, permutation
-/// map, and in-bounds flags required by vector.transfer_read/write.
-/// 1. Cast each tile-level index to `index` and scale by the view's per-dim
-///    base advance (`viewStrides[i]`): tile_shape for partition_view,
-///    traversal_strides for strided_view.
-/// 2. Place the scaled index into the memref-dimension slot given by dim_map.
-/// 3. Build a permutation_map whose i-th result references memref dimension
-///    dim_map[i], so vector dim i reads/writes that tensor dimension.
-/// 4. Set inBounds[i] = true only when the tensor extent is static and the
-///    last in-bounds tile base plus the tile extent still fits within it (i.e.
-///    no tile, including the trailing one, ever runs past the tensor extent).
-///    For partition_view this reduces to "extent divisible by tile extent";
-///    for strided_view it also rejects overlapping/gapped layouts whose edge
-///    tiles spill out of bounds, deferring those lanes to the masked path.
+/// Tile index i, scaled by the base advance of the view, indexes memref
+/// dimension dim_map[i], and the permutation map sends that dimension to
+/// vector dimension i. A dimension is in bounds only if its extent is static
+/// and the last tile that starts inside the tensor also ends inside it; the
+/// transfer masks the other dimensions.
 static FailureOr<TransferViewAccessPlan>
 buildTransferViewAccessPlan(ConversionPatternRewriter &rewriter, Operation *op,
                             Value view, Value convertedView,
@@ -983,7 +909,7 @@ buildTransferViewAccessPlan(ConversionPatternRewriter &rewriter, Operation *op,
   Location loc = op->getLoc();
   auto *ctx = rewriter.getContext();
 
-  // Build memref indices in tensor-dimension order. View indices are unsigned.
+  // View indices are unsigned.
   auto nswFlag = arith::IntegerOverflowFlagsAttr::get(
       ctx, arith::IntegerOverflowFlags::nsw);
   SmallVector<Value> memrefIndices(rank);
@@ -1009,8 +935,8 @@ buildTransferViewAccessPlan(ConversionPatternRewriter &rewriter, Operation *op,
     int64_t ext = memrefShape[viewInfo.dimMap[i]];
     if (ext == ShapedType::kDynamic)
       continue;
-    // Number of in-bounds tile bases along this dimension (partial edge tiles
-    // are included), then check whether the trailing tile fits entirely.
+    // Count the tiles that start inside the tensor, then check whether the
+    // last one ends inside it.
     int64_t stride = viewInfo.viewStrides[i];
     int64_t numTiles = (ext + stride - 1) / stride;
     int64_t lastBase = numTiles > 0 ? (numTiles - 1) * stride : 0;
@@ -1022,29 +948,17 @@ buildTransferViewAccessPlan(ConversionPatternRewriter &rewriter, Operation *op,
 }
 
 //===----------------------------------------------------------------------===//
-// Conversion Patterns
+// Conversion Patterns, roughly in alphabetical order of the cuda_tile op
 //===----------------------------------------------------------------------===//
 using ConvertAddF = ConvertBinaryFloatOp<cuda_tile::AddFOp, arith::AddFOp>;
 
 using ConvertAddI =
     ConvertBinaryLhsRhsWithOverflowOp<cuda_tile::AddIOp, arith::AddIOp>;
 
-/// Convert cuda_tile.alloca to memref.alloca (+ memref.cast).
-///
-/// The op allocates `num_elem` elements of the pointee type with automatic
-/// (block-scoped) lifetime and yields a scalar pointer. The pass models a
-/// scalar `tile<ptr<T>>` as an unranked `memref<*xT>`, so we allocate a ranked
-/// `memref<num_elem x T>` on the stack and cast it to the unranked result type.
-///
-/// Attribute mapping:
-///   - `num_elem`  -> the (single) static dimension of the ranked memref.
-///   - `alignment` -> memref.alloca's `alignment` (a non-zero power of two,
-///                    guaranteed by the source verifier and required as such by
-///                    memref.alloca).
-///   - `global`    -> marks the address as shareable across tile threads. The
-///                    unranked memref pointer model carries no memory space
-///                    able to express that sharing, so the conversion bails
-///                    when it is set.
+/// Convert cuda_tile.alloca to a memref.alloca of `num_elem` elements, cast to
+/// the pointer type `memref<*xT>`. The `global` variant, whose address is
+/// shared across tile threads, is rejected: the memref has no memory space
+/// that could express the sharing.
 struct ConvertAlloca : public OpConversionPattern<cuda_tile::AllocaOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -1065,8 +979,7 @@ struct ConvertAlloca : public OpConversionPattern<cuda_tile::AllocaOp> {
       return rewriter.notifyMatchFailure(
           op, "alloca result did not convert to an unranked memref");
 
-    // The source verifier guarantees alignment is a non-zero power of two,
-    // which is exactly what memref.alloca requires.
+    // The verifier guarantees the non-zero power of two memref.alloca needs.
     auto rankedTy = MemRefType::get(
         {static_cast<int64_t>(op.getNumElem())}, unrankedTy.getElementType(),
         MemRefLayoutAttrInterface{}, unrankedTy.getMemorySpace());
@@ -1106,17 +1019,8 @@ struct ConvertBroadcast : public OpConversionPattern<cuda_tile::BroadcastOp> {
   }
 };
 
-/// Convert cuda_tile.cat to vector.insert_strided_slice.
-///
-///   1. Create a poison/undef vector of the result type (ub.poison) — its
-///      elements will be fully overwritten by the two inserts.
-///   2. vector.insert_strided_slice lhs into the result at all-zero offsets.
-///   3. vector.insert_strided_slice rhs into the result at offset
-///      [0,...,lhs.shape[d],...,0] (only the concat-dim offset is non-zero).
-///
-///   All sizes and offsets are statically known from the tile types, which is
-///   exactly what vector.insert_strided_slice requires (I64ArrayAttr offsets,
-///   unit strides).
+/// Convert cuda_tile.cat to two vector.insert_strided_slice ops into a poison
+/// vector: lhs at offset 0, and rhs behind it along the concatenated dimension.
 struct ConvertCat : public OpConversionPattern<cuda_tile::CatOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -1136,18 +1040,12 @@ struct ConvertCat : public OpConversionPattern<cuda_tile::CatOp> {
     Value rhs = adaptor.getRhs();
     auto lhsVecTy = cast<VectorType>(lhs.getType());
 
-    // Start with an undefined result vector (all elements will be written).
     Value dest = ub::PoisonOp::create(rewriter, loc, dstVecTy);
-
-    // Offsets for lhs: all zeros.
     SmallVector<int64_t> lhsOffsets(rank, 0);
-    // Strides: all ones (required by vector.insert_strided_slice).
     SmallVector<int64_t> strides(rank, 1);
-
     Value withLhs = vector::InsertStridedSliceOp::create(
         rewriter, loc, lhs, dest, lhsOffsets, strides);
 
-    // Offsets for rhs: zero everywhere except concatDim = lhs.shape[concatDim].
     SmallVector<int64_t> rhsOffsets(rank, 0);
     rhsOffsets[concatDim] = lhsVecTy.getDimSize(concatDim);
 
@@ -1157,9 +1055,8 @@ struct ConvertCat : public OpConversionPattern<cuda_tile::CatOp> {
   }
 };
 
-/// Map a cuda_tile comparison predicate to the arith.cmpf predicate with the
-/// matching ordering (`cuda_tile::ComparisonOrdering` is either ordered or
-/// unordered).
+/// Map a cuda_tile comparison predicate to the arith.cmpf predicate that is
+/// ordered or unordered as requested.
 static arith::CmpFPredicate
 mapCmpFPredicate(cuda_tile::ComparisonPredicate pred, bool ordered) {
   using CP = cuda_tile::ComparisonPredicate;
@@ -1235,9 +1132,7 @@ struct ConvertCmpI : public OpConversionPattern<cuda_tile::CmpIOp> {
   }
 };
 
-/// Convert cuda_tile.constant to an arith.constant of the converted type:
-/// a scalar attribute for rank-0 tiles, a DenseElementsAttr of the target
-/// vector type otherwise.
+/// Convert cuda_tile.constant to an arith.constant of the converted type.
 struct ConvertConstant : public OpConversionPattern<cuda_tile::ConstantOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -1263,14 +1158,8 @@ struct ConvertConstant : public OpConversionPattern<cuda_tile::ConstantOp> {
 
 using ConvertContinue = ConvertToScfYield<cuda_tile::ContinueOp>;
 
-/// Convert cuda_tile.divf to arith.divf.
-///
-/// `rounding<approx>` is represented by the `arcp` (allow reciprocal) FastMath
-/// flag. The default `rounding<nearest_even>` is represented by arith.divf's
-/// default semantics. Other rounding modes are preserved as
-/// `tir-dropped-rounding`.
-/// `flush_to_zero` has no arith equivalent and is preserved on the result as
-/// `tir-dropped-flush-to-zero`.
+/// Convert cuda_tile.divf to arith.divf; `rounding<approx>` maps to the `arcp`
+/// (allow reciprocal) flag.
 using ConvertDivF = ConvertBinaryFloatOp<cuda_tile::DivFOp, arith::DivFOp,
                                          arith::FastMathFlags::arcp>;
 
@@ -1308,23 +1197,10 @@ struct ConvertDivI : public OpConversionPattern<cuda_tile::DivIOp> {
   }
 };
 
-/// Convert cuda_tile.entry to gpu.func (gpu target) or func.func (cpu target).
-///
-/// The function signature is derived by applying the type converter to each
-/// entry argument type (e.g. `tile<ptr<T>>` -> `memref<*xT>`, `tile<i32>` ->
-/// `i32`). The entry body is signature-converted in place and then moved into
-/// the new function body.
-///
-/// When `append-grid-args=true`, the function additionally receives six
-/// trailing `i32` arguments carrying launch coordinates: the three tile block
-/// ids (x, y, z) followed by the three grid dimensions (x, y, z). These follow
-/// the converted entry arguments.
-///
-/// `optimization_hints`, when present, is preserved on the produced function as
-/// the discardable attribute `tir-dropped-optimization-hints`.
-///
-/// When `known-block-size` provides three values, the produced gpu.func carries
-/// them as the `known_block_size` attribute.
+/// Convert cuda_tile.entry to a gpu.func kernel (GPU target) or a func.func
+/// (CPU target) with the converted argument types. `append-grid-args` appends
+/// the launch coordinates (see AppendedGridArgLayout), and `known-block-size`
+/// sets the `known_block_size` of the gpu.func.
 struct ConvertEntry : public OptionsPattern<cuda_tile::EntryOp> {
   using OptionsPattern::OptionsPattern;
 
@@ -1336,8 +1212,6 @@ struct ConvertEntry : public OptionsPattern<cuda_tile::EntryOp> {
     Block *entryBlock = &entryOp.getBody().front();
     unsigned numArgs = entryBlock->getNumArguments();
 
-    // Compute the function arg types and prepare a signature conversion for
-    // the entry block.
     const TypeConverter *tc = getTypeConverter();
     TypeConverter::SignatureConversion sigConv(numArgs);
     SmallVector<Type> funcArgTypes;
@@ -1353,8 +1227,6 @@ struct ConvertEntry : public OptionsPattern<cuda_tile::EntryOp> {
       sigConv.addInputs(i, converted);
     }
 
-    // Optionally append launch coordinates as six trailing i32 arguments
-    // (block id x/y/z then grid dim x/y/z), used by dim-query lowerings.
     if (options.appendGridArgs) {
       SmallVector<Type> launchArgTypes(AppendedGridArgLayout::kNumArgs,
                                        IntegerType::get(ctx, 32));
@@ -1364,17 +1236,13 @@ struct ConvertEntry : public OptionsPattern<cuda_tile::EntryOp> {
 
     auto funcType = FunctionType::get(ctx, funcArgTypes, {});
 
-    // Convert the entry block's arg types; this replaces the block with a
-    // new one having the converted signature and rewires uses via source
-    // materializations.
     FailureOr<Block *> convertedBlock =
         rewriter.convertRegionTypes(&entryOp.getBody(), *tc, &sigConv);
     if (failed(convertedBlock))
       return failure();
 
     if (options.target == TileIRTarget::GPU) {
-      // GPU: lower to a gpu.func kernel and merge the converted body into its
-      // (auto-created) entry block.
+      // gpu.func creates its entry block; merge the converted body into it.
       auto gpuFunc =
           gpu::GPUFuncOp::create(rewriter, loc, entryOp.getSymName(), funcType);
       gpuFunc->setAttr(gpu::GPUDialect::getKernelFuncAttrName(),
@@ -1386,7 +1254,6 @@ struct ConvertEntry : public OptionsPattern<cuda_tile::EntryOp> {
       Block *gpuBlock = &gpuFunc.getBody().front();
       rewriter.mergeBlocks(*convertedBlock, gpuBlock, gpuBlock->getArguments());
     } else {
-      // CPU: lower to a plain func.func and move the converted body region in.
       auto func =
           func::FuncOp::create(rewriter, loc, entryOp.getSymName(), funcType);
       preserveDroppedOptHints(entryOp, func);
@@ -1404,41 +1271,15 @@ using ConvertExp = ConvertUnaryApproxMathOp<cuda_tile::ExpOp, math::ExpOp,
                                             /*PreserveFtz=*/false>;
 
 /// Convert cuda_tile.exp2 to math.exp2.
-///
-/// `flush_to_zero` is not representable in math FastMath flags and is preserved
-/// on the result as `tir-dropped-flush-to-zero` when set.
 using ConvertExp2 = ConvertUnaryFlushToZeroOp<cuda_tile::Exp2Op, math::Exp2Op>;
 
-/// Convert cuda_tile.extract to vector.shape_cast + vector.transpose +
-/// vector.extract.
-///
-/// Source semantics (from Ops.td):
-///   For `extract %t[%i_0, ..., %i_{n-1}] : tile<D_0 x ... x D_{n-1} x T>
-///                                       -> tile<R_0 x ... x R_{n-1} x T>`,
-///   each R_k evenly divides D_k.  With S_k = D_k / R_k slices per axis,
-///       result[a_0, ..., a_{n-1}] = source[i_0*R_0 + a_0, ...,
-///                                          i_{n-1}*R_{n-1} + a_{n-1}].
-///   The $indices are interpreted as unsigned i32; OOB is UB.
-///
-/// Lowering (dynamic indices preclude vector.extract_strided_slice which
-/// requires static offsets):
-///   1. shape_cast <D_0 x ... x D_{n-1}>
-///                 -> <S_0 x R_0 x S_1 x R_1 x ... x S_{n-1} x R_{n-1}>.
-///      Row-major linearization gives position [s_0,r_0,...,s_k,r_k] the same
-///      linear index as source[s_0*R_0 + r_0, ..., s_k*R_k + r_k] because
-///      D_k = S_k * R_k.
-///   2. transpose with permutation [0,2,...,2(n-1), 1,3,...,2(n-1)+1] to
-///      group slice-index dims first:
-///          <S_0 x ... x S_{n-1} x R_0 x ... x R_{n-1}>.
-///   3. vector.extract at [i_0, ..., i_{n-1}] yields the <R_0 x ... x R_{n-1}>
-///      subvector matching the source semantics.
-///
-/// Special cases:
-///   - rank-1 source: interleaved shape <S_0, R_0> already has the slice dim
-///     leading, the permutation is the identity, so the transpose is skipped.
-///   - source type == result type (scalar tile or all S_k == 1): forward the
-///     source directly. This also covers the scalar tile<T> case where the
-///     converted type is not a VectorType.
+/// Convert cuda_tile.extract, which returns slice [i_0, ..., i_{n-1}] of a
+/// source of shape D cut into slices of the result shape R. The indices are
+/// dynamic, which vector.extract_strided_slice does not support, so:
+///   1. shape_cast the source to <S_0 x R_0 x ... x S_{n-1} x R_{n-1}>, where
+///      S_k = D_k / R_k, which keeps the row-major element order;
+///   2. transpose the slice dimensions S_k to the front (a no-op for rank 1);
+///   3. vector.extract the slice at the indices.
 struct ConvertExtract : public OpConversionPattern<cuda_tile::ExtractOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -1452,8 +1293,7 @@ struct ConvertExtract : public OpConversionPattern<cuda_tile::ExtractOp> {
     Value source = adaptor.getSource();
     Location loc = op.getLoc();
 
-    // Trivial case: source and result types coincide (all S_k == 1, or a
-    // scalar tile<T> that converts to a non-vector type).
+    // The only slice is the source, e.g. of a rank-0 tile.
     if (source.getType() == resultTy) {
       rewriter.replaceOp(op, source);
       return success();
@@ -1463,7 +1303,6 @@ struct ConvertExtract : public OpConversionPattern<cuda_tile::ExtractOp> {
     auto dstVecTy = cast<VectorType>(resultTy);
     int64_t rank = srcVecTy.getRank();
 
-    // Step 1: Build interleaved reshape <S_0, R_0, S_1, R_1, ...>.
     SmallVector<int64_t> interleavedShape;
     interleavedShape.reserve(2 * rank);
     for (auto [d, r] :
@@ -1476,23 +1315,19 @@ struct ConvertExtract : public OpConversionPattern<cuda_tile::ExtractOp> {
     Value reshaped =
         vector::ShapeCastOp::create(rewriter, loc, interleavedTy, source);
 
-    // Step 2: Transpose slice dims to the front.  For rank 1 the permutation
-    // is [0,1] (identity), so we skip the transpose.
     Value extractSource = reshaped;
     if (rank > 1) {
       SmallVector<int64_t> perm;
       perm.reserve(2 * rank);
       for (int64_t k = 0; k < rank; ++k)
-        perm.push_back(2 * k); // slice dims first
+        perm.push_back(2 * k);
       for (int64_t k = 0; k < rank; ++k)
-        perm.push_back(2 * k + 1); // result dims trailing
+        perm.push_back(2 * k + 1);
       extractSource =
           vector::TransposeOp::create(rewriter, loc, reshaped, perm);
     }
 
-    // Step 3: Cast the unsigned i32 slice indices to `index` (the spec
-    // declares $indices as unsigned, so use index_castui) and emit
-    // vector.extract.
+    // The indices are unsigned.
     Type indexTy = rewriter.getIndexType();
     SmallVector<OpFoldResult> positions = llvm::map_to_vector(
         adaptor.getIndices(), [&](Value idx) -> OpFoldResult {
@@ -1505,11 +1340,7 @@ struct ConvertExtract : public OpConversionPattern<cuda_tile::ExtractOp> {
   }
 };
 
-/// Convert cuda_tile.fma to math.fma.
-///
-/// math.fma rounds once to nearest even. Other rounding modes, and all modes
-/// under `drop-rounding-modes`, are preserved as `tir-dropped-rounding`;
-/// `flush_to_zero` is preserved as `tir-dropped-flush-to-zero`.
+/// Convert cuda_tile.fma to math.fma, which rounds once to nearest even.
 struct ConvertFma : public OptionsPattern<cuda_tile::FmaOp> {
   using OptionsPattern::OptionsPattern;
 
@@ -1557,16 +1388,13 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
         rewriter, loc, lb, ub, step, flattenValues(adaptor.getInitValues()),
         /*bodyBuilder=*/nullptr, op.getUnsignedCmp());
 
-    // Convert region types
     if (failed(
             rewriter.convertRegionTypes(&op.getRegion(), *getTypeConverter())))
       return failure();
 
-    // Merge old body into new body
+    // Move the body into the new loop, replacing its implicit yield.
     Block *oldBody = op.getBody();
     Block *newBody = newForOp.getBody();
-
-    // Remove auto-generated yield in new body
     if (newBody->mightHaveTerminator())
       rewriter.eraseOp(newBody->getTerminator());
 
@@ -1587,16 +1415,12 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
   }
 };
 
-/// Convert cuda_tile.ftof to arith.extf / arith.truncf / arith.convertf.
+/// Convert cuda_tile.ftof to arith.extf, arith.truncf, or arith.convertf for
+/// formats of the same width.
 ///
-///   - Widening uses arith.extf. It is exact, so the rounding mode does not
-///     matter and is only preserved under `drop-rounding-modes`.
-///   - Narrowing uses arith.truncf and conversions between formats of the same
-///     width use arith.convertf. Both carry a rounding-mode attribute, so the
-///     source rounding mode is mapped onto it when possible and preserved as
-///     `tir-dropped-rounding` otherwise.
-///
-/// Works for both scalar float and vector<float> types.
+/// Widening is exact, so its rounding mode is only recorded under
+/// `drop-rounding-modes`. truncf and convertf take the rounding mode if arith
+/// has it; otherwise the mode is recorded as dropped.
 struct ConvertFToF : public OptionsPattern<cuda_tile::FToFOp> {
   using OptionsPattern::OptionsPattern;
 
@@ -1608,10 +1432,8 @@ struct ConvertFToF : public OptionsPattern<cuda_tile::FToFOp> {
     if (failed(resultTy))
       return failure();
 
-    // After type conversion the source and result types may coincide -- e.g.
-    // `ftof f32 -> tf32` on the CPU target, where tf32 lowers to f32.  Such a
-    // cast is a no-op, so forward the converted source value (the rounding mode
-    // is irrelevant).
+    // On the CPU, tf32 converts to f32, so a conversion between the two keeps
+    // the value.
     if (adaptor.getFrom().getType() == resultTy.value()) {
       rewriter.replaceOp(op, adaptor.getFrom());
       return success();
@@ -1666,14 +1488,9 @@ using ConvertFToI = ConvertFromToSignednessCastWithRoundingOp<
     cuda_tile::FToIOp, arith::FPToSIOp, arith::FPToUIOp,
     cuda_tile::RoundingMode::NEAREST_INT_TO_ZERO>;
 
-/// Convert cuda_tile.get_global to memref.get_global (+ memref.cast).
-///
-///   1. Resolve the referenced global symbol, accepting either cuda_tile.global
-///      or an already-converted memref.global.
-///   2. Emit memref.get_global with the ranked memref type derived from that
-///      global initializer.
-///   3. Cast to the converted result type (typically memref<*xT>) so this
-///      pass's pointer model remains uniform (tile<ptr<T>> -> memref<*xT>).
+/// Convert cuda_tile.get_global to a memref.get_global of the global, which is
+/// a cuda_tile.global or an already converted memref.global, cast to the
+/// pointer type.
 struct ConvertGetGlobal : public OpConversionPattern<cuda_tile::GetGlobalOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -1728,13 +1545,9 @@ struct ConvertGetGlobal : public OpConversionPattern<cuda_tile::GetGlobalOp> {
   }
 };
 
-/// Convert cuda_tile.get_index_space_shape.
-///
-/// For a tile view with tile dims mapped to tensor dims via dim_map,
-///   index_space_shape[i] = ceildiv(tensor_shape[dimMap[i]], viewStrides[i]),
-/// where viewStrides[i] is the per-dim base advance: tile_shape[i] for
-/// partition_view, traversal_strides[i] for strided_view. Partial edge tiles
-/// are included in the count, which the ceildiv naturally accounts for.
+/// Convert cuda_tile.get_index_space_shape. Dimension i of the index space has
+/// ceildiv(tensor_shape[dim_map[i]], viewStrides[i]) tiles, including a partial
+/// edge tile.
 struct ConvertGetIndexSpaceShape
     : public OpConversionPattern<cuda_tile::GetIndexSpaceShapeOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -1749,11 +1562,6 @@ struct ConvertGetIndexSpaceShape
 
     Location loc = op.getLoc();
     unsigned rank = viewInfo.tileShape.size();
-
-    // For each tile dimension i:
-    // - The corresponding tensor_view dimension is dimMap[i]
-    // - index_space_dim_i = ceildiv(memref.dim(dimMap[i]), viewStrides[i])
-    // When the memref dimension is statically known, fold to a constant.
     auto memrefTy = cast<MemRefType>(viewInfo.memref.getType());
     auto memrefShape = memrefTy.getShape();
 
@@ -1770,12 +1578,10 @@ struct ConvertGetIndexSpaceShape
       int64_t dimSize = memrefShape[tensorDim];
       Value castedResult;
       if (dimSize != ShapedType::kDynamic) {
-        // Static dimension: compute ceildiv at compile time.
         int64_t numTiles = (dimSize + stride - 1) / stride;
         Value cst = arith::ConstantIndexOp::create(rewriter, loc, numTiles);
         castedResult = castValueToType(rewriter, loc, cst, resultTy);
       } else {
-        // Dynamic dimension: emit memref.dim + ceildivui.
         Value dimVal = memref::DimOp::create(
             rewriter, loc, viewInfo.memref,
             arith::ConstantIndexOp::create(rewriter, loc, tensorDim));
@@ -1800,14 +1606,8 @@ using ConvertGetNumTileBlocks =
     ConvertDimQueryOp<cuda_tile::GetNumTileBlocksOp, gpu::GridDimOp,
                       AppendedGridArgLayout::kGridDimBase>;
 
-/// Convert cuda_tile.get_tensor_shape.
-///
-/// For a converted tensor_view memref, each result is the extent of the
-/// corresponding memref dimension. Static extents are folded to constants;
-/// dynamic extents are queried via memref.dim.
-///
-/// Source semantics specify that these values are interpreted as unsigned
-/// integers. When the target result type is integer, use index_castui.
+/// Convert cuda_tile.get_tensor_shape to the extents of the converted memref,
+/// cast with index_castui since the shape is unsigned.
 struct ConvertGetTensorShape
     : public OpConversionPattern<cuda_tile::GetTensorShapeOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -1863,14 +1663,8 @@ using ConvertGetTileBlockId =
     ConvertDimQueryOp<cuda_tile::GetTileBlockIdOp, gpu::BlockIdOp,
                       AppendedGridArgLayout::kBlockIdBase>;
 
-/// Convert cuda_tile.global to memref.global.
-///
-///   1. Derive a ranked static memref type from the initializer shape/element.
-///   2. Emit memref.global with the same symbol name and initial value.
-///   3. Preserve alignment when non-zero; omit it otherwise.
-///
-/// Note: cuda_tile.global is mutable, so we do not set memref.global
-/// `constant`.
+/// Convert cuda_tile.global to a mutable memref.global with the same name,
+/// initializer and alignment.
 struct ConvertGlobal : public OpConversionPattern<cuda_tile::GlobalOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -1933,11 +1727,7 @@ struct ConvertIf : public OpConversionPattern<cuda_tile::IfOp> {
   }
 };
 
-/// Convert cuda_tile.iota to vector.step + arith.index_castui.
-///
-///   1. Emit vector.step : vector<nxindex> to materialize [0..n-1].
-///   2. Convert lanes to the destination integer element type with
-///      arith.index_castui to preserve unsigned interpretation.
+/// Convert cuda_tile.iota to vector.step, cast to the element type.
 struct ConvertIota : public OpConversionPattern<cuda_tile::IotaOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -1966,19 +1756,9 @@ using ConvertIToF = ConvertFromToSignednessCastWithRoundingOp<
     cuda_tile::IToFOp, arith::SIToFPOp, arith::UIToFPOp,
     cuda_tile::RoundingMode::NEAREST_EVEN>;
 
-/// Convert cuda_tile.load_view_tko to vector.transfer_read.
-///
-/// The indices, permutation map and in-bounds flags come from
-/// buildTransferViewAccessPlan. Out-of-bounds lanes read the view's
-/// `padding_value`, or poison when it has none.
-///
-/// Restrictions (return notifyMatchFailure on violation):
-///   - Only `weak` memory_ordering_semantics is supported.
-///   - `memory_scope` is not supported.
-///
-/// `optimization_hints`, when present, is preserved on the produced
-/// vector.transfer_read as the discardable attribute
-/// `tir-dropped-optimization-hints`.
+/// Convert cuda_tile.load_view_tko to a vector.transfer_read (see
+/// buildTransferViewAccessPlan). Out-of-bounds lanes read the view's
+/// `padding_value`, or poison without one.
 struct ConvertLoadViewTko
     : public OptionsPattern<cuda_tile::LoadViewTkoOp,
                             TokenDroppingPattern<cuda_tile::LoadViewTkoOp>> {
@@ -2044,28 +1824,15 @@ struct ConvertLoadViewTko
   }
 };
 
-/// Recover the runtime offset (the descriptor's offset field) carried by an
-/// unranked converted pointer value (`memref<*xT>`).
+/// The offset of the unranked pointer `unrankedBase` (`memref<*xT>`) into its
+/// buffer. Advancing a pointer must add to this offset, since reinterpret_cast
+/// offsets are absolute to the buffer.
 ///
-/// `memref.reinterpret_cast` expresses an offset that is *absolute* to the
-/// underlying buffer, so any pattern that needs to advance such a pointer
-/// (chained scalar `offset` ops, or a `make_tensor_view` whose base was
-/// pre-shifted) must read the base's current offset and add to it rather than
-/// overwrite it. The unranked base is cast to a ranked memref with a dynamic
-/// offset / unit stride, then its offset field is read via
-/// memref.extract_strided_metadata.
-///
-/// Kernel-pointer function arguments are a special case: by the calling
-/// convention of the converted kernels (see Passes.td), they are bare pointers
-/// with a zero descriptor offset, so there is nothing to recover. We
-/// short-circuit them to a static `0` and emit *no* IR. This also keeps every
-/// use of the argument a reinterpret_cast with a static zero offset, which
-/// ConvertMemrefArgsToRankedMemref requires to promote the argument.
-///
-/// The short-circuit is restricted to entry-block arguments of function-like
-/// ops. A pointer carried as a loop/region iter-arg (e.g. an `scf.for` body
-/// argument) may hold a non-zero, pre-shifted offset, so it must go through the
-/// metadata path instead of being assumed zero.
+/// Pointer arguments of functions have offset 0 by the calling convention (see
+/// Passes.td), so none is read for them. This keeps every use of such an
+/// argument a zero-offset reinterpret_cast, which
+/// ConvertMemrefArgsToRankedMemref needs to promote it. Other block arguments,
+/// e.g. loop-carried pointers, may have an offset and are queried.
 static OpFoldResult
 recoverUnrankedPtrOffset(ConversionPatternRewriter &rewriter, Location loc,
                          Value unrankedBase) {
@@ -2084,15 +1851,8 @@ recoverUnrankedPtrOffset(ConversionPatternRewriter &rewriter, Location loc,
   return meta.getOffset();
 }
 
-/// Reinterpret an unranked converted pointer (`memref<*xT>`) as a rank-0 memref
-/// the scalar load/store/atomic patterns can address, *preserving* the
-/// descriptor's absolute offset.
-///
-/// `memref.reinterpret_cast` offsets are absolute to the underlying buffer, so
-/// reinterpreting with a literal offset of 0 would reset a pre-shifted pointer
-/// (e.g. the result of a scalar `offset` op) back to the buffer start and read
-/// the wrong element. We recover the base's current offset and re-apply it,
-/// mirroring how `make_tensor_view` and scalar `offset` preserve offsets.
+/// A rank-0 memref at the unranked pointer `unrankedBase`, keeping the offset
+/// of the pointer; an offset of 0 would address the start of the buffer.
 static Value
 reinterpretScalarPtrPreservingOffset(ConversionPatternRewriter &rewriter,
                                      Location loc, Value unrankedBase) {
@@ -2110,11 +1870,8 @@ reinterpretScalarPtrPreservingOffset(ConversionPatternRewriter &rewriter,
       .getResult();
 }
 
-/// Convert cuda_tile.make_tensor_view to memref.reinterpret_cast.
-///
-/// The base operand is a scalar `tile<ptr<T>>`, which the type converter maps
-/// to `memref<*xT>`. The tensor_view result type maps to a ranked memref.
-/// Static shape and stride entries come from the tensor_view type.
+/// Convert cuda_tile.make_tensor_view to a memref.reinterpret_cast of the base
+/// pointer at its offset, with the shape and strides of the view.
 ///
 /// cuda_tile specifies the dynamic shape and stride operands as unsigned, but
 /// they are sign-extended: --tileir-ptr-to-view derives them from signed
@@ -2145,11 +1902,6 @@ struct ConvertMakeTensorView
         tvType.getShape(), toIndex(adaptor.getDynamicShape()), rewriter);
     SmallVector<OpFoldResult> strides = getMixedValues(
         tvType.getStrides(), toIndex(adaptor.getDynamicStrides()), rewriter);
-
-    // make_tensor_view reshapes the buffer at the base pointer's current
-    // location, so it must preserve whatever absolute offset the base memref
-    // descriptor carries. Recover it unconditionally rather than matching only
-    // a specific producer shape (e.g. direct scalar `offset`).
     OpFoldResult offset =
         recoverUnrankedPtrOffset(rewriter, loc, adaptor.getBase());
 
@@ -2165,16 +1917,7 @@ using ConvertMaxF =
 using ConvertMinF =
     ConvertMinMaxFOp<cuda_tile::MinFOp, arith::MinimumFOp, arith::MinNumFOp>;
 
-/// Convert cuda_tile.mmaf to vector.contract (matmul-style contraction).
-///
-///   1. Convert result tile type to a vector type
-///   2. Build affine indexing maps and iterator types depending on the rank.
-///      - Unbatched (3 iterators, d0=m, d1=n, d2=k):
-///          lhs (d0,d2), rhs (d2,d1), acc (d0,d1); iters [par,par,red].
-///      - Batched (4 iterators, d0=b, d1=m, d2=n, d3=k):
-///          lhs (d0,d1,d3), rhs (d0,d3,d2), acc (d0,d1,d2);
-///          iters [par,par,par,red].
-///   3. Replace with vector.contract(lhs, rhs, acc) with combining kind = add.
+/// Convert cuda_tile.mmaf to a vector.contract that accumulates into `acc`.
 struct ConvertMmaF : public OpConversionPattern<cuda_tile::MmaFOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -2192,7 +1935,6 @@ struct ConvertMmaF : public OpConversionPattern<cuda_tile::MmaFOp> {
       return rewriter.notifyMatchFailure(
           op, "only 2D or 3D (batched) mmaf is supported");
 
-    // Explicit combining kind = add (mmaf is multiply-accumulate).
     rewriter.replaceOpWithNewOp<vector::ContractionOp>(
         op, adaptor.getLhs(), adaptor.getRhs(), adaptor.getAcc(),
         rewriter.getAffineMapArrayAttr({spec->mapA, spec->mapB, spec->mapC}),
@@ -2201,12 +1943,9 @@ struct ConvertMmaF : public OpConversionPattern<cuda_tile::MmaFOp> {
   }
 };
 
-/// Convert cuda_tile.mmai to vector.contract (matmul-style contraction).
-///
-/// Lowering mirrors mmaf and uses the same indexing-map / iterator builder.
-/// vector.contract promotes narrower integer operands by sign extension, so
-/// operands are first extended to the accumulator element type according to
-/// their signedness.
+/// Convert cuda_tile.mmai to a vector.contract. The operands are first extended
+/// to the accumulator type by their signedness, since vector.contract would
+/// sign-extend them.
 struct ConvertMmaI : public OpConversionPattern<cuda_tile::MmaIOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -2245,12 +1984,8 @@ struct ConvertMmaI : public OpConversionPattern<cuda_tile::MmaIOp> {
   }
 };
 
-/// Convert cuda_tile.module by moving its body contents.
-///
-/// For the GPU target the body is moved into a new gpu.module of the same name.
-/// For the CPU target the cuda_tile.module is dissolved: its contents are
-/// inlined into the enclosing module (the builtin.module the pass runs on) and
-/// the cuda_tile.module wrapper is erased.
+/// Convert cuda_tile.module to a gpu.module of the same name (GPU target), or
+/// inline its contents into the enclosing module (CPU target).
 struct ConvertModule : public OptionsPattern<cuda_tile::ModuleOp> {
   using OptionsPattern::OptionsPattern;
 
@@ -2262,16 +1997,11 @@ struct ConvertModule : public OptionsPattern<cuda_tile::ModuleOp> {
                                              tileirMod.getSymName());
       Block *oldBody = &tileirMod.getBody().front();
       Block *newBody = gpuMod.getBody();
-
-      // Move ops from cuda_tile.module body into gpu.module body, inserting
-      // before the gpu.module_end terminator if present.
       if (newBody->mightHaveTerminator())
         rewriter.inlineBlockBefore(oldBody, newBody->getTerminator());
       else
         rewriter.inlineBlockBefore(oldBody, newBody, newBody->end());
     } else {
-      // Dissolve the module into the enclosing module by inlining its body
-      // ops right before the cuda_tile.module op in its parent block.
       rewriter.inlineBlockBefore(&tileirMod.getBody().front(), tileirMod);
     }
 
@@ -2282,7 +2012,8 @@ struct ConvertModule : public OptionsPattern<cuda_tile::ModuleOp> {
 
 using ConvertMulF = ConvertBinaryFloatOp<cuda_tile::MulFOp, arith::MulFOp>;
 
-/// Convert cuda_tile.mulhii by taking the high part of mului_extended.
+/// Convert cuda_tile.mulhii, which is unsigned, to the high half of
+/// arith.mului_extended.
 struct ConvertMulhiI : public OpConversionPattern<cuda_tile::MulhiIOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -2366,13 +2097,7 @@ struct ConvertNegI : public OpConversionPattern<cuda_tile::NegIOp> {
   }
 };
 
-/// Convert scalar (rank-0) cuda_tile.load_ptr_tko on a `tile<ptr<T>>` to a
-/// `memref.reinterpret_cast` + `memref.load`. The source `tile<ptr<T>>` is
-/// converted to `memref<*xT>`; a rank-0 reinterpret_cast that keeps the
-/// descriptor offset recovers the scalar memref the load reads from.
-///
-/// `optimization_hints`, when present, is preserved on the produced memref.load
-/// as the discardable attribute `tir-dropped-optimization-hints`.
+/// Convert a scalar cuda_tile.load_ptr_tko to a memref.load from the pointer.
 struct ConvertLoadPtrTkoScalar
     : public TokenDroppingPattern<cuda_tile::LoadPtrTkoOp> {
   using TokenDroppingPattern::TokenDroppingPattern;
@@ -2404,11 +2129,7 @@ struct ConvertLoadPtrTkoScalar
   }
 };
 
-/// Convert scalar (rank-0) cuda_tile.store_ptr_tko on a `tile<ptr<T>>` to a
-/// `memref.reinterpret_cast` + `memref.store`. Mirrors ConvertLoadPtrTkoScalar.
-///
-/// `optimization_hints`, when present, is preserved on the produced
-/// memref.store as the discardable attribute `tir-dropped-optimization-hints`.
+/// Convert a scalar cuda_tile.store_ptr_tko to a memref.store to the pointer.
 struct ConvertStorePtrTkoScalar
     : public TokenDroppingPattern<cuda_tile::StorePtrTkoOp> {
   using TokenDroppingPattern::TokenDroppingPattern;
@@ -2490,11 +2211,9 @@ static Value getMaskOrAllTrue(OpBuilder &builder, Location loc, ValueRange mask,
       builder, loc, VectorType::get(shape, builder.getI1Type()), trueVal);
 }
 
-/// Convert ranked cuda_tile.load_ptr_tko to vector.gather from the base of the
-/// pointer tile at its lane offsets.
-///
-/// `optimization_hints`, when present, is preserved on the gather as the
-/// discardable attribute `tir-dropped-optimization-hints`.
+/// Convert a ranked cuda_tile.load_ptr_tko to a vector.gather from the base of
+/// the pointer tile at its lane offsets. Masked-off lanes read the padding
+/// value, or zero without one.
 struct ConvertLoadPtrTkoRanked
     : public OpConversionPattern<cuda_tile::LoadPtrTkoOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -2531,12 +2250,8 @@ struct ConvertLoadPtrTkoRanked
   }
 };
 
-/// Convert ranked cuda_tile.store_ptr_tko to vector.scatter to the base of the
-/// pointer tile at its lane offsets.
-///
-/// `optimization_hints`, when present, is preserved on the produced
-/// vector.scatter as the discardable attribute
-/// `tir-dropped-optimization-hints`.
+/// Convert a ranked cuda_tile.store_ptr_tko to a vector.scatter to the base of
+/// the pointer tile at its lane offsets.
 struct ConvertStorePtrTkoRanked
     : public OpConversionPattern<cuda_tile::StorePtrTkoOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -2565,11 +2280,8 @@ struct ConvertStorePtrTkoRanked
   }
 };
 
-/// Map a cuda_tile.atomic_rmw mode to the equivalent arith atomic_rmw kind.
-///
-/// MAX/MIN are the signed integer variants; UMAX/UMIN are the unsigned ones.
-/// XCHG (unconditional swap) maps to `assign`. Every cuda_tile mode has an
-/// arith equivalent, so this mapping is total.
+/// Map a cuda_tile atomic_rmw mode to its arith kind; MAX and MIN are signed,
+/// XCHG is `assign`.
 static arith::AtomicRMWKind
 mapAtomicRMWMode(cuda_tile::AtomicRMWMode mode) {
   switch (mode) {
@@ -2597,24 +2309,13 @@ mapAtomicRMWMode(cuda_tile::AtomicRMWMode mode) {
   llvm_unreachable("unhandled cuda_tile atomic_rmw mode");
 }
 
-/// Convert scalar (rank-0) cuda_tile.atomic_rmw_tko on a `tile<ptr<T>>` to a
-/// `memref.reinterpret_cast` + `memref.atomic_rmw`. Mirrors
-/// ConvertLoadPtrTkoScalar: the source `tile<ptr<T>>` is converted to
-/// `memref<*xT>`; a rank-0 reinterpret_cast that keeps the descriptor offset
-/// recovers the scalar memref the atomic operates on.
+/// Convert a scalar cuda_tile.atomic_rmw_tko to a memref.atomic_rmw at the
+/// pointer; both return the old value.
 ///
-/// Both ops return the value read at the location before the update, so the
-/// result maps directly. The `memory_ordering_semantics` and `memory_scope`
-/// attributes have no representation on memref.atomic_rmw (which lowers to an
-/// acq_rel LLVM atomicrmw with no scope). Because acq_rel is at least as strong
-/// as any requested ordering, dropping the request is conservatively safe (it
-/// can only over-synchronize, never under-synchronize); the original values are
-/// preserved on the result as the discardable attributes
-/// `tir-dropped-memory-ordering` and `tir-dropped-memory-scope`. This is why,
-/// unlike the non-atomic load/store_tko lowerings (see checkCommonTkoGuards),
-/// atomic_rmw_tko accepts any ordering rather than rejecting non-`weak`.
-///
-/// Higher-rank atomics are not lowered in this pass.
+/// memref.atomic_rmw lowers to an acq_rel atomic at system scope, which is at
+/// least as strong as any ordering and scope. They are therefore recorded as
+/// dropped rather than rejected as for load/store_tko (see
+/// checkCommonTkoGuards).
 struct ConvertAtomicRMWTko
     : public TokenDroppingPattern<cuda_tile::AtomicRMWTkoOp> {
   using TokenDroppingPattern::TokenDroppingPattern;
@@ -2627,10 +2328,7 @@ struct ConvertAtomicRMWTko
       return rewriter.notifyMatchFailure(
           op, "only scalar (rank-0) atomic_rmw_tko is supported here");
     if (auto mask = op.getMask()) {
-      // Only a statically-true scalar mask can be dropped here; a dynamic or
-      // possibly-false mask would require a predicated atomic we cannot
-      // represent. A rank-0 mask constant is always splat, so reading the
-      // splat value is safe once we know it is a scalar constant.
+      // memref.atomic_rmw has no mask, so only a constant true one is accepted.
       auto maskCst = mask.getDefiningOp<cuda_tile::ConstantOp>();
       bool maskStaticallyTrue =
           mask.getType().getShape().empty() && maskCst &&
@@ -2665,11 +2363,6 @@ struct ConvertAtomicRMWTko
 };
 
 /// Convert cuda_tile.permute to vector.transpose.
-///
-/// Both ops reorder the dimensions of an N-D tensor/vector according to a
-/// permutation array.  The only mechanical difference is the attribute type:
-///   cuda_tile.permute uses DenseI32ArrayAttr,
-///   vector.transpose  uses DenseI64ArrayAttr.
 struct ConvertPermute : public OpConversionPattern<cuda_tile::PermuteOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -2684,10 +2377,9 @@ struct ConvertPermute : public OpConversionPattern<cuda_tile::PermuteOp> {
   }
 };
 
-/// Convert cuda_tile.ptr_to_ptr using memref.cast when representable.
-///
-/// Pointer model in this pass: tile<ptr<T>> -> memref<*xT>. The pattern fails
-/// if the conversion cannot be represented as a memref.cast.
+/// Convert cuda_tile.ptr_to_ptr between pointers that convert to the same type,
+/// e.g. tf32 and f32 pointers on the CPU. Other casts fail: they would change
+/// the element type of an unranked memref, which memref.cast cannot.
 struct ConvertPtrToPtrCastOrFail
     : public OpConversionPattern<cuda_tile::PtrToPtrOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -2722,11 +2414,8 @@ struct ConvertPtrToPtrCastOrFail
   }
 };
 
-/// Convert cuda_tile.reduce to vector.reduction (1D->scalar) or
-/// vector.multi_reduction (ND->(N-1)D).
-///
-/// Only supports single-operand reductions where the body contains exactly
-/// one recognized combining op.
+/// Convert cuda_tile.reduce to vector.multi_reduction, or to vector.reduction
+/// for a 1-D tile (see matchSingleOperandCombiningOp).
 struct ConvertReduce : public OpConversionPattern<cuda_tile::ReduceOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -2754,7 +2443,6 @@ struct ConvertReduce : public OpConversionPattern<cuda_tile::ReduceOp> {
             op, "reduce result vector type does not match source shape with "
                 "the reduced dimension removed");
 
-      // Multi-dim case: vector.multi_reduction
       Value acc = arith::ConstantOp::create(
           rewriter, loc, dstVecTy,
           SplatElementsAttr::get(dstVecTy, identityAttr));
@@ -2767,7 +2455,6 @@ struct ConvertReduce : public OpConversionPattern<cuda_tile::ReduceOp> {
             op, "scalar reduce results require a 1-D source and matching "
                 "element type");
 
-      // 1D -> scalar case: vector.reduction
       Value acc =
           arith::ConstantOp::create(rewriter, loc, resultTy, identityAttr);
       rewriter.replaceOpWithNewOp<vector::ReductionOp>(op, kind, source, acc);
@@ -2776,13 +2463,8 @@ struct ConvertReduce : public OpConversionPattern<cuda_tile::ReduceOp> {
   }
 };
 
-/// Convert cuda_tile.reshape to vector.shape_cast / vector.broadcast /
-/// vector.extract depending on source/result ranks.
-//
-///   - vector -> vector: vector.shape_cast
-///   - scalar -> vector: vector.broadcast (scalar to single-element vector)
-///   - vector -> scalar: vector.extract at [0,...,0]
-///   - scalar -> scalar: identity
+/// Convert cuda_tile.reshape to vector.shape_cast. A rank-0 source, which is a
+/// scalar, is broadcast instead, and a rank-0 result is extracted.
 ///
 /// A pointer tile keeps its base and reshapes its offsets, which are zero for
 /// a scalar pointer. A scalar pointer result is the base advanced by the
@@ -2859,26 +2541,17 @@ struct ConvertReturn : public OptionsPattern<cuda_tile::ReturnOp> {
 };
 
 /// Convert cuda_tile.rsqrt to math.rsqrt.
-///
-/// `flush_to_zero` is not representable in math FastMath flags and is
-/// preserved on the result as `tir-dropped-flush-to-zero` when set.
 using ConvertRsqrt =
     ConvertUnaryFlushToZeroOp<cuda_tile::RsqrtOp, math::RsqrtOp>;
 
-/// Convert cuda_tile.scan to vector.scan.
-///
-/// Only supports single-operand scans where the body contains exactly one
-/// recognized combining op. cuda_tile.scan semantics are inclusive (result[j]
-/// = f(result[j-1], X[j]) starting with the identity), so we lower with
-/// `inclusive = true`. The `reverse = true` case is not representable in
-/// vector.scan and is rejected.
+/// Convert cuda_tile.scan, which is inclusive, to an inclusive vector.scan (see
+/// matchSingleOperandCombiningOp).
 struct ConvertScan : public OpConversionPattern<cuda_tile::ScanOp> {
   using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::ScanOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // vector.scan has no reverse mode.
     if (op.getReverse())
       return rewriter.notifyMatchFailure(
           op, "reverse scan is not representable in vector.scan");
@@ -2900,8 +2573,7 @@ struct ConvertScan : public OpConversionPattern<cuda_tile::ScanOp> {
     Location loc = op.getLoc();
     int64_t dim = static_cast<int64_t>(op.getDim());
 
-    // Build the initial_value: an (n-1)-D vector splat with the identity
-    // (dim `dim` of the source removed).
+    // Each scan starts from the identity.
     SmallVector<int64_t> initShape = getReducedVectorShape(srcVecTy, dim);
     auto initTy = VectorType::get(initShape, srcVecTy.getElementType());
 
@@ -2925,20 +2597,9 @@ using ConvertSqrt =
                              cuda_tile::RoundingMode::NEAREST_EVEN,
                              /*PreserveFtz=*/true>;
 
-/// Convert cuda_tile.store_view_tko to vector.transfer_write.
-///
-/// The indices, permutation map and in-bounds flags come from
-/// buildTransferViewAccessPlan. vector.transfer_write skips out-of-bounds
-/// lanes, matching the view semantics ("Out-of-bounds tile elements are masked
-/// during stores").
-///
-/// Restrictions / guards:
-///   - Only `weak` memory_ordering_semantics is supported.
-///   - `memory_scope` is not supported.
-///
-/// `optimization_hints`, when present, is preserved on the produced
-/// vector.transfer_write as the discardable attribute
-/// `tir-dropped-optimization-hints`.
+/// Convert cuda_tile.store_view_tko to a vector.transfer_write (see
+/// buildTransferViewAccessPlan), which skips out-of-bounds lanes as the view
+/// semantics require.
 struct ConvertStoreViewTko
     : public OptionsPattern<cuda_tile::StoreViewTkoOp,
                             TokenDroppingPattern<cuda_tile::StoreViewTkoOp>> {
@@ -2983,13 +2644,7 @@ using ConvertTanH = ConvertUnaryApproxMathOp<cuda_tile::TanHOp, math::TanhOp,
                                              cuda_tile::RoundingMode::FULL,
                                              /*PreserveFtz=*/false>;
 
-/// Convert cuda_tile.trunci to arith.trunci while preserving overflow flags.
-///
-/// Overflow mapping:
-///   - none            -> no flags
-///   - no_signed_wrap  -> nsw
-///   - no_unsigned_wrap-> nuw
-///   - no_wrap         -> nsw,nuw
+/// Convert cuda_tile.trunci to arith.trunci with the same overflow flags.
 struct ConvertTruncI : public OpConversionPattern<cuda_tile::TruncIOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -3015,7 +2670,7 @@ using ConvertYield = ConvertToScfYield<cuda_tile::YieldOp>;
 // Type converter and conversion pattern population
 //===----------------------------------------------------------------------===//
 
-/// Populate type-conversion rules for cuda_tile -> gpu/vector lowering.
+/// Populate the type conversions of the value model (see the file header).
 static void populateTileIRToMLIRTypeConverter(TypeConverter &converter,
                                               MLIRContext *ctx,
                                               TileIRTarget target) {
@@ -3059,10 +2714,8 @@ static void populateTileIRToMLIRTypeConverter(TypeConverter &converter,
     return success();
   });
 
-  // tensor_view / partition_view -> ranked memref describing the same buffer.
-  // (partition_view inherits its memref layout from the underlying tensor_view;
-  // tile_shape / dim_map / padding_value are read off the source op's type at
-  // each use site.)
+  // Views convert to the memref of their tensor_view. Each access reads the
+  // tiling (tile shape, strides, dim_map, padding) from the view type.
   converter.addConversion([&converter](cuda_tile::TensorViewType tvTy) -> Type {
     return tensorViewToMemRefType(tvTy, converter);
   });
@@ -3070,9 +2723,6 @@ static void populateTileIRToMLIRTypeConverter(TypeConverter &converter,
       [&converter](cuda_tile::PartitionViewType pvTy) -> Type {
         return tensorViewToMemRefType(pvTy.getTensorView(), converter);
       });
-  // strided_view / gather_scatter_view likewise alias the underlying
-  // tensor_view buffer; tile_shape / traversal_strides / dim_map / sparse_dim /
-  // padding_value are read off the view type at each consumer use site.
   converter.addConversion(
       [&converter](cuda_tile::StridedViewType svTy) -> Type {
         return tensorViewToMemRefType(svTy.getTensorView(), converter);
@@ -3088,11 +2738,12 @@ static void populateTileIRToMLIRTypeConverter(TypeConverter &converter,
       [](cuda_tile::TokenType, SmallVectorImpl<Type> &) { return success(); });
 }
 
-/// Register all cuda_tile -> gpu/vector conversion patterns.
+/// Populate the patterns of all lowered cuda_tile ops.
 static void populateTileIRToMLIRConversionPatterns(
     TypeConverter &converter, RewritePatternSet &patterns,
     const ConvertTileIRToMLIRPassOptions &options) {
   MLIRContext *ctx = patterns.getContext();
+  // Patterns that depend on the pass options.
   patterns.add<ConvertAddF, ConvertSubF, ConvertMulF, ConvertDivF, ConvertEntry,
                ConvertExp, ConvertFma, ConvertFToF, ConvertFToI,
                ConvertGetNumTileBlocks, ConvertGetTileBlockId, ConvertIToF,
@@ -3153,7 +2804,7 @@ static void populateTileIRToMLIRConversionPatterns(
 // Pass Definition
 //===----------------------------------------------------------------------===//
 
-/// Pass driver for lowering Tile IR to GPU/vector/scf/arith/memref.
+/// Converts all cuda_tile ops, then applies the rewrites of PostConversion.h.
 struct ConvertTileIRToMLIRPass
     : public impl::ConvertTileIRToMLIRPassBase<ConvertTileIRToMLIRPass> {
   using Base::Base;
@@ -3204,8 +2855,7 @@ struct ConvertTileIRToMLIRPass
     tileir::populatePostConversionPatterns(postConversionPatterns);
     walkAndApplyPatterns(module, std::move(postConversionPatterns));
 
-    // Mark the module as a GPU container module when targeting the GPU. For the
-    // CPU target the GPU container-module marker is intentionally omitted.
+    // gpu.module ops need a container module.
     if (target == TileIRTarget::GPU)
       module->setAttr(gpu::GPUDialect::getContainerModuleAttrName(),
                       UnitAttr::get(ctx));

@@ -5,6 +5,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// The passes of the Tile IR to MLIR conversion and the enums of their options.
+//
 //===----------------------------------------------------------------------===//
 
 #ifndef MLIR_CONVERSION_TILEIRTOMLIR_PASSES_H

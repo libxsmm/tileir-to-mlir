@@ -5,6 +5,18 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// Rewrites of the IR that --convert-tileir-to-mlir produces. They run after the
+// dialect conversion so that they see the final vector, arith and scf ops:
+//   - rescaleTileLoops makes loops over tile indices step over element indices,
+//     so that transfers are indexed by the induction variable itself;
+//   - scopeLoopAllocations bounds stack allocations in loops to one iteration,
+//     as in cuda_tile.for;
+//   - local patterns fold selects into transfer_read masks, load contiguous
+//     gather rows with masked loads, and flatten n-D gathers and scatters for
+//     the LLVM lowering.
+// Facts beyond the local IR are proven with integer range analysis
+// (IntegerFacts).
+//
 //===----------------------------------------------------------------------===//
 
 #include "PostConversion.h"
@@ -288,10 +300,9 @@ static Value lookThroughElementCast(Value value) {
   return value;
 }
 
-/// True when `ty` varies *only* along the minor dimension, i.e. its trailing
-/// extent is `minorSize` and every other extent is 1. Comparing element counts
-/// alone would also accept transposed shapes such as `vector<Nx1>`, whose
-/// values vary across rows rather than across columns.
+/// Whether `ty` spans `minorSize` elements in the minor dimension and one in
+/// all others. Comparing element counts alone would also accept e.g.
+/// `vector<Nx1>`, whose elements lie along a column.
 static bool isMinorOnlyShape(VectorType ty, int64_t minorSize) {
   return ty && ty.getRank() > 0 && ty.getShape().back() == minorSize &&
          ty.getNumElements() == minorSize;
@@ -552,8 +563,8 @@ void mlir::tileir::rescaleTileLoops(Operation *root) {
     loop.getUpperBoundMutable().assign(scaled(loop.getUpperBound()));
     loop.getStepMutable().assign(scaled(loop.getStep()));
 
-    // The induction variable now iterates over element indices; the body
-    // divides it by the tile size to recover the tile index.
+    // After scaling, the induction variable is an element index; its other
+    // uses divide it by the tile size to recover the tile index.
     Value iv = loop.getInductionVar();
     builder.setInsertionPointToStart(loop.getBody());
     Value tileIv = arith::DivSIOp::create(builder, loc, iv, scale);
