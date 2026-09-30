@@ -74,6 +74,29 @@ cuda_tile.module @ops_module {
     return
   }
 
+  // An alloca lives until the end of its cuda_tile.for iteration, so the lowered
+  // loop body is wrapped in an allocation scope.
+  // CHECK-LABEL: gpu.func @test_alloca_in_loop
+  entry @test_alloca_in_loop() {
+    %lb = constant <i32: 0> : tile<i32>
+    %ub = constant <i32: 8> : tile<i32>
+    %st = constant <i32: 1> : tile<i32>
+    %init = constant <f32: 0.0> : tile<f32>
+    // CHECK: scf.for {{.*}} -> (f32) {
+    // CHECK-NEXT: %[[SCOPED:.*]] = memref.alloca_scope -> (f32) {
+    // CHECK: memref.alloca() alignment = 16 : memref<256xf32>
+    // CHECK: memref.alloca_scope.return %{{.*}} : f32
+    // CHECK-NEXT: }
+    // CHECK-NEXT: scf.yield %[[SCOPED]] : f32
+    %res = for %iv in (%lb to %ub, step %st) : tile<i32>
+        iter_values(%acc = %init) -> (tile<f32>) {
+      %p = alloca num_elem = 256, alignment = 16 : tile<ptr<f32>>
+      %next = addf %acc, %acc : tile<f32>
+      continue %next : tile<f32>
+    }
+    return
+  }
+
   // --- atan2 ---
   // CHECK-LABEL: gpu.func @test_atan2
   entry @test_atan2() {
