@@ -158,6 +158,22 @@ cuda_tile.module @m {
     }
   }
 
+  // --- unsigned for ---
+  // CHECK-LABEL: gpu.func @test_for_unsigned
+  entry @test_for_unsigned() {
+    %lb = constant <i32: 0> : tile<i32>
+    %ub = constant <i32: 0x80000000> : tile<i32>
+    %st = constant <i32: 1> : tile<i32>
+    // CHECK: %[[ULB:.*]] = arith.index_castui %{{.*}} : i32 to index
+    // CHECK: %[[UUB:.*]] = arith.index_castui %{{.*}} : i32 to index
+    // CHECK: %[[UST:.*]] = arith.index_castui %{{.*}} : i32 to index
+    // CHECK: scf.for unsigned %{{.*}} = %[[ULB]] to %[[UUB]] step %[[UST]] {
+    // CHECK-NOT: tir-dropped-unsigned-cmp
+    for unsigned %iv in (%lb to %ub, step %st) : tile<i32> {
+      continue
+    }
+  }
+
   // --- assume passthrough in chain ---
   // CHECK-LABEL: gpu.func @test_assume_passthrough
   entry @test_assume_passthrough() {

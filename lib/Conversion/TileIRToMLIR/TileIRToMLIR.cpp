@@ -1679,9 +1679,8 @@ struct ConvertFma : public OpConversionPattern<cuda_tile::FmaOp> {
 ///   - Convert the region types and merge the original body into the new one,
 ///     replacing the induction-variable and iter-arg block arguments.
 ///
-/// `unsignedCmp` (use unsigned comparison for loop termination) has no
-/// equivalent on scf.for and is otherwise dropped; it is preserved on the
-/// produced scf.for as the discardable attribute `tir-dropped-unsigned-cmp`.
+/// `unsignedCmp` maps to scf.for's `unsignedCmp`; the bounds are then
+/// zero-extended to `index`.
 struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -1689,15 +1688,15 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
   matchAndRewrite(cuda_tile::ForOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    Value lb = castValueToType(rewriter, loc, adaptor.getLowerBound(),
-                               rewriter.getIndexType());
-    Value ub = castValueToType(rewriter, loc, adaptor.getUpperBound(),
-                               rewriter.getIndexType());
-    Value step = castValueToType(rewriter, loc, adaptor.getStep(),
-                                 rewriter.getIndexType());
-    if (!lb || !ub || !step)
-      return rewriter.notifyMatchFailure(
-          op, "for bounds could not be converted to index");
+    Type indexTy = rewriter.getIndexType();
+    auto toIndex = [&](Value bound) -> Value {
+      if (op.getUnsignedCmp())
+        return arith::IndexCastUIOp::create(rewriter, loc, indexTy, bound);
+      return arith::IndexCastOp::create(rewriter, loc, indexTy, bound);
+    };
+    Value lb = toIndex(adaptor.getLowerBound());
+    Value ub = toIndex(adaptor.getUpperBound());
+    Value step = toIndex(adaptor.getStep());
 
     // Infer the loop-axis tile size from the partition_view tile shapes at the
     // load_view_tko/store_view_tko indices that are semantically the induction
@@ -1805,10 +1804,9 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
       step = arith::MulIOp::create(rewriter, loc, step, tileSizeVal);
     }
 
-    auto newForOp = scf::ForOp::create(rewriter, loc, lb, ub, step,
-                                       adaptor.getInitValues());
-    if (op.getUnsignedCmp())
-      newForOp->setAttr("tir-dropped-unsigned-cmp", rewriter.getUnitAttr());
+    auto newForOp =
+        scf::ForOp::create(rewriter, loc, lb, ub, step, adaptor.getInitValues(),
+                           /*bodyBuilder=*/nullptr, op.getUnsignedCmp());
 
     // Convert region types
     if (failed(
