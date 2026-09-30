@@ -391,41 +391,57 @@ buildMmaContractionSpec(MLIRContext *ctx, int64_t resultRank) {
   return spec;
 }
 
-/// Convert unary source-based ops by forwarding the converted source operand.
+/// Convert `SrcOp` to `DstOp` with the converted result type and operands.
 template <typename SrcOp, typename DstOp>
-struct ConvertUnarySourceOp : public OpConversionPattern<SrcOp> {
+struct DirectConversion : public OpConversionPattern<SrcOp> {
   using OpConversionPattern<SrcOp>::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(SrcOp op,
                   typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    rewriter.template replaceOpWithNewOp<DstOp>(op, adaptor.getSource());
+    Type resultTy =
+        this->getTypeConverter()->convertType(op->getResult(0).getType());
+    if (!resultTy)
+      return rewriter.notifyMatchFailure(op, "cannot convert result type");
+    rewriter.template replaceOpWithNewOp<DstOp>(op, TypeRange{resultTy},
+                                                adaptor.getOperands());
     return success();
   }
 };
 
-/// Convert a rank-1 whole-tile bit reinterpretation (pack / unpack) to
-/// vector.bitcast.
+/// Replace `SrcOp` by its converted first operand, which the op only annotates
+/// or views differently.
 template <typename SrcOp>
-struct ConvertVectorBitcastOp : public OpConversionPattern<SrcOp> {
+struct ForwardOperand : public OpConversionPattern<SrcOp> {
   using OpConversionPattern<SrcOp>::OpConversionPattern;
 
   LogicalResult
   matchAndRewrite(SrcOp op,
                   typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto resultTy =
-        getConvertedResultTypeOrFail(op, this->getTypeConverter(), rewriter,
-                                     "cannot convert pack/unpack result type");
-    if (failed(resultTy))
-      return failure();
-    auto vecTy = dyn_cast<VectorType>(resultTy.value());
-    if (!vecTy)
-      return rewriter.notifyMatchFailure(
-          op, "pack/unpack result did not convert to a vector type");
-    rewriter.template replaceOpWithNewOp<vector::BitCastOp>(
-        op, vecTy, adaptor.getSource());
+    rewriter.replaceOp(op, adaptor.getOperands().front());
+    return success();
+  }
+};
+
+/// Convert `SrcOp` to `SignedOp` or `UnsignedOp` according to its signedness,
+/// with the converted result type and operands.
+template <typename SrcOp, typename SignedOp, typename UnsignedOp>
+struct SignednessConversion : public OpConversionPattern<SrcOp> {
+  using OpConversionPattern<SrcOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(SrcOp op,
+                  typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type resultTy =
+        this->getTypeConverter()->convertType(op->getResult(0).getType());
+    if (!resultTy)
+      return rewriter.notifyMatchFailure(op, "cannot convert result type");
+    replaceBySignedness<SignedOp, UnsignedOp>(rewriter, op, op.getSignedness(),
+                                              TypeRange{resultTy},
+                                              adaptor.getOperands());
     return success();
   }
 };
@@ -544,21 +560,6 @@ struct ConvertBinaryLhsRhsWithOverflowOp : public OpConversionPattern<SrcOp> {
         rewriter.getContext(), mapIntegerOverflowFlags(op.getOverflow()));
     rewriter.template replaceOpWithNewOp<DstOp>(op, adaptor.getLhs(),
                                                 adaptor.getRhs(), overflowAttr);
-    return success();
-  }
-};
-
-/// Convert binary lhs/rhs source-based ops by forwarding both operands.
-template <typename SrcOp, typename DstOp>
-struct ConvertBinaryLhsRhsOp : public OpConversionPattern<SrcOp> {
-  using OpConversionPattern<SrcOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(SrcOp op,
-                  typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    rewriter.template replaceOpWithNewOp<DstOp>(op, adaptor.getLhs(),
-                                                adaptor.getRhs());
     return success();
   }
 };
@@ -917,22 +918,6 @@ matchSingleOperandCombiningOp(OpT op, ValueRange convertedOperands,
   return std::make_tuple(*kind, source, srcVecTy, identityAttr);
 }
 
-/// Convert integer binary ops that dispatch on signedness (remi, shri, maxi,
-/// mini).
-template <typename SrcOp, typename SignedDstOp, typename UnsignedDstOp>
-struct ConvertBinaryLhsRhsWithSignednessOp : public OpConversionPattern<SrcOp> {
-  using OpConversionPattern<SrcOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(SrcOp op,
-                  typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    replaceBySignedness<SignedDstOp, UnsignedDstOp>(
-        rewriter, op, op.getSignedness(), adaptor.getLhs(), adaptor.getRhs());
-    return success();
-  }
-};
-
 /// Validate shared load/store_tko constraints before lowering.
 ///
 /// load/store_tko lower to *non-atomic* memref.load/memref.store, which provide
@@ -1048,16 +1033,10 @@ buildTransferViewAccessPlan(ConversionPatternRewriter &rewriter, Operation *op,
 //===----------------------------------------------------------------------===//
 // Conversion Patterns
 //===----------------------------------------------------------------------===//
-using ConvertAbsF = ConvertUnarySourceOp<cuda_tile::AbsFOp, math::AbsFOp>;
-
-using ConvertAbsI = ConvertUnarySourceOp<cuda_tile::AbsIOp, math::AbsIOp>;
-
 using ConvertAddF = ConvertBinaryFloatOp<cuda_tile::AddFOp, arith::AddFOp>;
 
 using ConvertAddI =
     ConvertBinaryLhsRhsWithOverflowOp<cuda_tile::AddIOp, arith::AddIOp>;
-
-using ConvertAndI = ConvertBinaryLhsRhsOp<cuda_tile::AndIOp, arith::AndIOp>;
 
 /// Convert cuda_tile.alloca to memref.alloca (+ memref.cast).
 ///
@@ -1104,48 +1083,6 @@ struct ConvertAlloca : public OpConversionPattern<cuda_tile::AllocaOp> {
         memref::AllocaOp::create(rewriter, op.getLoc(), rankedTy,
                                  rewriter.getI64IntegerAttr(op.getAlignment()));
     rewriter.replaceOpWithNewOp<memref::CastOp>(op, unrankedTy, alloca);
-    return success();
-  }
-};
-
-/// Convert cuda_tile.assume to a pass-through (just forward the source value).
-struct ConvertAssume : public OpConversionPattern<cuda_tile::AssumeOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(cuda_tile::AssumeOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOp(op, adaptor.getValue());
-    return success();
-  }
-};
-
-/// Convert cuda_tile.atan2 to math.atan2.
-struct ConvertAtan2 : public OpConversionPattern<cuda_tile::Atan2Op> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(cuda_tile::Atan2Op op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<math::Atan2Op>(op, adaptor.getX(),
-                                               adaptor.getY());
-    return success();
-  }
-};
-
-/// Convert cuda_tile.bitcast to arith.bitcast.
-struct ConvertBitcast : public OpConversionPattern<cuda_tile::BitcastOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(cuda_tile::BitcastOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto resultTy = getConvertedResultTypeOrFail(
-        op, getTypeConverter(), rewriter, "cannot convert bitcast result type");
-    if (failed(resultTy))
-      return failure();
-    rewriter.replaceOpWithNewOp<arith::BitcastOp>(op, resultTy.value(),
-                                                  adaptor.getSource());
     return success();
   }
 };
@@ -1247,8 +1184,6 @@ struct ConvertCat : public OpConversionPattern<cuda_tile::CatOp> {
     return success();
   }
 };
-
-using ConvertCeil = ConvertUnarySourceOp<cuda_tile::CeilOp, math::CeilOp>;
 
 /// Map a cuda_tile comparison predicate to the arith.cmpf predicate with the
 /// matching ordering (`cuda_tile::ComparisonOrdering` is either ordered or
@@ -1355,10 +1290,6 @@ struct ConvertConstant : public OpConversionPattern<cuda_tile::ConstantOp> {
 };
 
 using ConvertContinue = ConvertToScfYield<cuda_tile::ContinueOp>;
-
-using ConvertCos = ConvertUnarySourceOp<cuda_tile::CosOp, math::CosOp>;
-
-using ConvertCosH = ConvertUnarySourceOp<cuda_tile::CosHOp, math::CoshOp>;
 
 /// Convert cuda_tile.divf to arith.divf.
 ///
@@ -1503,36 +1434,11 @@ struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
   SmallVector<int32_t, 3> knownBlockSize;
 };
 
-using ConvertExp = ConvertUnarySourceOp<cuda_tile::ExpOp, math::ExpOp>;
-
 /// Convert cuda_tile.exp2 to math.exp2.
 ///
 /// `flush_to_zero` is not representable in math FastMath flags and is preserved
 /// on the result as `tir-dropped-flush-to-zero` when set.
 using ConvertExp2 = ConvertUnaryFlushToZeroOp<cuda_tile::Exp2Op, math::Exp2Op>;
-
-/// Convert cuda_tile.exti to arith.extsi / arith.extui.
-///
-///   1. Convert the destination tile type (`to`) via the type converter.
-///   2. Dispatch to arith.extui for `signedness = unsigned`, otherwise to
-///      arith.extsi.
-struct ConvertExtI : public OpConversionPattern<cuda_tile::ExtIOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(cuda_tile::ExtIOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto resultTy =
-        getConvertedResultTypeOrFail(op, this->getTypeConverter(), rewriter,
-                                     "cannot convert cast result type");
-    if (failed(resultTy))
-      return failure();
-
-    replaceBySignedness<arith::ExtSIOp, arith::ExtUIOp>(
-        rewriter, op, op.getSignedness(), resultTy.value(), adaptor.getFrom());
-    return success();
-  }
-};
 
 /// Convert cuda_tile.extract to vector.shape_cast + vector.transpose +
 /// vector.extract.
@@ -1629,8 +1535,6 @@ struct ConvertExtract : public OpConversionPattern<cuda_tile::ExtractOp> {
     return success();
   }
 };
-
-using ConvertFloor = ConvertUnarySourceOp<cuda_tile::FloorOp, math::FloorOp>;
 
 /// Convert cuda_tile.fma to math.fma.
 ///
@@ -2177,64 +2081,6 @@ struct ConvertLoadViewTko
   bool assumeInBounds;
 };
 
-using ConvertLog = ConvertUnarySourceOp<cuda_tile::LogOp, math::LogOp>;
-
-using ConvertLog2 = ConvertUnarySourceOp<cuda_tile::Log2Op, math::Log2Op>;
-
-/// Convert cuda_tile.make_partition_view
-///
-/// The partition_view type maps to the same ranked memref as its underlying
-/// tensor_view, so this pattern just forwards the already-converted memref.
-struct ConvertMakePartitionView
-    : public OpConversionPattern<cuda_tile::MakePartitionViewOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(cuda_tile::MakePartitionViewOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOp(op, adaptor.getTensorView());
-    return success();
-  }
-};
-
-/// Convert cuda_tile.make_strided_view
-///
-/// Like partition_view, a strided_view is backed by the same ranked memref as
-/// its underlying tensor_view; tile_shape / traversal_strides / dim_map /
-/// padding_value are read off the result type at each consumer use site. So
-/// this pattern just forwards the already-converted tensor_view memref.
-struct ConvertMakeStridedView
-    : public OpConversionPattern<cuda_tile::MakeStridedViewOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(cuda_tile::MakeStridedViewOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOp(op, adaptor.getTensorView());
-    return success();
-  }
-};
-
-/// Convert cuda_tile.make_gather_scatter_view
-///
-/// A gather_scatter_view is backed by the same ranked memref as its underlying
-/// tensor_view, so the view value itself forwards the converted memref. Note
-/// that consuming a gather_scatter_view through load_view_tko / store_view_tko
-/// requires gather/scatter semantics along the sparse dimension, which the
-/// transfer-based consumer lowering does not yet implement; those consumers
-/// will report a match failure for this view kind.
-struct ConvertMakeGatherScatterView
-    : public OpConversionPattern<cuda_tile::MakeGatherScatterViewOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(cuda_tile::MakeGatherScatterViewOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOp(op, adaptor.getTensorView());
-    return success();
-  }
-};
-
 /// Recover the runtime offset (the descriptor's offset field) carried by an
 /// unranked converted pointer value (`memref<*xT>`).
 ///
@@ -2379,14 +2225,8 @@ struct ConvertMakeTensorView
 using ConvertMaxF =
     ConvertMinMaxFOp<cuda_tile::MaxFOp, arith::MaximumFOp, arith::MaxNumFOp>;
 
-using ConvertMaxI = ConvertBinaryLhsRhsWithSignednessOp<
-    cuda_tile::MaxIOp, arith::MaxSIOp, arith::MaxUIOp>;
-
 using ConvertMinF =
     ConvertMinMaxFOp<cuda_tile::MinFOp, arith::MinimumFOp, arith::MinNumFOp>;
-
-using ConvertMinI = ConvertBinaryLhsRhsWithSignednessOp<
-    cuda_tile::MinIOp, arith::MinSIOp, arith::MinUIOp>;
 
 /// Convert cuda_tile.mmaf to vector.contract (matmul-style contraction).
 ///
@@ -2610,8 +2450,6 @@ struct ConvertOffsetScalarPtr
     return success();
   }
 };
-
-using ConvertNegF = ConvertUnarySourceOp<cuda_tile::NegFOp, arith::NegFOp>;
 
 /// Convert cuda_tile.negi to arith.subi(0, source).
 struct ConvertNegI : public OpConversionPattern<cuda_tile::NegIOp> {
@@ -3013,12 +2851,6 @@ struct ConvertAtomicRMWTko
   }
 };
 
-using ConvertOrI = ConvertBinaryLhsRhsOp<cuda_tile::OrIOp, arith::OrIOp>;
-
-/// Convert cuda_tile.pack to vector.bitcast (rank-1 whole-tile bit
-/// reinterpret).
-using ConvertPack = ConvertVectorBitcastOp<cuda_tile::PackOp>;
-
 /// Convert cuda_tile.permute to vector.transpose.
 ///
 /// Both ops reorder the dimensions of an N-D tensor/vector according to a
@@ -3035,19 +2867,6 @@ struct ConvertPermute : public OpConversionPattern<cuda_tile::PermuteOp> {
                               op.getPermutation().end());
     rewriter.replaceOpWithNewOp<vector::TransposeOp>(op, adaptor.getSource(),
                                                      perm);
-    return success();
-  }
-};
-
-/// Convert cuda_tile.pow to math.powf.
-struct ConvertPow : public OpConversionPattern<cuda_tile::PowOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(cuda_tile::PowOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<math::PowFOp>(op, adaptor.getSource(),
-                                              adaptor.getExponent());
     return success();
   }
 };
@@ -3143,12 +2962,6 @@ struct ConvertReduce : public OpConversionPattern<cuda_tile::ReduceOp> {
     return success();
   }
 };
-
-using ConvertRemF = ConvertBinaryLhsRhsOp<cuda_tile::RemFOp, arith::RemFOp>;
-
-using ConvertRemI =
-    ConvertBinaryLhsRhsWithSignednessOp<cuda_tile::RemIOp, arith::RemSIOp,
-                                        arith::RemUIOp>;
 
 /// Convert cuda_tile.reshape to vector.shape_cast / vector.broadcast /
 /// vector.extract depending on source/result ranks.
@@ -3266,35 +3079,8 @@ struct ConvertScan : public OpConversionPattern<cuda_tile::ScanOp> {
   }
 };
 
-/// Convert cuda_tile.select to arith.select.
-///
-/// cuda_tile.select is element-wise: result[i] = cond[i] ? val_if_true[i]
-/// : val_if_false[i]. All three operands have the same shape and the
-/// condition is i1 (scalar or vector of i1). arith.select natively supports
-/// both scalar i1 and vector<...xi1> conditions with matching shapes, so the
-/// lowering is a direct one-to-one mapping.
-struct ConvertSelect : public OpConversionPattern<cuda_tile::SelectOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(cuda_tile::SelectOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<arith::SelectOp>(
-        op, adaptor.getCond(), adaptor.getValIfTrue(), adaptor.getValIfFalse());
-    return success();
-  }
-};
-
 using ConvertShLI =
     ConvertBinaryLhsRhsWithOverflowOp<cuda_tile::ShLIOp, arith::ShLIOp>;
-
-using ConvertShRI =
-    ConvertBinaryLhsRhsWithSignednessOp<cuda_tile::ShRIOp, arith::ShRSIOp,
-                                        arith::ShRUIOp>;
-
-using ConvertSin = ConvertUnarySourceOp<cuda_tile::SinOp, math::SinOp>;
-
-using ConvertSinH = ConvertUnarySourceOp<cuda_tile::SinHOp, math::SinhOp>;
 
 /// Convert cuda_tile.sqrt to math.sqrt.
 ///
@@ -3361,8 +3147,6 @@ using ConvertSubF = ConvertBinaryFloatOp<cuda_tile::SubFOp, arith::SubFOp>;
 using ConvertSubI =
     ConvertBinaryLhsRhsWithOverflowOp<cuda_tile::SubIOp, arith::SubIOp>;
 
-using ConvertTan = ConvertUnarySourceOp<cuda_tile::TanOp, math::TanOp>;
-
 /// Convert cuda_tile.tanh to math.tanh.
 ///
 /// rounding<approx> maps to the `afn` (allow approximate functions) FastMath
@@ -3396,12 +3180,6 @@ struct ConvertTruncI : public OpConversionPattern<cuda_tile::TruncIOp> {
     return success();
   }
 };
-
-/// Convert cuda_tile.unpack to vector.bitcast (rank-1 whole-tile bit
-/// reinterpret).
-using ConvertUnpack = ConvertVectorBitcastOp<cuda_tile::UnpackOp>;
-
-using ConvertXOrI = ConvertBinaryLhsRhsOp<cuda_tile::XOrIOp, arith::XOrIOp>;
 
 using ConvertYield = ConvertToScfYield<cuda_tile::YieldOp>;
 
@@ -3501,28 +3279,57 @@ static void populateTileIRToMLIRConversionPatterns(
       converter, ctx, dropRoundingModes);
   patterns.add<ConvertLoadViewTko, ConvertStoreViewTko>(converter, ctx,
                                                         assumeInBounds);
+  // Ops that map to one target op with the same operands, or to one of their
+  // operands.
+  patterns.add<
+      DirectConversion<cuda_tile::AbsFOp, math::AbsFOp>,
+      DirectConversion<cuda_tile::AbsIOp, math::AbsIOp>,
+      DirectConversion<cuda_tile::AndIOp, arith::AndIOp>,
+      DirectConversion<cuda_tile::Atan2Op, math::Atan2Op>,
+      DirectConversion<cuda_tile::BitcastOp, arith::BitcastOp>,
+      DirectConversion<cuda_tile::CeilOp, math::CeilOp>,
+      DirectConversion<cuda_tile::CosOp, math::CosOp>,
+      DirectConversion<cuda_tile::CosHOp, math::CoshOp>,
+      DirectConversion<cuda_tile::ExpOp, math::ExpOp>,
+      DirectConversion<cuda_tile::FloorOp, math::FloorOp>,
+      DirectConversion<cuda_tile::LogOp, math::LogOp>,
+      DirectConversion<cuda_tile::Log2Op, math::Log2Op>,
+      DirectConversion<cuda_tile::NegFOp, arith::NegFOp>,
+      DirectConversion<cuda_tile::OrIOp, arith::OrIOp>,
+      DirectConversion<cuda_tile::PackOp, vector::BitCastOp>,
+      DirectConversion<cuda_tile::PowOp, math::PowFOp>,
+      DirectConversion<cuda_tile::RemFOp, arith::RemFOp>,
+      DirectConversion<cuda_tile::SelectOp, arith::SelectOp>,
+      DirectConversion<cuda_tile::SinOp, math::SinOp>,
+      DirectConversion<cuda_tile::SinHOp, math::SinhOp>,
+      DirectConversion<cuda_tile::TanOp, math::TanOp>,
+      DirectConversion<cuda_tile::UnpackOp, vector::BitCastOp>,
+      DirectConversion<cuda_tile::XOrIOp, arith::XOrIOp>,
+      ForwardOperand<cuda_tile::AssumeOp>,
+      ForwardOperand<cuda_tile::MakeGatherScatterViewOp>,
+      ForwardOperand<cuda_tile::MakePartitionViewOp>,
+      ForwardOperand<cuda_tile::MakeStridedViewOp>,
+      SignednessConversion<cuda_tile::ExtIOp, arith::ExtSIOp, arith::ExtUIOp>,
+      SignednessConversion<cuda_tile::MaxIOp, arith::MaxSIOp, arith::MaxUIOp>,
+      SignednessConversion<cuda_tile::MinIOp, arith::MinSIOp, arith::MinUIOp>,
+      SignednessConversion<cuda_tile::RemIOp, arith::RemSIOp, arith::RemUIOp>,
+      SignednessConversion<cuda_tile::ShRIOp, arith::ShRSIOp, arith::ShRUIOp>>(
+      converter, ctx);
   patterns
-      .add<ConvertAbsF, ConvertAbsI, ConvertAddI, ConvertAlloca, ConvertAndI,
-           ConvertAssume, ConvertAtan2, ConvertBitcast, ConvertBroadcast,
-           ConvertCat, ConvertCeil, ConvertCmpF, ConvertCmpI, ConvertConstant,
-           ConvertContinue, ConvertCos, ConvertCosH, ConvertAtomicRMWTko,
-           ConvertDivI, ConvertExp, ConvertExp2, ConvertExtI, ConvertExtract,
-           ConvertFloor, ConvertFma, ConvertFor, ConvertGetGlobal,
-           ConvertGetIndexSpaceShape, ConvertGetTensorShape, ConvertGlobal,
-           ConvertIf, ConvertIota, EraseTokenOp<cuda_tile::JoinTokensOp>,
-           ConvertLoadPtrTkoRanked, ConvertLoadPtrTkoScalar, ConvertLog,
-           ConvertLog2, ConvertMakeGatherScatterView, ConvertMakePartitionView,
-           ConvertMakeStridedView, ConvertMakeTensorView,
-           EraseTokenOp<cuda_tile::MakeTokenOp>, ConvertMaxF, ConvertMaxI,
-           ConvertMinF, ConvertMinI, ConvertMmaF, ConvertMmaI, ConvertMulhiI,
-           ConvertMulI, ConvertOffsetRanked, ConvertOffsetScalarPtr,
-           ConvertNegF, ConvertNegI, ConvertOrI, ConvertPack, ConvertPermute,
-           ConvertPow, ConvertPtrToPtrCastOrFail, ConvertReduce, ConvertRemF,
-           ConvertRemI, ConvertReshape, ConvertRsqrt, ConvertScan,
-           ConvertSelect, ConvertShLI, ConvertShRI, ConvertSin, ConvertSinH,
+      .add<ConvertAddI, ConvertAlloca, ConvertBroadcast, ConvertCat,
+           ConvertCmpF, ConvertCmpI, ConvertConstant, ConvertContinue,
+           ConvertAtomicRMWTko, ConvertDivI, ConvertExp2, ConvertExtract,
+           ConvertFma, ConvertFor, ConvertGetGlobal, ConvertGetIndexSpaceShape,
+           ConvertGetTensorShape, ConvertGlobal, ConvertIf, ConvertIota,
+           EraseTokenOp<cuda_tile::JoinTokensOp>, ConvertLoadPtrTkoRanked,
+           ConvertLoadPtrTkoScalar, ConvertMakeTensorView,
+           EraseTokenOp<cuda_tile::MakeTokenOp>, ConvertMaxF, ConvertMinF,
+           ConvertMmaF, ConvertMmaI, ConvertMulhiI, ConvertMulI,
+           ConvertOffsetRanked, ConvertOffsetScalarPtr, ConvertNegI,
+           ConvertPermute, ConvertPtrToPtrCastOrFail, ConvertReduce,
+           ConvertReshape, ConvertRsqrt, ConvertScan, ConvertShLI,
            ConvertStorePtrTkoRanked, ConvertStorePtrTkoScalar, ConvertSubI,
-           ConvertTan, ConvertTruncI, ConvertUnpack, ConvertXOrI, ConvertYield>(
-          converter, ctx);
+           ConvertTruncI, ConvertYield>(converter, ctx);
 }
 
 //===----------------------------------------------------------------------===//
