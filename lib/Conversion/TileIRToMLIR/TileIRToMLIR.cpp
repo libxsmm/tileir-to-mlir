@@ -446,6 +446,16 @@ struct SignednessConversion : public OpConversionPattern<SrcOp> {
   }
 };
 
+/// Base of the patterns that depend on the pass options.
+template <typename SrcOp, typename Base = OpConversionPattern<SrcOp>>
+struct OptionsPattern : public Base {
+  OptionsPattern(const TypeConverter &converter, MLIRContext *ctx,
+                 const ConvertTileIRToMLIRPassOptions &options)
+      : Base(converter, ctx), options(options) {}
+
+  ConvertTileIRToMLIRPassOptions options;
+};
+
 /// Convert a unary source-based op to a math op that takes no FastMath flags,
 /// preserving `flush_to_zero` as `tir-dropped-flush-to-zero` when set.
 template <typename SrcOp, typename DstOp>
@@ -468,21 +478,18 @@ struct ConvertUnaryFlushToZeroOp : public OpConversionPattern<SrcOp> {
 /// mode is always preserved as `tir-dropped-rounding`; when `PreserveFtz` is
 /// set, `flush_to_zero` is preserved as `tir-dropped-flush-to-zero`.
 template <typename SrcOp, typename DstOp, bool PreserveFtz>
-struct ConvertUnaryApproxMathOp : public OpConversionPattern<SrcOp> {
-  ConvertUnaryApproxMathOp(const TypeConverter &tc, MLIRContext *ctx,
-                           bool dropRoundingModes)
-      : OpConversionPattern<SrcOp>(tc, ctx),
-        dropRoundingModes(dropRoundingModes) {}
+struct ConvertUnaryApproxMathOp : public OptionsPattern<SrcOp> {
+  using OptionsPattern<SrcOp>::OptionsPattern;
 
   LogicalResult
   matchAndRewrite(SrcOp op,
                   typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto rounding = op.getRoundingMode();
-    auto fmf =
-        (!dropRoundingModes && rounding == cuda_tile::RoundingMode::APPROX)
-            ? arith::FastMathFlags::afn
-            : arith::FastMathFlags::none;
+    auto fmf = (!this->options.dropRoundingModes &&
+                rounding == cuda_tile::RoundingMode::APPROX)
+                   ? arith::FastMathFlags::afn
+                   : arith::FastMathFlags::none;
     auto newOp = rewriter.template replaceOpWithNewOp<DstOp>(
         op, adaptor.getSource(),
         arith::FastMathFlagsAttr::get(rewriter.getContext(), fmf));
@@ -491,8 +498,6 @@ struct ConvertUnaryApproxMathOp : public OpConversionPattern<SrcOp> {
       preserveDroppedFlushToZero(rewriter, op.getFlushToZero(), newOp);
     return success();
   }
-
-  bool dropRoundingModes;
 };
 
 /// Convert float binary ops to arith float ops.
@@ -505,11 +510,8 @@ struct ConvertUnaryApproxMathOp : public OpConversionPattern<SrcOp> {
 /// equivalent and is preserved as `tir-dropped-flush-to-zero`.
 template <typename SrcOp, typename DstOp,
           arith::FastMathFlags ApproxFlag = arith::FastMathFlags::none>
-struct ConvertBinaryFloatOp : public OpConversionPattern<SrcOp> {
-  ConvertBinaryFloatOp(const TypeConverter &tc, MLIRContext *ctx,
-                       bool dropRoundingModes)
-      : OpConversionPattern<SrcOp>(tc, ctx),
-        dropRoundingModes(dropRoundingModes) {}
+struct ConvertBinaryFloatOp : public OptionsPattern<SrcOp> {
+  using OptionsPattern<SrcOp>::OptionsPattern;
 
   LogicalResult
   matchAndRewrite(SrcOp op,
@@ -520,7 +522,7 @@ struct ConvertBinaryFloatOp : public OpConversionPattern<SrcOp> {
     arith::FastMathFlags fmf = arith::FastMathFlags::none;
     arith::RoundingModeAttr roundingAttr;
     bool roundingRepresented = false;
-    if (!dropRoundingModes) {
+    if (!this->options.dropRoundingModes) {
       if (rounding == cuda_tile::RoundingMode::NEAREST_EVEN) {
         roundingRepresented = true;
       } else if (ApproxFlag != arith::FastMathFlags::none &&
@@ -543,8 +545,6 @@ struct ConvertBinaryFloatOp : public OpConversionPattern<SrcOp> {
     preserveDroppedFlushToZero(rewriter, ftz, newOp);
     return success();
   }
-
-  bool dropRoundingModes;
 };
 
 /// Convert integer binary ops that carry overflow flags (addi, subi, shli).
@@ -575,19 +575,15 @@ struct ConvertBinaryLhsRhsWithOverflowOp : public OpConversionPattern<SrcOp> {
 template <typename SrcOp, typename SignedDstOp, typename UnsignedDstOp,
           cuda_tile::RoundingMode ExpectedRounding>
 struct ConvertFromToSignednessCastWithRoundingOp
-    : public OpConversionPattern<SrcOp> {
-  ConvertFromToSignednessCastWithRoundingOp(const TypeConverter &tc,
-                                            MLIRContext *ctx,
-                                            bool dropRoundingModes)
-      : OpConversionPattern<SrcOp>(tc, ctx),
-        dropRoundingModes(dropRoundingModes) {}
+    : public OptionsPattern<SrcOp> {
+  using OptionsPattern<SrcOp>::OptionsPattern;
 
   LogicalResult
   matchAndRewrite(SrcOp op,
                   typename OpConversionPattern<SrcOp>::OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    bool roundingRepresented =
-        !dropRoundingModes && op.getRoundingMode() == ExpectedRounding;
+    bool roundingRepresented = !this->options.dropRoundingModes &&
+                               op.getRoundingMode() == ExpectedRounding;
 
     auto resultTy =
         getConvertedResultTypeOrFail(op, this->getTypeConverter(), rewriter,
@@ -601,8 +597,6 @@ struct ConvertFromToSignednessCastWithRoundingOp
                                          roundingRepresented, newOp);
     return success();
   }
-
-  bool dropRoundingModes;
 };
 
 /// Flatten the 1:N adaptor operands of a pattern into a single value list.
@@ -726,11 +720,8 @@ struct AppendedGridArgLayout {
 ///
 /// Each result is cast to the converted result type as needed.
 template <typename SrcOp, typename GpuDimOp, unsigned ArgBase>
-struct ConvertDimQueryOp : public OpConversionPattern<SrcOp> {
-  ConvertDimQueryOp(const TypeConverter &tc, MLIRContext *ctx,
-                    TileIRTarget target, bool appendGridArgs)
-      : OpConversionPattern<SrcOp>(tc, ctx), target(target),
-        appendGridArgs(appendGridArgs) {}
+struct ConvertDimQueryOp : public OptionsPattern<SrcOp> {
+  using OptionsPattern<SrcOp>::OptionsPattern;
 
   LogicalResult
   matchAndRewrite(SrcOp op, typename OpConversionPattern<SrcOp>::OpAdaptor,
@@ -744,14 +735,14 @@ struct ConvertDimQueryOp : public OpConversionPattern<SrcOp> {
     // When requested, source launch coordinates from trailing function
     // arguments (of any function-like parent, e.g. func.func or gpu.func).
     FunctionOpInterface parentFunc;
-    if (appendGridArgs) {
+    if (this->options.appendGridArgs) {
       parentFunc = op->template getParentOfType<FunctionOpInterface>();
       if (!parentFunc ||
           parentFunc.getNumArguments() < AppendedGridArgLayout::kNumArgs)
         return rewriter.notifyMatchFailure(
             op, "expected enclosing function with appended launch-coordinate "
                 "arguments");
-    } else if (target != TileIRTarget::GPU) {
+    } else if (this->options.target != TileIRTarget::GPU) {
       return rewriter.notifyMatchFailure(
           op, "dim-query lowering on non-GPU targets requires "
               "append-grid-args=true");
@@ -774,9 +765,6 @@ struct ConvertDimQueryOp : public OpConversionPattern<SrcOp> {
     rewriter.replaceOp(op, results);
     return success();
   }
-
-  TileIRTarget target;
-  bool appendGridArgs;
 };
 
 /// Convert cuda_tile.maxf/minf based on propagate_nan.
@@ -1353,12 +1341,8 @@ struct ConvertDivI : public OpConversionPattern<cuda_tile::DivIOp> {
 ///
 /// When `known-block-size` provides three values, the produced gpu.func carries
 /// them as the `known_block_size` attribute.
-struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
-  ConvertEntry(const TypeConverter &tc, MLIRContext *ctx, TileIRTarget target,
-               bool appendGridArgs, ArrayRef<int32_t> knownBlockSize)
-      : OpConversionPattern(tc, ctx), target(target),
-        appendGridArgs(appendGridArgs),
-        knownBlockSize(knownBlockSize.begin(), knownBlockSize.end()) {}
+struct ConvertEntry : public OptionsPattern<cuda_tile::EntryOp> {
+  using OptionsPattern::OptionsPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::EntryOp entryOp, OpAdaptor adaptor,
@@ -1387,7 +1371,7 @@ struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
 
     // Optionally append launch coordinates as six trailing i32 arguments
     // (block id x/y/z then grid dim x/y/z), used by dim-query lowerings.
-    if (appendGridArgs) {
+    if (options.appendGridArgs) {
       SmallVector<Type> launchArgTypes(AppendedGridArgLayout::kNumArgs,
                                        IntegerType::get(ctx, 32));
       funcArgTypes.append(launchArgTypes.begin(), launchArgTypes.end());
@@ -1404,16 +1388,16 @@ struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
     if (failed(convertedBlock))
       return failure();
 
-    if (target == TileIRTarget::GPU) {
+    if (options.target == TileIRTarget::GPU) {
       // GPU: lower to a gpu.func kernel and merge the converted body into its
       // (auto-created) entry block.
       auto gpuFunc =
           gpu::GPUFuncOp::create(rewriter, loc, entryOp.getSymName(), funcType);
       gpuFunc->setAttr(gpu::GPUDialect::getKernelFuncAttrName(),
                        rewriter.getUnitAttr());
-      if (!knownBlockSize.empty())
+      if (!options.knownBlockSize.empty())
         gpuFunc.setKnownBlockSizeAttr(
-            rewriter.getDenseI32ArrayAttr(knownBlockSize));
+            rewriter.getDenseI32ArrayAttr(options.knownBlockSize));
       preserveDroppedOptHints(entryOp, gpuFunc);
       Block *gpuBlock = &gpuFunc.getBody().front();
       rewriter.mergeBlocks(*convertedBlock, gpuBlock, gpuBlock->getArguments());
@@ -1428,10 +1412,6 @@ struct ConvertEntry : public OpConversionPattern<cuda_tile::EntryOp> {
     rewriter.eraseOp(entryOp);
     return success();
   }
-
-  TileIRTarget target;
-  bool appendGridArgs;
-  SmallVector<int32_t, 3> knownBlockSize;
 };
 
 /// Convert cuda_tile.exp2 to math.exp2.
@@ -1627,9 +1607,8 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
 ///     `tir-dropped-rounding` otherwise.
 ///
 /// Works for both scalar float and vector<float> types.
-struct ConvertFToF : public OpConversionPattern<cuda_tile::FToFOp> {
-  ConvertFToF(const TypeConverter &tc, MLIRContext *ctx, bool dropRoundingModes)
-      : OpConversionPattern(tc, ctx), dropRoundingModes(dropRoundingModes) {}
+struct ConvertFToF : public OptionsPattern<cuda_tile::FToFOp> {
+  using OptionsPattern::OptionsPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::FToFOp op, OpAdaptor adaptor,
@@ -1672,7 +1651,7 @@ struct ConvertFToF : public OpConversionPattern<cuda_tile::FToFOp> {
       return success();
     }
 
-    auto arithRounding = dropRoundingModes
+    auto arithRounding = options.dropRoundingModes
                              ? std::optional<arith::RoundingMode>()
                              : mapRoundingModeToArith(op.getRoundingMode());
     arith::RoundingModeAttr roundingAttr;
@@ -1692,8 +1671,6 @@ struct ConvertFToF : public OpConversionPattern<cuda_tile::FToFOp> {
                                          arithRounding.has_value(), castOp);
     return success();
   }
-
-  bool dropRoundingModes;
 };
 
 using ConvertFToI = ConvertFromToSignednessCastWithRoundingOp<
@@ -2014,10 +1991,9 @@ using ConvertIToF = ConvertFromToSignednessCastWithRoundingOp<
 /// vector.transfer_read as the discardable attribute
 /// `tir-dropped-optimization-hints`.
 struct ConvertLoadViewTko
-    : public TokenDroppingPattern<cuda_tile::LoadViewTkoOp> {
-  ConvertLoadViewTko(const TypeConverter &tc, MLIRContext *ctx,
-                     bool assumeInBounds)
-      : TokenDroppingPattern(tc, ctx), assumeInBounds(assumeInBounds) {}
+    : public OptionsPattern<cuda_tile::LoadViewTkoOp,
+                            TokenDroppingPattern<cuda_tile::LoadViewTkoOp>> {
+  using OptionsPattern::OptionsPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::LoadViewTkoOp op, OpAdaptor adaptor,
@@ -2064,7 +2040,7 @@ struct ConvertLoadViewTko
       padding = arith::ConstantIntOp::create(rewriter, loc,
                                              vecTy.getElementType(), 0);
     }
-    SmallVector<bool> inBounds = assumeInBounds
+    SmallVector<bool> inBounds = options.assumeInBounds
                                      ? SmallVector<bool>(vecTy.getRank(), true)
                                      : plan->inBounds;
 
@@ -2077,8 +2053,6 @@ struct ConvertLoadViewTko
     rewriter.replaceOp(op, {readOp.getResult(), Value()});
     return success();
   }
-
-  bool assumeInBounds;
 };
 
 /// Recover the runtime offset (the descriptor's offset field) carried by an
@@ -2314,14 +2288,13 @@ struct ConvertMmaI : public OpConversionPattern<cuda_tile::MmaIOp> {
 /// For the CPU target the cuda_tile.module is dissolved: its contents are
 /// inlined into the enclosing module (the builtin.module the pass runs on) and
 /// the cuda_tile.module wrapper is erased.
-struct ConvertModule : public OpConversionPattern<cuda_tile::ModuleOp> {
-  ConvertModule(const TypeConverter &tc, MLIRContext *ctx, TileIRTarget target)
-      : OpConversionPattern(tc, ctx), target(target) {}
+struct ConvertModule : public OptionsPattern<cuda_tile::ModuleOp> {
+  using OptionsPattern::OptionsPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::ModuleOp tileirMod, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (target == TileIRTarget::GPU) {
+    if (options.target == TileIRTarget::GPU) {
       auto gpuMod = gpu::GPUModuleOp::create(rewriter, tileirMod.getLoc(),
                                              tileirMod.getSymName());
       Block *oldBody = &tileirMod.getBody().front();
@@ -2342,8 +2315,6 @@ struct ConvertModule : public OpConversionPattern<cuda_tile::ModuleOp> {
     rewriter.eraseOp(tileirMod);
     return success();
   }
-
-  TileIRTarget target;
 };
 
 using ConvertMulF = ConvertBinaryFloatOp<cuda_tile::MulFOp, arith::MulFOp>;
@@ -3004,21 +2975,18 @@ struct ConvertReshape : public OpConversionPattern<cuda_tile::ReshapeOp> {
 
 /// Convert cuda_tile.return to gpu.return (gpu target) or func.return (cpu
 /// target).
-struct ConvertReturn : public OpConversionPattern<cuda_tile::ReturnOp> {
-  ConvertReturn(const TypeConverter &tc, MLIRContext *ctx, TileIRTarget target)
-      : OpConversionPattern(tc, ctx), target(target) {}
+struct ConvertReturn : public OptionsPattern<cuda_tile::ReturnOp> {
+  using OptionsPattern::OptionsPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::ReturnOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (target == TileIRTarget::GPU)
+    if (options.target == TileIRTarget::GPU)
       rewriter.replaceOpWithNewOp<gpu::ReturnOp>(op);
     else
       rewriter.replaceOpWithNewOp<func::ReturnOp>(op);
     return success();
   }
-
-  TileIRTarget target;
 };
 
 /// Convert cuda_tile.rsqrt to math.rsqrt.
@@ -3106,10 +3074,9 @@ using ConvertSqrt = ConvertUnaryApproxMathOp<cuda_tile::SqrtOp, math::SqrtOp,
 /// vector.transfer_write as the discardable attribute
 /// `tir-dropped-optimization-hints`.
 struct ConvertStoreViewTko
-    : public TokenDroppingPattern<cuda_tile::StoreViewTkoOp> {
-  ConvertStoreViewTko(const TypeConverter &tc, MLIRContext *ctx,
-                      bool assumeInBounds)
-      : TokenDroppingPattern(tc, ctx), assumeInBounds(assumeInBounds) {}
+    : public OptionsPattern<cuda_tile::StoreViewTkoOp,
+                            TokenDroppingPattern<cuda_tile::StoreViewTkoOp>> {
+  using OptionsPattern::OptionsPattern;
 
   LogicalResult
   matchAndRewrite(cuda_tile::StoreViewTkoOp op, OpAdaptor adaptor,
@@ -3124,7 +3091,7 @@ struct ConvertStoreViewTko
       return failure();
 
     SmallVector<bool> inBounds =
-        assumeInBounds
+        options.assumeInBounds
             ? SmallVector<bool>(plan->viewInfo.tileShape.size(), true)
             : plan->inBounds;
 
@@ -3138,8 +3105,6 @@ struct ConvertStoreViewTko
     rewriter.eraseOp(op);
     return success();
   }
-
-  bool assumeInBounds;
 };
 
 using ConvertSubF = ConvertBinaryFloatOp<cuda_tile::SubFOp, arith::SubFOp>;
@@ -3263,22 +3228,14 @@ static void populateTileIRToMLIRTypeConverter(TypeConverter &converter,
 
 /// Register all cuda_tile -> gpu/vector conversion patterns.
 static void populateTileIRToMLIRConversionPatterns(
-    TypeConverter &converter, RewritePatternSet &patterns, TileIRTarget target,
-    bool appendGridArgs, bool dropRoundingModes, bool assumeInBounds,
-    ArrayRef<int32_t> knownBlockSize) {
+    TypeConverter &converter, RewritePatternSet &patterns,
+    const ConvertTileIRToMLIRPassOptions &options) {
   MLIRContext *ctx = patterns.getContext();
-  // Target-dependent patterns select gpu vs func ops (module / entry / return)
-  // and gpu dim-query ops vs leading function arguments (block id / grid dim).
-  patterns.add<ConvertEntry>(converter, ctx, target, appendGridArgs,
-                             knownBlockSize);
-  patterns.add<ConvertGetNumTileBlocks, ConvertGetTileBlockId>(
-      converter, ctx, target, appendGridArgs);
-  patterns.add<ConvertModule, ConvertReturn>(converter, ctx, target);
-  patterns.add<ConvertAddF, ConvertSubF, ConvertMulF, ConvertDivF, ConvertFToF,
-               ConvertFToI, ConvertIToF, ConvertSqrt, ConvertTanH>(
-      converter, ctx, dropRoundingModes);
-  patterns.add<ConvertLoadViewTko, ConvertStoreViewTko>(converter, ctx,
-                                                        assumeInBounds);
+  patterns.add<ConvertAddF, ConvertSubF, ConvertMulF, ConvertDivF, ConvertEntry,
+               ConvertFToF, ConvertFToI, ConvertGetNumTileBlocks,
+               ConvertGetTileBlockId, ConvertIToF, ConvertLoadViewTko,
+               ConvertModule, ConvertReturn, ConvertSqrt, ConvertStoreViewTko,
+               ConvertTanH>(converter, ctx, options);
   // Ops that map to one target op with the same operands, or to one of their
   // operands.
   patterns.add<
@@ -3383,9 +3340,10 @@ struct ConvertTileIRToMLIRPass
     populateTileIRToMLIRTypeConverter(typeConverter, ctx, target);
 
     RewritePatternSet patterns(ctx);
-    populateTileIRToMLIRConversionPatterns(typeConverter, patterns, target,
-                                           appendGridArgs, dropRoundingModes,
-                                           assumeInBounds, knownBlockSize);
+    populateTileIRToMLIRConversionPatterns(typeConverter, patterns,
+                                           {target, appendGridArgs,
+                                            dropRoundingModes, assumeInBounds,
+                                            llvm::to_vector(knownBlockSize)});
 
     // TileIR ops are illegal; the ops they lower to are legal once all their
     // types are legal.
