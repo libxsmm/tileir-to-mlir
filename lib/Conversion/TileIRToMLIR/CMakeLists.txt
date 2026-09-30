@@ -15,6 +15,8 @@ target_link_libraries(TileIRToMLIR
   PRIVATE
   MLIRAnalysis
   MLIRArithDialect
+  MLIRArithUtils
+  MLIRDialectUtils
   MLIRFuncDialect
   MLIRGPUDialect
   MLIRLLVMCommonConversion

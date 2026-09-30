@@ -20,6 +20,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/SymbolTable.h"
@@ -43,7 +44,6 @@ using namespace mlir;
 
 namespace {
 
-using tileir::isStaticZero;
 using tileir::signatureChangeIsSafe;
 
 /// Returns true when `lhs` and `rhs` are identical reinterpret_casts for this
@@ -86,7 +86,7 @@ static bool collectPtrPromotionPlan(BlockArgument arg, PtrPromotionPlan &plan) {
     if (!castTy || castTy.getElementType() != unranked.getElementType())
       return false;
     SmallVector<OpFoldResult> offsets = rc.getMixedOffsets();
-    if (offsets.size() != 1 || !isStaticZero(offsets[0]))
+    if (offsets.size() != 1 || !isZeroInteger(offsets[0]))
       return false;
 
     if (!canonical) {

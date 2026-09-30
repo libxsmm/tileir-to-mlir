@@ -28,12 +28,14 @@
 #include "PostConversion.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -2375,14 +2377,13 @@ struct ConvertOffsetScalarPtr
     // zero offset, in which case the addend alone is the absolute offset.
     OpFoldResult srcOff =
         recoverUnrankedPtrOffset(rewriter, op.getLoc(), adaptor.getPtr());
-    OpFoldResult totalOff;
-    if (isa<Attribute>(srcOff)) {
-      totalOff = OpFoldResult(offIdx);
-    } else {
-      totalOff = OpFoldResult(arith::AddIOp::create(rewriter, op.getLoc(),
-                                                    cast<Value>(srcOff), offIdx)
-                                  .getResult());
-    }
+    OpFoldResult totalOff = offIdx;
+    if (!isZeroInteger(srcOff))
+      totalOff = arith::AddIOp::create(rewriter, op.getLoc(),
+                                       getValueOrCreateConstantIndexOp(
+                                           rewriter, op.getLoc(), srcOff),
+                                       offIdx)
+                     .getResult();
 
     auto rank1ViewTy =
         get1DDynamicOffsetMemRefType(elemTy, /*size=*/1, memSpace);
