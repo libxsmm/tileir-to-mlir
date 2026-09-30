@@ -14,7 +14,10 @@
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/VectorInterfaces.h"
 
@@ -197,7 +200,62 @@ struct TileLoop {
   SmallVector<Operation *> elementIndices;
 };
 
+/// The scalar constant splatted across `value`, or null. Broadcasts are looked
+/// through only from single-element sources, whose lanes hold one value.
+static Attribute getSplatConstant(Value value) {
+  while (auto broadcast = value.getDefiningOp<vector::BroadcastOp>()) {
+    auto sourceTy = dyn_cast<VectorType>(broadcast.getSource().getType());
+    if (sourceTy && (sourceTy.isScalable() || sourceTy.getNumElements() != 1))
+      break;
+    value = broadcast.getSource();
+  }
+  Attribute attr;
+  if (!matchPattern(value, m_Constant(&attr)))
+    return {};
+  if (auto elements = dyn_cast<SplatElementsAttr>(attr))
+    return elements.getSplatValue<Attribute>();
+  return isa<VectorType>(value.getType()) ? Attribute() : attr;
+}
+
+/// Fold `select(mask, transfer_read(.., pad), splat(pad))` into a masked
+/// transfer_read. Both yield `pad` on masked-off lanes, but the masked read
+/// lets the backend skip their loads. The in_bounds flags are kept, so lanes
+/// the mask leaves enabled keep their out-of-bounds protection.
+struct FoldSelectIntoTransferReadMask
+    : public OpRewritePattern<arith::SelectOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(arith::SelectOp op,
+                                PatternRewriter &rewriter) const override {
+    auto read = op.getTrueValue().getDefiningOp<vector::TransferReadOp>();
+    if (!read || !read->hasOneUse() || read.getMask())
+      return rewriter.notifyMatchFailure(op, "no unmasked read to fold into");
+    // The mask is indexed in source (pre-permutation) order.
+    if (!read.getPermutationMap().isMinorIdentity())
+      return rewriter.notifyMatchFailure(op, "read permutes its source");
+    // A scalar condition does not select per lane.
+    if (!isa<VectorType>(op.getCondition().getType()))
+      return rewriter.notifyMatchFailure(op, "condition is not per lane");
+    // The mask must be available at the read, which must not move.
+    if (!DominanceInfo().properlyDominates(op.getCondition(), read))
+      return rewriter.notifyMatchFailure(op, "condition defined after read");
+    Attribute padding;
+    if (!matchPattern(read.getPadding(), m_Constant(&padding)) ||
+        getSplatConstant(op.getFalseValue()) != padding)
+      return rewriter.notifyMatchFailure(op, "false value is not the padding");
+
+    rewriter.modifyOpInPlace(
+        read, [&] { read.getMaskMutable().assign(op.getCondition()); });
+    rewriter.replaceOp(op, read.getResult());
+    return success();
+  }
+};
+
 } // namespace
+
+void mlir::tileir::populatePostConversionPatterns(RewritePatternSet &patterns) {
+  patterns.add<FoldSelectIntoTransferReadMask>(patterns.getContext());
+}
 
 void mlir::tileir::rescaleTileLoops(Operation *root) {
   IntegerFacts facts(root);

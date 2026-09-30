@@ -37,13 +37,13 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/IR/Dominance.h"
-#include "mlir/IR/Matchers.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/WalkPatternRewriteDriver.h"
 
 #include "llvm/ADT/TypeSwitch.h"
 
@@ -3894,67 +3894,9 @@ struct ConvertTileIRToMLIRPass
     tileir::rescaleTileLoops(module);
     scopeLoopAllocations(module);
 
-    // Fold select(mask, transfer_read(.., pad), splat(pad)) into a masked
-    // transfer_read. Both forms yield `pad` on masked-off lanes, but the
-    // masked form lets the backend skip issuing their physical loads. The
-    // in_bounds attribute is carried over unchanged, so lanes the mask leaves
-    // enabled keep their original out-of-bounds protection.
-    {
-      // Return the scalar constant splatted across `value`, or a null
-      // attribute. Broadcasts are peeled only through single-element sources,
-      // where every result lane is known to hold the same value.
-      auto getSplatConstant = [](Value value) -> Attribute {
-        while (auto bcast = value.getDefiningOp<vector::BroadcastOp>()) {
-          Value src = bcast.getSource();
-          auto srcTy = dyn_cast<VectorType>(src.getType());
-          if (srcTy && (srcTy.isScalable() || srcTy.getNumElements() != 1))
-            break;
-          value = src;
-        }
-        Attribute attr;
-        if (!matchPattern(value, m_Constant(&attr)))
-          return {};
-        if (auto elements = dyn_cast<SplatElementsAttr>(attr))
-          return elements.getSplatValue<Attribute>();
-        return isa<VectorType>(value.getType()) ? Attribute() : attr;
-      };
-
-      DominanceInfo domInfo(module);
-      SmallVector<arith::SelectOp> maskFolds;
-      module.walk([&](arith::SelectOp op) {
-        auto readOp = op.getTrueValue().getDefiningOp<vector::TransferReadOp>();
-        if (!readOp || !readOp->hasOneUse() || readOp.getMask())
-          return;
-        // The mask is indexed in source (pre-permutation) order.
-        if (!readOp.getPermutationMap().isMinorIdentity())
-          return;
-        // A scalar condition does not select per lane.
-        if (!isa<VectorType>(op.getCondition().getType()))
-          return;
-        // Attaching the mask at the load must not move the load itself.
-        if (!domInfo.properlyDominates(op.getCondition(), readOp))
-          return;
-        Attribute pad;
-        if (!matchPattern(readOp.getPadding(), m_Constant(&pad)))
-          return;
-        Attribute falsePad = getSplatConstant(op.getFalseValue());
-        if (!falsePad || falsePad != pad)
-          return;
-        maskFolds.push_back(op);
-      });
-      for (arith::SelectOp op : maskFolds) {
-        auto readOp =
-            cast<vector::TransferReadOp>(op.getTrueValue().getDefiningOp());
-        OpBuilder builder(readOp);
-        auto maskedRead = vector::TransferReadOp::create(
-            builder, readOp.getLoc(), readOp.getVectorType(), readOp.getBase(),
-            readOp.getIndices(), readOp.getPermutationMapAttr(),
-            readOp.getPadding(), op.getCondition(), readOp.getInBoundsAttr());
-        op.replaceAllUsesWith(maskedRead.getResult());
-        op.erase();
-        readOp.erase();
-      }
-    }
+    RewritePatternSet postConversionPatterns(ctx);
+    tileir::populatePostConversionPatterns(postConversionPatterns);
+    walkAndApplyPatterns(module, std::move(postConversionPatterns));
 
     // Mark the module as a GPU container module when targeting the GPU. For the
     // CPU target the GPU container-module marker is intentionally omitted.

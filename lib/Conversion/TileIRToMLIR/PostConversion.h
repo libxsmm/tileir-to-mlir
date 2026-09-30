@@ -14,6 +14,7 @@
 
 namespace mlir {
 class Operation;
+class RewritePatternSet;
 namespace tileir {
 
 /// Make vector transfers index loops over tiles by the loop induction variable:
@@ -23,6 +24,9 @@ namespace tileir {
 ///     multiple of `T` becomes `iv`.
 /// Every rewrite is proven exact with integer range analysis.
 void rescaleTileLoops(Operation *root);
+
+/// Collect the patterns that optimize the converted IR locally.
+void populatePostConversionPatterns(RewritePatternSet &patterns);
 
 } // namespace tileir
 } // namespace mlir
