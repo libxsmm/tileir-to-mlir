@@ -150,7 +150,7 @@ cuda_tile.module @m {
     // CHECK: arith.index_cast {{.*}} : i32 to index
     // CHECK: arith.index_cast {{.*}} : i32 to index
     // CHECK: scf.for
-    // CHECK: arith.index_cast {{.*}} : index to i32
+    // CHECK-NOT: arith.index_cast
     // CHECK: scf.yield
     %res = for %iv in (%lb to %ub, step %st) : tile<i32>
       iter_values(%acc = %init) -> (tile<2x2xf32>) {
@@ -170,6 +170,39 @@ cuda_tile.module @m {
     // CHECK: scf.for unsigned %{{.*}} = %[[ULB]] to %[[UUB]] step %[[UST]] {
     // CHECK-NOT: tir-dropped-unsigned-cmp
     for unsigned %iv in (%lb to %ub, step %st) : tile<i32> {
+      continue
+    }
+  }
+
+  // --- loop counters as view indices ---
+  // A view index that is a loop counter uses the `index` counter directly; a
+  // negative counter would be outside the index space. Other uses of the
+  // counter keep its i32 cast.
+  // CHECK-LABEL: gpu.func @test_for_counter_view_index
+  entry @test_for_counter_view_index(%p: tile<ptr<f32>>, %n: tile<i32>) {
+    %c0 = constant <i32: 0> : tile<i32>
+    %c1 = constant <i32: 1> : tile<i32>
+    %tv = make_tensor_view %p, shape = [%n, 4], strides = [4, 1] : tile<i32> -> tensor_view<?x4xf32, strides=[4,1]>
+    %pv = make_partition_view %tv : partition_view<tile=(1x4), tensor_view<?x4xf32, strides=[4,1]>>
+    // CHECK: scf.for %[[IV:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
+    // CHECK:   %[[IV32:.*]] = arith.index_cast %[[IV]] : index to i32
+    // CHECK-NOT: arith.index_castui %[[IV32]]
+    // CHECK:   %[[ROW:.*]] = arith.muli %[[IV]], %{{.*}} overflow<nsw> : index
+    // CHECK:   vector.transfer_read %{{.*}}[%[[ROW]], %{{.*}}]
+    // CHECK:   %[[NEXT:.*]] = arith.addi %[[IV32]], %{{.*}} : i32
+    // CHECK:   arith.index_castui %[[NEXT]] : i32 to index
+    for %iv in (%c0 to %n, step %c1) : tile<i32> {
+      %t, %tok = load_view_tko weak %pv[%iv, %c0] : partition_view<tile=(1x4), tensor_view<?x4xf32, strides=[4,1]>>, tile<i32> -> tile<1x4xf32>, !cuda_tile.token
+      %next = addi %iv, %c1 : tile<i32>
+      %t2, %tok2 = load_view_tko weak %pv[%next, %c0] : partition_view<tile=(1x4), tensor_view<?x4xf32, strides=[4,1]>>, tile<i32> -> tile<1x4xf32>, !cuda_tile.token
+      continue
+    }
+    // CHECK: scf.for unsigned %[[UIV:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
+    // CHECK-NOT: arith.index_cast
+    // CHECK:   %[[UROW:.*]] = arith.muli %[[UIV]], %{{.*}} overflow<nsw> : index
+    // CHECK:   vector.transfer_read %{{.*}}[%[[UROW]], %{{.*}}]
+    for unsigned %iv in (%c0 to %n, step %c1) : tile<i32> {
+      %t, %tok = load_view_tko weak %pv[%iv, %c0] : partition_view<tile=(1x4), tensor_view<?x4xf32, strides=[4,1]>>, tile<i32> -> tile<1x4xf32>, !cuda_tile.token
       continue
     }
   }

@@ -888,6 +888,26 @@ struct TransferViewAccessPlan {
   SmallVector<bool> inBounds;
 };
 
+/// The `index` induction variable that `value` truncates with an index_cast,
+/// if the loop bounds are extended from the type of `value`: the induction
+/// variable then is the unsigned interpretation of `value`, or negative.
+static Value getExtendedInductionVar(Value value) {
+  auto cast = value.getDefiningOp<arith::IndexCastOp>();
+  auto iv = cast ? dyn_cast<BlockArgument>(cast.getIn()) : BlockArgument();
+  auto loop =
+      iv ? dyn_cast<scf::ForOp>(iv.getOwner()->getParentOp()) : scf::ForOp();
+  if (!loop || loop.getInductionVar() != iv)
+    return {};
+  auto isExtended = [&](Value bound) {
+    Operation *def = bound.getDefiningOp();
+    return isa_and_nonnull<arith::IndexCastOp, arith::IndexCastUIOp>(def) &&
+           def->getOperand(0).getType() == value.getType();
+  };
+  if (!isExtended(loop.getLowerBound()) || !isExtended(loop.getUpperBound()))
+    return {};
+  return iv;
+}
+
 /// Plan the transfer that accesses tile `convertedIndices` of `view`.
 ///
 /// Tile index i, scaled by the base advance of the view, indexes memref
@@ -914,8 +934,11 @@ buildTransferViewAccessPlan(ConversionPatternRewriter &rewriter, Operation *op,
       ctx, arith::IntegerOverflowFlags::nsw);
   SmallVector<Value> memrefIndices(rank);
   for (unsigned i = 0; i < rank; ++i) {
-    Value tileIndex = arith::IndexCastUIOp::create(
-        rewriter, loc, rewriter.getIndexType(), convertedIndices[i]);
+    // A negative loop counter would be an index outside the index space.
+    Value tileIndex = getExtendedInductionVar(convertedIndices[i]);
+    if (!tileIndex)
+      tileIndex = arith::IndexCastUIOp::create(
+          rewriter, loc, rewriter.getIndexType(), convertedIndices[i]);
     Value strideVal =
         arith::ConstantIndexOp::create(rewriter, loc, viewInfo.viewStrides[i]);
     memrefIndices[viewInfo.dimMap[i]] =
@@ -2828,6 +2851,15 @@ struct ConvertTileIRToMLIRPass
     if (failed(applyPartialConversion(module, conversionTarget,
                                       std::move(patterns))))
       return signalPassFailure();
+
+    // Drop the casts of loop counters to their source type (see ConvertFor)
+    // that only view indices used.
+    module.walk([](scf::ForOp loop) {
+      for (Operation *user :
+           llvm::make_early_inc_range(loop.getInductionVar().getUsers()))
+        if (isOpTriviallyDead(user))
+          user->erase();
+    });
 
     tileir::rescaleTileLoops(module);
     tileir::scopeLoopAllocations(module);

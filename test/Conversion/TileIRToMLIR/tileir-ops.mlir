@@ -489,7 +489,8 @@ cuda_tile.module @ops_module {
     // CHECK: %[[FOR_UBI:.*]] = arith.index_cast %[[FOR_UB]] : i32 to index
     // CHECK: %[[FOR_STEPI:.*]] = arith.index_cast %[[FOR_STEP]] : i32 to index
     // CHECK: scf.for %[[FOR_IV:.*]] = %[[FOR_LBI]] to %[[FOR_UBI]] step %[[FOR_STEPI]] {
-    // CHECK:   arith.index_cast %[[FOR_IV]] : index to i32
+    // CHECK-NOT: arith.index_cast
+    // CHECK: }
     for %iv in (%lowerBound to %upperBound, step %step) : tile<i32> {
         continue
     }
