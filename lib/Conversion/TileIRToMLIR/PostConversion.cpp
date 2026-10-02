@@ -284,21 +284,11 @@ struct FoldSelectIntoTransferReadMask
 // shifts (row bases, strides, buffer offsets) at any level. That covers the
 // canonical `row_base + column_iota` form as well as `broadcast(start + iota)`.
 //
-// Casts to wider integers are looked through, assuming that the offset
-// arithmetic below them does not wrap; a wrapping row is not contiguous. This
-// is the usual assumption of contiguity analyses for pointer offsets.
+// A cast may change the lane-to-lane stride when arithmetic in its narrower
+// source type wraps. Casts of an unshifted step whose lanes fit are exact. For
+// one widening cast of shifted lanes, the rows are only contiguous if no row
+// wraps; that is checked at runtime, with a gather as fallback.
 //===----------------------------------------------------------------------===//
-
-/// Strip casts that change only the element type and preserve the lane layout.
-static Value lookThroughElementCast(Value value) {
-  while (Operation *def = value.getDefiningOp()) {
-    if (!isa<arith::IndexCastOp, arith::IndexCastUIOp, arith::ExtSIOp,
-             arith::ExtUIOp>(def))
-      break;
-    value = def->getOperand(0);
-  }
-  return value;
-}
 
 /// Whether `ty` spans `minorSize` elements in the minor dimension and one in
 /// all others. Comparing element counts alone would also accept e.g.
@@ -311,7 +301,6 @@ static bool isMinorOnlyShape(VectorType ty, int64_t minorSize) {
 /// Match a value that is constant along the minor dimension, so adding it
 /// shifts a whole row without disturbing its unit spacing.
 static bool isMinorInvariant(Value value) {
-  value = lookThroughElementCast(value);
   auto valueTy = dyn_cast<VectorType>(value.getType());
   if (!valueTy)
     return true;
@@ -328,31 +317,87 @@ static bool isMinorInvariant(Value value) {
          (sourceTy.getRank() > 0 && sourceTy.getShape().back() == 1);
 }
 
+namespace {
+/// Where `matchUnitMinorStride` is in the chain of offset computations.
+enum class StrideMode {
+  /// Above all casts, in the gather's index type.
+  Wide,
+  /// Below the cast checked at runtime, in its narrower source type.
+  Narrow,
+  /// Below a cast that must preserve the lanes exactly, so shifts must not wrap.
+  Exact,
+};
+} // namespace
+
 /// Prove that offsets within each row increase by exactly one per column.
-static bool hasUnitMinorStride(Value value, int64_t minorSize) {
-  value = lookThroughElementCast(value);
+/// Returns the cast whose source rows must be checked at runtime not to wrap,
+/// or null if no check is needed. In `Exact` mode, shifts carrying `noWrap`,
+/// the flags under which the enclosing cast preserves them, are allowed.
+static FailureOr<Operation *> matchUnitMinorStride(
+    Value value, int64_t minorSize, StrideMode mode = StrideMode::Wide,
+    arith::IntegerOverflowFlags noWrap = arith::IntegerOverflowFlags::none) {
+  Operation *def = value.getDefiningOp();
+  if (isa_and_nonnull<arith::IndexCastOp, arith::IndexCastUIOp, arith::ExtSIOp,
+                     arith::ExtUIOp>(def)) {
+    Value source = def->getOperand(0);
+    unsigned sourceWidth =
+        ConstantIntRanges::getStorageBitwidth(source.getType());
+    unsigned resultWidth =
+        ConstantIntRanges::getStorageBitwidth(value.getType());
+    bool signedCast = isa<arith::IndexCastOp, arith::ExtSIOp>(def);
+    unsigned requiredBits =
+        APInt(64, minorSize - 1).getActiveBits() + unsigned(signedCast);
+    if (sourceWidth < requiredBits || resultWidth < requiredBits)
+      return failure();
+    auto castNoWrap = signedCast ? arith::IntegerOverflowFlags::nsw
+                                 : arith::IntegerOverflowFlags::nuw;
+    if (succeeded(matchUnitMinorStride(source, minorSize, StrideMode::Exact,
+                                       castNoWrap)))
+      return static_cast<Operation *>(nullptr);
+    if (mode != StrideMode::Wide || sourceWidth > resultWidth ||
+        failed(matchUnitMinorStride(source, minorSize, StrideMode::Narrow)))
+      return failure();
+    return def;
+  }
   // Base case: the iota itself, which must span exactly the minor dimension.
-  if (auto step = value.getDefiningOp<vector::StepOp>())
-    return isMinorOnlyShape(step.getType(), minorSize);
+  if (auto step = value.getDefiningOp<vector::StepOp>()) {
+    if (!isMinorOnlyShape(step.getType(), minorSize))
+      return failure();
+    return static_cast<Operation *>(nullptr);
+  }
   // Replication preserves the step only when the source already carries it
   // along its own minor dimension; the shape guard rejects transposed sources.
-  if (auto shapeCast = value.getDefiningOp<vector::ShapeCastOp>())
-    return isMinorOnlyShape(shapeCast.getSourceVectorType(), minorSize) &&
-           hasUnitMinorStride(shapeCast.getSource(), minorSize);
+  if (auto shapeCast = value.getDefiningOp<vector::ShapeCastOp>()) {
+    if (!isMinorOnlyShape(shapeCast.getSourceVectorType(), minorSize))
+      return failure();
+    return matchUnitMinorStride(shapeCast.getSource(), minorSize, mode,
+                                noWrap);
+  }
   if (auto broadcast = value.getDefiningOp<vector::BroadcastOp>()) {
     // A scalar source cannot carry a step, so a vector source is required.
     auto sourceTy = dyn_cast<VectorType>(broadcast.getSource().getType());
-    return isMinorOnlyShape(sourceTy, minorSize) &&
-           hasUnitMinorStride(broadcast.getSource(), minorSize);
+    if (!isMinorOnlyShape(sourceTy, minorSize))
+      return failure();
+    return matchUnitMinorStride(broadcast.getSource(), minorSize, mode,
+                                noWrap);
   }
   // Shifting by a minor-invariant term moves a row without restriding it. The
   // shift may sit either side of a replication, e.g. `broadcast(start + iota)`.
-  if (auto add = value.getDefiningOp<arith::AddIOp>())
-    return (hasUnitMinorStride(add.getLhs(), minorSize) &&
-            isMinorInvariant(add.getRhs())) ||
-           (hasUnitMinorStride(add.getRhs(), minorSize) &&
-            isMinorInvariant(add.getLhs()));
-  return false;
+  if (auto add = value.getDefiningOp<arith::AddIOp>();
+      add && (mode != StrideMode::Exact ||
+              (noWrap != arith::IntegerOverflowFlags::none &&
+               bitEnumContainsAll(add.getOverflowFlags(), noWrap)))) {
+    for (auto [stride, shift] : {std::pair(add.getLhs(), add.getRhs()),
+                                 std::pair(add.getRhs(), add.getLhs())}) {
+      if (!isMinorInvariant(shift))
+        continue;
+      FailureOr<Operation *> check =
+          matchUnitMinorStride(stride, minorSize, mode, noWrap);
+      if (succeeded(check))
+        return check;
+    }
+  }
+  return failure();
 }
 
 /// Shape cast `value` to `shape`, keeping its element type.
@@ -365,13 +410,97 @@ static Value reshapeVector(PatternRewriter &rewriter, Location loc, Value value,
       rewriter, loc, VectorType::get(shape, type.getElementType()), value);
 }
 
+/// Whether no row of the source of `wrapCast`, which a matched stride makes
+/// `first + j` modulo its width, wraps across the `columns` lanes it spans.
+static Value createNoRowWrapCheck(PatternRewriter &rewriter, Location loc,
+                                  Operation *wrapCast, int64_t columns) {
+  Value source = wrapCast->getOperand(0);
+  auto sourceTy = cast<VectorType>(source.getType());
+  int64_t rows = sourceTy.getNumElements() / columns;
+  Value firsts = vector::ExtractStridedSliceOp::create(
+      rewriter, loc, reshapeVector(rewriter, loc, source, {rows, columns}),
+      /*offsets=*/ArrayRef<int64_t>{0, 0}, /*sizes=*/ArrayRef<int64_t>{rows, 1},
+      /*strides=*/ArrayRef<int64_t>{1, 1});
+  firsts = reshapeVector(rewriter, loc, firsts, rows);
+
+  bool signedCast = isa<arith::IndexCastOp, arith::ExtSIOp>(wrapCast);
+  unsigned width = sourceTy.getElementTypeBitWidth();
+  APInt max = signedCast ? APInt::getSignedMaxValue(width)
+                         : APInt::getMaxValue(width);
+  APInt limit = max - (columns - 1);
+  Value bound = arith::ConstantOp::create(
+      rewriter, loc,
+      DenseElementsAttr::get(cast<VectorType>(firsts.getType()), limit));
+  Value fits = arith::CmpIOp::create(
+      rewriter, loc,
+      signedCast ? arith::CmpIPredicate::sle : arith::CmpIPredicate::ule,
+      firsts, bound);
+  return vector::ReductionOp::create(rewriter, loc, vector::CombiningKind::AND,
+                                     fits);
+}
+
+/// The result of `gather`, loaded by one masked load per row.
+static Value createRowLoads(PatternRewriter &rewriter,
+                            vector::GatherOp gather) {
+  VectorType resultTy = gather.getVectorType();
+  Location loc = gather.getLoc();
+  int64_t columns = resultTy.getShape().back();
+  int64_t rowsAndColumns[] = {resultTy.getNumElements() / columns, columns};
+  Value indices =
+      reshapeVector(rewriter, loc, gather.getIndices(), rowsAndColumns);
+  Value mask = reshapeVector(rewriter, loc, gather.getMask(), rowsAndColumns);
+  Value passThru =
+      reshapeVector(rewriter, loc, gather.getPassThru(), rowsAndColumns);
+
+  auto rowTy = VectorType::get({columns}, resultTy.getElementType());
+  SmallVector<Value> offsets(gather.getOffsets());
+  Value minorOffset = offsets.back();
+  Value result = passThru;
+  for (int64_t row = 0; row < rowsAndColumns[0]; ++row) {
+    Value first = vector::ExtractOp::create(rewriter, loc, indices,
+                                            ArrayRef<int64_t>{row, 0});
+    offsets.back() =
+        rewriter.createOrFold<arith::AddIOp>(loc, first, minorOffset);
+    Value rowMask = vector::ExtractOp::create(rewriter, loc, mask, row);
+    Value rowPassThru = vector::ExtractOp::create(rewriter, loc, passThru, row);
+    // The gather's alignment holds only for the lanes it accesses, which
+    // need not include the first lane of the row.
+    auto load = vector::MaskedLoadOp::create(
+        rewriter, loc, rowTy, gather.getBase(), offsets, rowMask, rowPassThru,
+        llvm::MaybeAlign());
+    load->setDiscardableAttrs(gather->getDiscardableAttrDictionary());
+    result =
+        vector::InsertOp::create(rewriter, loc, load.getResult(), result, row);
+  }
+  return reshapeVector(rewriter, loc, result, resultTy.getShape());
+}
+
+/// The result of `gather`, loaded by an equivalent 1-D gather.
+static Value createFlatGather(PatternRewriter &rewriter,
+                              vector::GatherOp gather) {
+  VectorType resultTy = gather.getVectorType();
+  Location loc = gather.getLoc();
+  int64_t numElements = resultTy.getNumElements();
+  Value indices =
+      reshapeVector(rewriter, loc, gather.getIndices(), numElements);
+  Value mask = reshapeVector(rewriter, loc, gather.getMask(), numElements);
+  Value passThru =
+      reshapeVector(rewriter, loc, gather.getPassThru(), numElements);
+  auto flat = vector::GatherOp::create(
+      rewriter, loc, passThru.getType(), gather.getBase(), gather.getOffsets(),
+      indices, mask, passThru, gather.getAlignmentAttr());
+  flat->setDiscardableAttrs(gather->getDiscardableAttrDictionary());
+  return reshapeVector(rewriter, loc, flat.getResult(), resultTy.getShape());
+}
+
 namespace {
 
 /// Replace a gather whose offsets are contiguous within each row by one masked
 /// load per row. Leading dimensions are collapsed, so a rank-N gather becomes
 /// `rows x columns`. Each row loads from its first offset: lane `j` then reads
 /// the element the gather would, and masked-off lanes are never accessed, so a
-/// row whose first offset lies outside the buffer stays safe.
+/// row whose first offset lies outside the buffer stays safe. Rows that are
+/// contiguous only without wraparound are guarded by a runtime check.
 struct LowerGatherToRowLoads : public OpRewritePattern<vector::GatherOp> {
   LowerGatherToRowLoads(MLIRContext *context)
       : OpRewritePattern(context, /*benefit=*/2) {}
@@ -385,40 +514,29 @@ struct LowerGatherToRowLoads : public OpRewritePattern<vector::GatherOp> {
         !gather.getIndexVectorType().getElementType().isIndex())
       return rewriter.notifyMatchFailure(gather, "unsupported gather");
     int64_t columns = resultTy.getShape().back();
-    if (!hasUnitMinorStride(gather.getIndices(), columns))
+    FailureOr<Operation *> wrapCast =
+        matchUnitMinorStride(gather.getIndices(), columns);
+    if (failed(wrapCast))
       return rewriter.notifyMatchFailure(gather, "rows are not contiguous");
 
-    Location loc = gather.getLoc();
-    int64_t rowsAndColumns[] = {resultTy.getNumElements() / columns, columns};
-    Value indices =
-        reshapeVector(rewriter, loc, gather.getIndices(), rowsAndColumns);
-    Value mask = reshapeVector(rewriter, loc, gather.getMask(), rowsAndColumns);
-    Value passThru =
-        reshapeVector(rewriter, loc, gather.getPassThru(), rowsAndColumns);
-
-    auto rowTy = VectorType::get({columns}, resultTy.getElementType());
-    SmallVector<Value> offsets(gather.getOffsets());
-    Value minorOffset = offsets.back();
-    Value result = passThru;
-    for (int64_t row = 0; row < rowsAndColumns[0]; ++row) {
-      Value first = vector::ExtractOp::create(rewriter, loc, indices,
-                                              ArrayRef<int64_t>{row, 0});
-      offsets.back() =
-          rewriter.createOrFold<arith::AddIOp>(loc, first, minorOffset);
-      Value rowMask = vector::ExtractOp::create(rewriter, loc, mask, row);
-      Value rowPassThru =
-          vector::ExtractOp::create(rewriter, loc, passThru, row);
-      // The gather's alignment holds only for the lanes it accesses, which
-      // need not include the first lane of the row.
-      auto load = vector::MaskedLoadOp::create(
-          rewriter, loc, rowTy, gather.getBase(), offsets, rowMask, rowPassThru,
-          llvm::MaybeAlign());
-      load->setDiscardableAttrs(gather->getDiscardableAttrDictionary());
-      result = vector::InsertOp::create(rewriter, loc, load.getResult(), result,
-                                        row);
+    if (!*wrapCast) {
+      rewriter.replaceOp(gather, createRowLoads(rewriter, gather));
+      return success();
     }
-    rewriter.replaceOp(
-        gather, reshapeVector(rewriter, loc, result, resultTy.getShape()));
+
+    Location loc = gather.getLoc();
+    Value noWrap = createNoRowWrapCheck(rewriter, loc, *wrapCast, columns);
+    auto ifOp = scf::IfOp::create(rewriter, loc, TypeRange{resultTy}, noWrap,
+                                  /*withElseRegion=*/true);
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(ifOp.thenBlock());
+      scf::YieldOp::create(rewriter, loc, createRowLoads(rewriter, gather));
+      // The 1-D fallback is not matched again by this pattern.
+      rewriter.setInsertionPointToStart(ifOp.elseBlock());
+      scf::YieldOp::create(rewriter, loc, createFlatGather(rewriter, gather));
+    }
+    rewriter.replaceOp(gather, ifOp.getResults());
     return success();
   }
 };
@@ -432,21 +550,7 @@ struct FlattenGather : public OpRewritePattern<vector::GatherOp> {
     VectorType resultTy = gather.getVectorType();
     if (resultTy.getRank() < 2 || resultTy.isScalable())
       return rewriter.notifyMatchFailure(gather, "not an n-D gather");
-
-    Location loc = gather.getLoc();
-    int64_t numElements = resultTy.getNumElements();
-    Value indices =
-        reshapeVector(rewriter, loc, gather.getIndices(), numElements);
-    Value mask = reshapeVector(rewriter, loc, gather.getMask(), numElements);
-    Value passThru =
-        reshapeVector(rewriter, loc, gather.getPassThru(), numElements);
-    auto flat =
-        vector::GatherOp::create(rewriter, loc, passThru.getType(),
-                                 gather.getBase(), gather.getOffsets(), indices,
-                                 mask, passThru, gather.getAlignmentAttr());
-    flat->setDiscardableAttrs(gather->getDiscardableAttrDictionary());
-    rewriter.replaceOp(gather, reshapeVector(rewriter, loc, flat.getResult(),
-                                             resultTy.getShape()));
+    rewriter.replaceOp(gather, createFlatGather(rewriter, gather));
     return success();
   }
 };

@@ -56,6 +56,19 @@ func.func private @dynamic_stride_cast(%arg0: memref<*xf32>) -> f32 {
   return %x : f32
 }
 
+// A plain cast with a dynamic size reads it from the unranked descriptor.
+// A pointer cannot supply that size to memref.dim.
+// CHECK-LABEL: func.func private @dynamic_size_cast(
+// CHECK-SAME:    %{{[^:]+}}: memref<*xf32>
+// CHECK:         memref.cast
+// CHECK:         memref.dim
+func.func private @dynamic_size_cast(%arg0: memref<*xf32>) -> index {
+  %c0 = arith.constant 0 : index
+  %v = memref.cast %arg0 : memref<*xf32> to memref<?xf32, strided<[1], offset: ?>>
+  %size = memref.dim %v, %c0 : memref<?xf32, strided<[1], offset: ?>>
+  return %size : index
+}
+
 // CHECK-LABEL: func.func private @non_strided_cast(
 // CHECK-SAME:    %{{[^:]+}}: memref<*xf32>
 // CHECK:         memref.cast

@@ -81,13 +81,14 @@ static bool collectPromotableCasts(
         resTy.getElementType() != unranked.getElementType())
       return false;
     // The descriptor needs strides and a type of the memref-to-LLVM lowering. A
-    // plain cast would read the strides from the unranked descriptor, which a
-    // pointer does not have, so they must be static.
+    // plain cast would read sizes and strides from the unranked descriptor,
+    // which a pointer does not have, so they must be static.
     SmallVector<int64_t> strides;
     int64_t offset;
     if (failed(resTy.getStridesAndOffset(strides, offset)) ||
         (isa<memref::CastOp>(user) &&
-         llvm::any_of(strides, ShapedType::isDynamic)) ||
+         (llvm::any_of(resTy.getShape(), ShapedType::isDynamic) ||
+          llvm::any_of(strides, ShapedType::isDynamic))) ||
         !typeConverter.convertType(resTy))
       return false;
     casts.emplace_back(user, resTy);
@@ -124,10 +125,8 @@ static void getLayout(OpBuilder &builder, Location loc, Operation *cast,
     return;
   }
 
-  // A plain cast takes the static strides of its type. A dynamic offset is 0
-  // by the calling convention of pointer arguments. A pointer has no sizes, so
-  // dynamic ones are set to 0; the gathers and scatters of converted IR do not
-  // read them.
+  // A plain cast takes the static sizes and strides of its type. A dynamic
+  // offset is 0 by the calling convention of pointer arguments.
   auto constIndex = [&](int64_t v) -> Value {
     return LLVM::ConstantOp::create(
         builder, loc, indexTy,

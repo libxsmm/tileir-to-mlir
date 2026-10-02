@@ -517,6 +517,9 @@ struct DimInfo {
   Value stride;
   /// Static stride recovered from a tile-shaped integer splat.
   std::optional<int64_t> staticStride;
+  /// Width of the source multiplication by stride (if present). Preserve
+  /// its modular arithmetic when moving a uniform offset to the base.
+  unsigned strideMulWidth = 0;
   /// Scalar `size` value extracted from the corresponding mask (the global
   /// tensor's size along this dimension). Null if the mask does not bound this
   /// dimension; the view then spans one tile along it.
@@ -580,6 +583,9 @@ static LogicalResult decomposeAddend(Value addend, ArrayRef<int64_t> tileShape,
   // Optional `muli` with one side being a broadcast-of-reshape-of-scalar (the
   // stride).
   if (auto mul = cur.getDefiningOp<MulIOp>()) {
+    info.strideMulWidth =
+      cast<IntegerType>(cast<TileType>(cur.getType()).getElementType())
+        .getWidth();
     for (auto [a, b] : commutedOperands(mul.getLhs(), mul.getRhs())) {
       if (std::optional<int64_t> stride = matchSplatInt64(a);
           stride && *stride > 0) {
@@ -1041,6 +1047,7 @@ static LogicalResult analyzePtr(Value ptr, ArrayRef<int64_t> tileShape,
           out.dims[dim].start = info.start;
           out.dims[dim].stride = info.stride;
           out.dims[dim].staticStride = info.staticStride;
+          out.dims[dim].strideMulWidth = info.strideMulWidth;
           covered[dim] = true;
         } else if (!isScalarTile(a.getType())) {
           if (Value shift = matchScalarBroadcastReshape(a))
@@ -1351,29 +1358,33 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
       return failure();
   }
 
-  // `factor * scale [* stride]` in i64, like the address arithmetic of views.
+  // Multiply at the source offset's width before sign-extending to the i64
+  // pointer offset. Widening first would discard i32 muli's wraparound.
   auto buildElementOffset = [&](Value factor, int64_t scale,
-                                Value stride) -> Value {
+                                Value stride, unsigned mulWidth) -> Value {
     SmallVector<Value> operands{factor};
     if (stride)
       operands.push_back(stride);
     OpBuilder sb(ctx);
     setInsertionPointAfterLatestDef(sb, dom, operands, anchor);
     auto i64Ty = TileType::get(ctx, {}, sb.getI64Type());
-    auto toI64 = [&](Value v) -> Value {
-      if (cast<TileType>(v.getType()).getElementType().isInteger(64))
+    auto mulTy = TileType::get(ctx, {}, sb.getIntegerType(mulWidth));
+    auto toMulWidth = [&](Value v) -> Value {
+      if (v.getType() == mulTy)
         return v;
-      return ExtIOp::create(sb, loc, i64Ty, v, Signedness::Signed);
+      return ExtIOp::create(sb, loc, mulTy, v, Signedness::Signed);
     };
-    Value offset = toI64(factor);
+    Value offset = toMulWidth(factor);
     if (stride)
-      offset = MulIOp::create(sb, loc, offset, toI64(stride));
+      offset = MulIOp::create(sb, loc, offset, toMulWidth(stride));
     if (scale != 1) {
-      auto attr = DenseElementsAttr::get(i64Ty, APInt(64, scale));
-      Value scaleCst = ConstantOp::create(sb, loc, i64Ty,
+      auto attr = DenseElementsAttr::get(mulTy, APInt(mulWidth, scale));
+      Value scaleCst = ConstantOp::create(sb, loc, mulTy,
                                           cast<DenseTypedElementsAttr>(attr));
       offset = MulIOp::create(sb, loc, offset, scaleCst);
     }
+    if (mulWidth != 64)
+      offset = ExtIOp::create(sb, loc, i64Ty, offset, Signedness::Signed);
     return offset;
   };
 
@@ -1403,7 +1414,8 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
     int64_t staticStride = di.staticStride.value_or(1);
     if (di.start && !bounded) {
       out.baseShifts.push_back(
-          buildElementOffset(di.start, staticStride, di.stride));
+          buildElementOffset(di.start, staticStride, di.stride,
+                   di.strideMulWidth ? di.strideMulWidth : 32));
       indices.push_back(buildZeroI32(b, loc));
       continue;
     }
@@ -1438,7 +1450,8 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
       Value loopIdx = access.loop->inductionVar;
       if (!bounded) {
         out.baseShifts.push_back(
-            buildElementOffset(loopIdx, di.tileSize * staticStride, di.stride));
+          buildElementOffset(loopIdx, di.tileSize * staticStride, di.stride,
+                     di.strideMulWidth ? di.strideMulWidth : 32));
         indices.push_back(buildZeroI32(b, loc));
         continue;
       }
