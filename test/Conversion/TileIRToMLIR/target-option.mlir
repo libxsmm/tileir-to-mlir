@@ -38,7 +38,7 @@
 //   tir-dropped-rounding otherwise (same policy on both targets).
 // GPU:           gpu.func @rounding(%[[FX:.*]]: f32, %[[FY:.*]]: f32, %[[IX:.*]]: i32, %[[IY:.*]]: i32) kernel {
 // GPU:             arith.addf %[[FX]], %[[FY]]
-// GPU:             arith.divf %[[FX]], %[[FY]] {"tir-dropped-rounding" = "zero"}
+// GPU:             arith.divf %[[FX]], %[[FY]] toward_zero
 // GPU:             arith.truncf %[[FX]] to_nearest_even
 // GPU:             arith.fptosi %[[FX]]
 // GPU:             arith.sitofp %[[IX]]
@@ -76,7 +76,7 @@
 //   CPU follows the same representable-vs-dropped rounding policy.
 // CPU:         func.func @rounding(%[[FX:.*]]: f32, %[[FY:.*]]: f32, %[[IX:.*]]: i32, %[[IY:.*]]: i32, %{{.*}}: i32, %{{.*}}: i32, %{{.*}}: i32, %{{.*}}: i32, %{{.*}}: i32, %{{.*}}: i32) {
 // CPU:           arith.addf %[[FX]], %[[FY]]
-// CPU:           arith.divf %[[FX]], %[[FY]] {"tir-dropped-rounding" = "zero"}
+// CPU:           arith.divf %[[FX]], %[[FY]] toward_zero
 // CPU:           arith.truncf %[[FX]] to_nearest_even
 // CPU:           arith.fptosi %[[FX]]
 // CPU:           arith.sitofp %[[IX]]

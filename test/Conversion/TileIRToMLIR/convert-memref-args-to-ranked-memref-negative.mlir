@@ -5,6 +5,7 @@
 // 2) arguments with non-identical reinterpret casts are not promoted,
 // 3) shared scalar shape args with conflicting memref sources are not removed.
 // 4) non-zero reinterpret offsets are not folded into the ranked argument.
+// 5) casts whose layout varies between executions are not promoted.
 
 // CHECK-LABEL: func.func private @callee(
 // CHECK-SAME: %[[P:[^:]+]]: memref<*xf32>, %[[N:[^:]+]]: i32)
@@ -60,6 +61,26 @@ module attributes {gpu.container_module} {
       %n = arith.index_cast %arg1 : i32 to index
       %off = arith.index_cast %arg2 : i32 to index
       %a = memref.reinterpret_cast %arg0 to offset: [%off], sizes: [%n], strides: [1] : memref<*xf16> to memref<?xf16, strided<[1], offset: ?>>
+      gpu.return
+    }
+
+    // The argument would replace the cast in every loop iteration, so a cast
+    // whose size is loop-carried is not promoted. The loop block argument %s
+    // must not be taken for function argument #1 (%n) either.
+    // CHECK-LABEL: gpu.func @loop_carried_size(
+    // CHECK-SAME: memref<*xf32>, %[[N:[^:]+]]: index, %{{[^:]+}}: index)
+    // CHECK: memref.reinterpret_cast
+    // CHECK: arith.addi %[[N]], %[[N]]
+    gpu.func @loop_carried_size(%arg0: memref<*xf32>, %n: index, %k: index) attributes {sym_visibility = "private"} {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c4 = arith.constant 4 : index
+      %r = scf.for %i = %c0 to %k step %c1 iter_args(%s = %c4) -> index {
+        %a = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%s], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1]>>
+        %s2 = arith.addi %s, %c1 : index
+        scf.yield %s2 : index
+      }
+      %u = arith.addi %n, %n : index
       gpu.return
     }
   }

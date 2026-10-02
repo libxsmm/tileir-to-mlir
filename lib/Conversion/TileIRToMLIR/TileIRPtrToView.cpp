@@ -19,14 +19,14 @@
 //
 //   // per-dim index construction (one offset op per dimension)
 //   %iota0  = iota                           : tile<N x i32>
-//   %start0 = ...                            : tile<ptr<T>>  // scalar
+//   %start0 = ...                            : tile<i32>
 //   %off0   = addi broadcast(reshape(%start0)), reshape(%iota0)
 //                                            : tile<N x i32>
 //   // optional: %off0 = muli %off0, broadcast(reshape(%stride0))
 //   %ptr1   = offset %base,   reshape(%off0) : tile<N x 1 x ptr<T>>
 //
 //   %iota1  = iota                           : tile<M x i32>
-//   %start1 = ...                            : tile<ptr<T>>  // scalar
+//   %start1 = ...                            : tile<i32>
 //   %off1   = addi broadcast(reshape(%start1)), reshape(%iota1)
 //                                            : tile<M x i32>
 //   // optional: %off1 = muli %off1, broadcast(reshape(%stride1))
@@ -49,7 +49,9 @@
 // The rewrite is conservative: it leaves the original
 // load_ptr_tko/store_ptr_tko untouched whenever it cannot fully recover the
 // access, rather than fabricating a shape/stride. In particular it requires:
-//   * a recovered global size (from the mask) for every dimension;
+//   * a global size recovered from the mask for every dimension, except for
+//     dimensions that a fully understood mask does not bound: the view spans
+//     one tile along them, and the base pointer moves to that tile;
 //   * the innermost dimension to be contiguous (unit stride) and every other
 //     dimension to carry an explicitly recovered stride (row-major layout);
 //   * exactly one loop-advancing (start-less) dimension when the access is
@@ -75,7 +77,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Conversion/TileIRToMLIR/TileIRPtrToView.h"
+#include "mlir/Conversion/TileIRToMLIR/Passes.h"
 
 #include "cuda_tile/Dialect/CudaTile/IR/Dialect.h"
 #include "cuda_tile/Dialect/CudaTile/IR/Ops.h"
@@ -147,7 +149,7 @@ static Value lookThroughIndexCast(Value v) {
   return v;
 }
 
-/// Returns `true` iff `tt` is a TileType with empty shape (scalar tile).
+/// Whether `t` is a rank-0 tile.
 static bool isScalarTile(Type t) {
   auto tt = dyn_cast<TileType>(t);
   return tt && tt.getShape().empty();
@@ -317,6 +319,7 @@ static Value stripMaskWrappers(Value v) {
   return nullptr;
 }
 
+/// Whether `condition` is a conjunct of `mask`, so that `mask` implies it.
 static bool isMaskConjunct(Value condition, Value mask) {
   condition = stripMaskWrappers(condition);
   mask = stripMaskWrappers(mask);
@@ -415,7 +418,8 @@ static std::optional<int64_t> matchSplatInt64(Value v) {
   return value.getSExtValue();
 }
 
-/// Return whether `mask` proves `0 <= index < upperBound`.
+/// Set `hasLowerBound` if a conjunct of `mask` proves `index >= 0`, and
+/// `hasUpperBound` if one proves `index < upperBound`.
 static void findMaskBounds(Value mask, Value index, int64_t upperBound,
                            bool &hasLowerBound, bool &hasUpperBound) {
   Value v = lookThroughAssume(mask);
@@ -513,9 +517,12 @@ struct DimInfo {
   Value stride;
   /// Static stride recovered from a tile-shaped integer splat.
   std::optional<int64_t> staticStride;
+  /// Width of the source multiplication by stride (if present). Preserve
+  /// its modular arithmetic when moving a uniform offset to the base.
+  unsigned strideMulWidth = 0;
   /// Scalar `size` value extracted from the corresponding mask (the global
-  /// tensor's size along this dimension).  May be null if no comparison was
-  /// found for this dimension (we then fall back to the tile size).
+  /// tensor's size along this dimension). Null if the mask does not bound this
+  /// dimension; the view then spans one tile along it.
   Value size;
   /// Static size recovered from a tile-shaped integer splat.
   std::optional<int64_t> staticSize;
@@ -576,6 +583,9 @@ static LogicalResult decomposeAddend(Value addend, ArrayRef<int64_t> tileShape,
   // Optional `muli` with one side being a broadcast-of-reshape-of-scalar (the
   // stride).
   if (auto mul = cur.getDefiningOp<MulIOp>()) {
+    info.strideMulWidth =
+      cast<IntegerType>(cast<TileType>(cur.getType()).getElementType())
+        .getWidth();
     for (auto [a, b] : commutedOperands(mul.getLhs(), mul.getRhs())) {
       if (std::optional<int64_t> stride = matchSplatInt64(a);
           stride && *stride > 0) {
@@ -673,12 +683,8 @@ static LogicalResult decomposeAddend(Value addend, ArrayRef<int64_t> tileShape,
   return failure();
 }
 
-/// Recognise the per-dim sizes encoded in `mask`.  We walk a tree of
-/// `cmpi less_than` / `andi` / `exti` / `trunci` / `broadcast` / `reshape`
-/// ops.  Each `cmpi less_than` compares a `reshape(iota...)` against a
-/// broadcast-of-reshape-of-scalar — that scalar is the per-dim size.
-/// Locate which dimension `val` bounds. We look through reshapes, broadcasts,
-/// and addi's to find the dimension index.
+/// The tile dimension along which the index `val` varies, or -1 if it is not
+/// found through reshapes, broadcasts and addis.
 static int findDimFromIndexValue(Value val, unsigned rank,
                                  Value mask = {}) {
   while (val) {
@@ -1041,6 +1047,7 @@ static LogicalResult analyzePtr(Value ptr, ArrayRef<int64_t> tileShape,
           out.dims[dim].start = info.start;
           out.dims[dim].stride = info.stride;
           out.dims[dim].staticStride = info.staticStride;
+          out.dims[dim].strideMulWidth = info.strideMulWidth;
           covered[dim] = true;
         } else if (!isScalarTile(a.getType())) {
           if (Value shift = matchScalarBroadcastReshape(a))
@@ -1161,14 +1168,17 @@ static PaddingValueAttr matchPadding(MLIRContext *ctx, Value v) {
   return nullptr;
 }
 
-/// Build the (TensorViewType, PartitionViewType, dynamic-shape, dynamic-stride,
-/// per-dim partition index) tuple for a recovered PtrAccess.
+/// The view types, dynamic shape and strides, and per-dimension partition
+/// indices of a recovered PtrAccess.
 struct BuiltViews {
   TensorViewType tvTy;
   PartitionViewType pvTy;
   SmallVector<Value> dynamicShape;
   SmallVector<Value> dynamicStride;
   SmallVector<Value> indices;
+  /// i64 element offsets that move the base pointer to the tile along the
+  /// dimensions that the mask does not bound.
+  SmallVector<Value> baseShifts;
 };
 
 /// Given a per-dim `start` scalar that is expected to be a sum of terms of the
@@ -1314,9 +1324,15 @@ static Value buildZeroI32(OpBuilder &b, Location loc) {
 ///
 /// When `access.loop` is set, the index for the advancing dimension becomes
 /// `initial_idx + loopIdx` (the loop induction variable).
+///
+/// A dimension that the mask does not bound has no known extent, so the view
+/// spans only the accessed tile along it: its index is 0, and its tile offset
+/// is returned in `out.baseShifts`, built right after the values it uses so
+/// that the views can still be hoisted.
 static LogicalResult buildViews(OpBuilder &b, Location loc,
                                 const PtrAccess &access, Type elementType,
-                                PaddingValueAttr padding, BuiltViews &out) {
+                                PaddingValueAttr padding, DominanceInfo &dom,
+                                Operation *anchor, BuiltViews &out) {
   MLIRContext *ctx = b.getContext();
   unsigned rank = access.dims.size();
 
@@ -1342,6 +1358,36 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
       return failure();
   }
 
+  // Multiply at the source offset's width before sign-extending to the i64
+  // pointer offset. Widening first would discard i32 muli's wraparound.
+  auto buildElementOffset = [&](Value factor, int64_t scale,
+                                Value stride, unsigned mulWidth) -> Value {
+    SmallVector<Value> operands{factor};
+    if (stride)
+      operands.push_back(stride);
+    OpBuilder sb(ctx);
+    setInsertionPointAfterLatestDef(sb, dom, operands, anchor);
+    auto i64Ty = TileType::get(ctx, {}, sb.getI64Type());
+    auto mulTy = TileType::get(ctx, {}, sb.getIntegerType(mulWidth));
+    auto toMulWidth = [&](Value v) -> Value {
+      if (v.getType() == mulTy)
+        return v;
+      return ExtIOp::create(sb, loc, mulTy, v, Signedness::Signed);
+    };
+    Value offset = toMulWidth(factor);
+    if (stride)
+      offset = MulIOp::create(sb, loc, offset, toMulWidth(stride));
+    if (scale != 1) {
+      auto attr = DenseElementsAttr::get(mulTy, APInt(mulWidth, scale));
+      Value scaleCst = ConstantOp::create(sb, loc, mulTy,
+                                          cast<DenseTypedElementsAttr>(attr));
+      offset = MulIOp::create(sb, loc, offset, scaleCst);
+    }
+    if (mulWidth != 64)
+      offset = ExtIOp::create(sb, loc, i64Ty, offset, Signedness::Signed);
+    return offset;
+  };
+
   // 1) Compute per-dim partition indices by stripping the `tileSize * idx`
   //    multiplication out of the `start` scalar.  Bail early when this fails
   //    (the rewrite would otherwise lose information about the alignment of
@@ -1360,6 +1406,16 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
     bool isLoopAdvancingDim = access.loop && !di.start;
 
     if (!di.start && !isLoopAdvancingDim) {
+      indices.push_back(buildZeroI32(b, loc));
+      continue;
+    }
+
+    bool bounded = di.size || di.staticSize;
+    int64_t staticStride = di.staticStride.value_or(1);
+    if (di.start && !bounded) {
+      out.baseShifts.push_back(
+          buildElementOffset(di.start, staticStride, di.stride,
+                   di.strideMulWidth ? di.strideMulWidth : 32));
       indices.push_back(buildZeroI32(b, loc));
       continue;
     }
@@ -1392,6 +1448,13 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
 
       // The partition index for this dim is just loopIdx (induction var).
       Value loopIdx = access.loop->inductionVar;
+      if (!bounded) {
+        out.baseShifts.push_back(
+          buildElementOffset(loopIdx, di.tileSize * staticStride, di.stride,
+                     di.strideMulWidth ? di.strideMulWidth : 32));
+        indices.push_back(buildZeroI32(b, loc));
+        continue;
+      }
       if (baseIdx) {
         baseIdx = AddIOp::create(b, loc, baseIdx, loopIdx);
       } else {
@@ -1409,9 +1472,9 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
   //        `K - loopIdx*tileSize`; recover the absolute `K` from it.
   //      * unmasked -- the source loads it unconditionally.  This is only sound
   //        when the entire mask was understood (`maskFullyRecognized`), so that
-  //        the dimension is *provably* unbounded; we then give it a static,
-  //        tile-sized extent which the lowering turns into an unchecked
-  //        (in-bounds) access, faithfully reproducing the source.
+  //        the dimension is *provably* unbounded; the view then spans the one
+  //        tile that step 1 moved the base pointer to, which the lowering turns
+  //        into an unchecked (in-bounds) access.
   //    Layout: only the innermost dimension may be contiguous (unit stride);
   //    every outer dimension must carry an explicitly recovered stride.  This
   //    matches the canonical layout produced by the TileIR frontend.
@@ -1442,8 +1505,7 @@ static LogicalResult buildViews(OpBuilder &b, Location loc,
   }
 
   // Build the tensor-view shape/strides.  Masked dims take a dynamic extent
-  // from the recovered absolute size; unmasked dims take a static tile-sized
-  // extent (a multiple of the tile size) so the access lowers unchecked.
+  // from the recovered absolute size; unmasked dims span one tile.
   // Strides are dynamic for the outer dims and a static 1 for the contiguous
   // innermost dim.
   SmallVector<int64_t> shape(rank, TensorViewType::kDynamic);
@@ -1644,10 +1706,16 @@ static LogicalResult lowerAccess(OpBuilder &b, Location loc, Value ptr,
   access.base = base;
 
   BuiltViews bv;
-  if (failed(buildViews(b, loc, access, elemTy, padding, bv))) {
+  if (failed(
+          buildViews(b, loc, access, elemTy, padding, fwd.dom, anchor, bv))) {
     if (failureReason)
       *failureReason = "view shape or partition index recovery";
     return failure();
+  }
+  for (Value shift : bv.baseShifts) {
+    OpBuilder sb(b.getContext());
+    setInsertionPointAfterLatestDef(sb, fwd.dom, {base, shift}, anchor);
+    base = OffsetOp::create(sb, loc, base.getType(), base, shift).getResult();
   }
 
   // Forward any `assume` metadata the source attached to the operands we reuse
@@ -1684,10 +1752,8 @@ static LogicalResult rewriteLoad(LoadPtrTkoOp op, AssumeForwarder &fwd) {
   Type elemTy = resultTy.getElementType();
   ArrayRef<int64_t> tileShape = resultTy.getShape();
 
-  // The pass requires a mask so that we can recover the per-dim global sizes.
-  // Rank-0 (scalar) loads carry no per-dim information and are lowered
-  // directly by --convert-tileir-to-mlir, so we silently skip them here
-  // rather than emitting a misleading remark.
+  // The mask provides the global sizes. Scalar loads have none and are lowered
+  // directly by --convert-tileir-to-mlir, so they are skipped without a remark.
   if (!op.getMask()) {
     if (!tileShape.empty())
       op.emitRemark("tileir-ptr-to-view: load has no mask; skipping");
@@ -1716,11 +1782,8 @@ static LogicalResult rewriteLoad(LoadPtrTkoOp op, AssumeForwarder &fwd) {
     return failure();
   }
 
-  // Preserve the source ordering/scope rather than forcing `weak`: silently
-  // weakening acquire/release (or dropping the scope) would change the
-  // program's memory semantics.  load_view_tko accepts the same ordering
-  // variants as load_ptr_tko, so this stays type-valid; an ordering the final
-  // conversion cannot model is then rejected there rather than miscompiled.
+  // Keep the ordering and scope: --convert-tileir-to-mlir rejects those it
+  // cannot lower, whereas forcing `weak` here would silently weaken them.
   auto newOp = LoadViewTkoOp::create(
       b, loc, resultTy, op.getResultToken().getType(),
       op.getMemoryOrderingSemanticsAttr(), op.getMemoryScopeAttr(), view,
@@ -1738,9 +1801,7 @@ static LogicalResult rewriteStore(StorePtrTkoOp op, AssumeForwarder &fwd) {
   Type elemTy = valueTy.getElementType();
   ArrayRef<int64_t> tileShape = valueTy.getShape();
 
-  // Same rationale as in rewriteLoad: scalar (rank-0) stores are handled by
-  // the direct --convert-tileir-to-mlir pattern; only emit the remark for
-  // higher-rank stores that genuinely need a mask.
+  // As for loads, scalar stores are skipped without a remark.
   if (!op.getMask()) {
     if (!tileShape.empty())
       op.emitRemark("tileir-ptr-to-view: store has no mask; skipping");
@@ -1748,9 +1809,8 @@ static LogicalResult rewriteStore(StorePtrTkoOp op, AssumeForwarder &fwd) {
   }
 
   OpBuilder b(op);
-  // Stores mask out-of-bounds elements, so the padding value is never observed;
-  // we use `zero` to match the canonical partition view emitted by the TileIR
-  // frontend.
+  // Stores skip out-of-bounds elements, so the padding is never observed;
+  // `zero` matches the partition views of the TileIR frontend.
   PaddingValueAttr padding =
       PaddingValueAttr::get(op.getContext(), PaddingValue::zero);
   Value view;
@@ -1765,9 +1825,7 @@ static LogicalResult rewriteStore(StorePtrTkoOp op, AssumeForwarder &fwd) {
     return failure();
   }
 
-  // Preserve the source ordering/scope (see rewriteLoad): store_view_tko
-  // accepts the same ordering variants as store_ptr_tko, so forwarding keeps
-  // the memory semantics intact rather than silently weakening them.
+  // Keep the ordering and scope, as for loads.
   auto newOp = StoreViewTkoOp::create(
       b, loc, op.getResultToken().getType(),
       op.getMemoryOrderingSemanticsAttr(), op.getMemoryScopeAttr(),
@@ -1946,9 +2004,8 @@ struct TileIRPtrToViewPass
           ForOp::create(builder, forOp.getLoc(), forOp.getLowerBound(),
                         forOp.getUpperBound(), forOp.getStep(), newInits,
                         /*bodyBuilder=*/nullptr, forOp.getUnsignedCmp());
-      // Preserve discardable attributes (e.g. `tir-dropped-*`) that the rebuilt
-      // loop would otherwise lose.  `unsignedCmp` is an inherent attribute and
-      // is carried by the builder argument above.
+      // Keep the discardable attributes of the loop; `unsignedCmp` is passed to
+      // the builder above.
       newFor->setDiscardableAttrs(forOp->getDiscardableAttrDictionary());
 
       // Map old block args → new block args.

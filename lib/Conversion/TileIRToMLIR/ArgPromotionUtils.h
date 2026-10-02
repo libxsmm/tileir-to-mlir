@@ -13,8 +13,6 @@
 #ifndef TILEIRTOMLIR_ARGPROMOTIONUTILS_H
 #define TILEIRTOMLIR_ARGPROMOTIONUTILS_H
 
-#include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 
@@ -23,17 +21,9 @@
 namespace mlir {
 namespace tileir {
 
-/// Returns `true` when `ofr` is a statically-known zero offset.
-inline bool isStaticZero(OpFoldResult ofr) {
-  auto attr = dyn_cast<Attribute>(ofr);
-  auto intAttr = attr ? dyn_cast<IntegerAttr>(attr) : nullptr;
-  return intAttr && intAttr.getValue().isZero();
-}
-
-/// Returns `true` iff changing `func`'s signature is safe, i.e. the function is
-/// not referenced (called / launched) from within its nearest
-/// symbol table. A non-`SymbolOpInterface` or an unresolved use set is treated
-/// conservatively as "unsafe".
+/// Whether the signature of `func` can change without breaking a symbol use:
+/// `func` is a symbol without uses in its nearest symbol table. Uses outside
+/// that table, e.g. launches from host code, are not checked.
 inline bool signatureChangeIsSafe(FunctionOpInterface func) {
   auto symbol = dyn_cast<SymbolOpInterface>(func.getOperation());
   if (!symbol)

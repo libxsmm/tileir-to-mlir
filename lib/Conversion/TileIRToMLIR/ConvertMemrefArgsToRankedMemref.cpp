@@ -5,21 +5,28 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Promotes unranked memref function arguments to ranked memrefs when the
-// function body immediately reinterprets those arguments with a fixed ranked
-// layout and forwards scalar shape/stride arguments into the cast.
+// Promotes unranked memref arguments of functions to ranked memrefs.
 //
-// This pass is intended to run after --convert-tileir-to-mlir.
+// --convert-tileir-to-mlir accesses pointer arguments through
+// reinterpret_casts, whose dynamic sizes and strides are often further scalar
+// arguments. If all uses of a pointer argument are the same reinterpret_cast at
+// offset 0, with a layout that is fixed per call, the argument takes the type
+// of the cast and replaces it. The scalar arguments that the cast uses as sizes
+// or strides are recomputed from the memref with memref.dim and
+// memref.extract_strided_metadata, and unused arguments are removed as the
+// `remove-unused` option selects. Callers must pass the promoted argument with
+// the sizes and strides the cast computed.
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Conversion/TileIRToMLIR/ConvertMemrefArgsToRankedMemref.h"
+#include "mlir/Conversion/TileIRToMLIR/Passes.h"
 
 #include "ArgPromotionUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/SymbolTable.h"
@@ -43,12 +50,10 @@ using namespace mlir;
 
 namespace {
 
-using tileir::isStaticZero;
 using tileir::signatureChangeIsSafe;
 
-/// Returns true when `lhs` and `rhs` are identical reinterpret_casts for this
-/// transform: same result type and identical mixed offset/size/stride
-/// operands. Callers guarantee both share the same source argument.
+/// Whether the reinterpret_casts `lhs` and `rhs` of the same source yield the
+/// same memref.
 static bool sameReinterpretCast(memref::ReinterpretCastOp lhs,
                                 memref::ReinterpretCastOp rhs) {
   if (lhs.getType() != rhs.getType())
@@ -58,6 +63,8 @@ static bool sameReinterpretCast(memref::ReinterpretCastOp lhs,
          llvm::equal(lhs.getMixedStrides(), rhs.getMixedStrides());
 }
 
+/// The promotion of argument `argIndex` to `rankedType`, the type of its uses
+/// `casts`, which all equal `canonicalCast`.
 struct PtrPromotionPlan {
   unsigned argIndex = 0;
   MemRefType rankedType;
@@ -65,10 +72,22 @@ struct PtrPromotionPlan {
   memref::ReinterpretCastOp canonicalCast;
 };
 
-/// If `arg` is unranked and all of its uses are identical reinterpret_casts to
-/// a ranked memref with a static-zero offset, fills `plan` and returns true.
-/// A non-zero offset cannot be represented by handing back the bare argument,
-/// so such casts are left untouched.
+/// Whether `value` is the same wherever the function with entry block `entry`
+/// computes it: a value of the entry block, or computed from such values by
+/// pure ops.
+static bool isFixedPerCall(Value value, Block &entry) {
+  if (value.getParentBlock() == &entry)
+    return true;
+  Operation *def = value.getDefiningOp();
+  return def && isPure(def) && def->getNumRegions() == 0 &&
+         llvm::all_of(def->getOperands(), [&](Value operand) {
+           return isFixedPerCall(operand, entry);
+         });
+}
+
+/// Plan the promotion of `arg` if it is an unranked memref whose uses are all
+/// the same reinterpret_cast. The argument replaces the casts, so they must not
+/// offset it, and their layout must be the same in every execution.
 static bool collectPtrPromotionPlan(BlockArgument arg, PtrPromotionPlan &plan) {
   auto unranked = dyn_cast<UnrankedMemRefType>(arg.getType());
   if (!unranked || arg.use_empty())
@@ -86,7 +105,11 @@ static bool collectPtrPromotionPlan(BlockArgument arg, PtrPromotionPlan &plan) {
     if (!castTy || castTy.getElementType() != unranked.getElementType())
       return false;
     SmallVector<OpFoldResult> offsets = rc.getMixedOffsets();
-    if (offsets.size() != 1 || !isStaticZero(offsets[0]))
+    if (offsets.size() != 1 || !isZeroInteger(offsets[0]))
+      return false;
+    if (!llvm::all_of(rc->getOperands().drop_front(), [&](Value operand) {
+          return isFixedPerCall(operand, *arg.getOwner());
+        }))
       return false;
 
     if (!canonical) {
@@ -113,6 +136,8 @@ enum class ScalarKind {
   Stride,
 };
 
+/// How to recompute a scalar argument: as the size (Dim) or stride of
+/// dimension `dim` of the promoted argument `memrefArgIndex`.
 struct ScalarRecipe {
   unsigned memrefArgIndex = 0;
   ScalarKind kind = ScalarKind::Dim;
@@ -136,8 +161,7 @@ static std::optional<unsigned> getScalarArgIndex(Value v) {
   return std::nullopt;
 }
 
-/// Build a replacement index value from `recipe` using the promoted ranked
-/// memref argument.
+/// Build the value of `recipe` from the promoted argument `rankedArg`.
 static Value buildIndexFromRecipe(OpBuilder &builder, Location loc,
                                   BlockArgument rankedArg,
                                   const ScalarRecipe &recipe) {
@@ -160,7 +184,7 @@ static Value castIndexToType(OpBuilder &builder, Location loc, Value indexVal,
   return {};
 }
 
-/// Erase operations that became trivially dead after cast rewrites.
+/// Erase the operations of `worklist` and their operands that are dead.
 static void eraseTriviallyDead(SmallVectorImpl<Operation *> &worklist) {
   llvm::SmallPtrSet<Operation *, 16> seen;
   SmallVector<Operation *> deduplicatedWorklist;
@@ -180,6 +204,9 @@ static void eraseTriviallyDead(SmallVectorImpl<Operation *> &worklist) {
   }
 }
 
+/// Promote the eligible pointer arguments of `func`, recompute the scalar
+/// arguments that their casts use, and remove unused arguments as
+/// `removeUnused` selects. Returns whether `func` changed.
 static bool promoteOneFunction(FunctionOpInterface func,
                                MemrefArgRemovalMode removeUnused) {
   if (func.getFunctionBody().empty() || !signatureChangeIsSafe(func))
@@ -196,6 +223,8 @@ static bool promoteOneFunction(FunctionOpInterface func,
   if (ptrPlans.empty())
     return false;
 
+  // The scalar arguments that the casts use as sizes or strides. One that is
+  // used as different sizes or strides is not recomputed.
   llvm::MapVector<unsigned, ScalarRecipe> scalarRecipes;
   llvm::SmallSet<unsigned, 8> conflictingScalarArgs;
 
@@ -226,6 +255,7 @@ static bool promoteOneFunction(FunctionOpInterface func,
 
   SmallVector<Operation *> maybeDead;
 
+  // The promoted arguments replace their casts.
   for (const PtrPromotionPlan &plan : ptrPlans) {
     BlockArgument arg = func.getArgument(plan.argIndex);
     arg.setType(plan.rankedType);
@@ -249,6 +279,8 @@ static bool promoteOneFunction(FunctionOpInterface func,
 
   llvm::BitVector argsToErase(func.getNumArguments());
   llvm::BitVector memrefDependentArgs(func.getNumArguments());
+  // The arguments that follow a promoted rank-N memref in the calling
+  // convention `(memref, size_0, ..., size_N-1, stride_0, ..., stride_N-1)`.
   llvm::BitVector assumedMemrefDependentArgs(func.getNumArguments());
 
   for (const PtrPromotionPlan &plan : ptrPlans) {
@@ -262,6 +294,7 @@ static bool promoteOneFunction(FunctionOpInterface func,
       assumedMemrefDependentArgs.set(argIdx);
   }
 
+  // Recompute the scalar arguments from the promoted memrefs.
   for (auto [argIdx, recipe] : scalarRecipes) {
     memrefDependentArgs.set(argIdx);
     if (conflictingScalarArgs.contains(argIdx))

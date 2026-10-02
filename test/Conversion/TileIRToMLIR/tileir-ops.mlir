@@ -74,6 +74,29 @@ cuda_tile.module @ops_module {
     return
   }
 
+  // An alloca lives until the end of its cuda_tile.for iteration, so the lowered
+  // loop body is wrapped in an allocation scope.
+  // CHECK-LABEL: gpu.func @test_alloca_in_loop
+  entry @test_alloca_in_loop() {
+    %lb = constant <i32: 0> : tile<i32>
+    %ub = constant <i32: 8> : tile<i32>
+    %st = constant <i32: 1> : tile<i32>
+    %init = constant <f32: 0.0> : tile<f32>
+    // CHECK: scf.for {{.*}} -> (f32) {
+    // CHECK-NEXT: %[[SCOPED:.*]] = memref.alloca_scope -> (f32) {
+    // CHECK: memref.alloca() alignment = 16 : memref<256xf32>
+    // CHECK: memref.alloca_scope.return %{{.*}} : f32
+    // CHECK-NEXT: }
+    // CHECK-NEXT: scf.yield %[[SCOPED]] : f32
+    %res = for %iv in (%lb to %ub, step %st) : tile<i32>
+        iter_values(%acc = %init) -> (tile<f32>) {
+      %p = alloca num_elem = 256, alignment = 16 : tile<ptr<f32>>
+      %next = addf %acc, %acc : tile<f32>
+      continue %next : tile<f32>
+    }
+    return
+  }
+
   // --- atan2 ---
   // CHECK-LABEL: gpu.func @test_atan2
   entry @test_atan2() {
@@ -151,6 +174,8 @@ cuda_tile.module @ops_module {
     %in = constant <f32: [0.0, 1.0, 2.0, 3.0]> : tile<4xf32>
     // CHECK: %[[EXP_RES:.*]] = math.exp %[[EXP_IN]] : vector<4xf32>
     %res = exp %in : tile<4xf32>
+    // CHECK: math.exp %[[EXP_IN]] fastmath<afn> : vector<4xf32>
+    %res_approx = exp %in rounding<approx> : tile<4xf32>
     return
   }
 
@@ -296,7 +321,9 @@ cuda_tile.module @ops_module {
     %rhs0 = constant <i8: 0> : tile<8x2xi8>
     // CHECK: %[[MMAI_ACC0:.*]] = arith.constant dense<0> : vector<4x2xi32>
     %acc0 = constant <i32: 0> : tile<4x2xi32>
-    // CHECK: %[[MMAI_R0:.*]] = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %[[MMAI_LHS0]], %[[MMAI_RHS0]], %[[MMAI_ACC0]] {"tir-dropped-signedness-lhs" = "signed", "tir-dropped-signedness-rhs" = "signed"} : vector<4x8xi8>, vector<8x2xi8> into vector<4x2xi32>
+    // CHECK: %[[MMAI_LHS0_EXT:.*]] = arith.extsi %[[MMAI_LHS0]] : vector<4x8xi8> to vector<4x8xi32>
+    // CHECK: %[[MMAI_RHS0_EXT:.*]] = arith.extsi %[[MMAI_RHS0]] : vector<8x2xi8> to vector<8x2xi32>
+    // CHECK: %[[MMAI_R0:.*]] = vector.contract {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %[[MMAI_LHS0_EXT]], %[[MMAI_RHS0_EXT]], %[[MMAI_ACC0]] : vector<4x8xi32>, vector<8x2xi32> into vector<4x2xi32>
     %0 = mmai %lhs0, %rhs0, %acc0 signed signed : tile<4x8xi8>, tile<8x2xi8>, tile<4x2xi32>
 
     // CHECK: %[[MMAI_LHS1:.*]] = arith.constant dense<0> : vector<2x4x8xi8>
@@ -305,8 +332,10 @@ cuda_tile.module @ops_module {
     %rhs1 = constant <i8: 0> : tile<2x8x2xi8>
     // CHECK: %[[MMAI_ACC1:.*]] = arith.constant dense<0> : vector<2x4x2xi32>
     %acc1 = constant <i32: 0> : tile<2x4x2xi32>
-    // CHECK: %[[MMAI_R1:.*]] = vector.contract {indexing_maps = [#map3, #map4, #map5], iterator_types = ["parallel", "parallel", "parallel", "reduction"], kind = #vector.kind<add>} %[[MMAI_LHS1]], %[[MMAI_RHS1]], %[[MMAI_ACC1]] {"tir-dropped-signedness-lhs" = "unsigned", "tir-dropped-signedness-rhs" = "unsigned"} : vector<2x4x8xi8>, vector<2x8x2xi8> into vector<2x4x2xi32>
-    %1 = mmai %lhs1, %rhs1, %acc1 unsigned unsigned : tile<2x4x8xi8>, tile<2x8x2xi8>, tile<2x4x2xi32>
+    // CHECK: %[[MMAI_LHS1_EXT:.*]] = arith.extui %[[MMAI_LHS1]] : vector<2x4x8xi8> to vector<2x4x8xi32>
+    // CHECK: %[[MMAI_RHS1_EXT:.*]] = arith.extsi %[[MMAI_RHS1]] : vector<2x8x2xi8> to vector<2x8x2xi32>
+    // CHECK: %[[MMAI_R1:.*]] = vector.contract {indexing_maps = [#map3, #map4, #map5], iterator_types = ["parallel", "parallel", "parallel", "reduction"], kind = #vector.kind<add>} %[[MMAI_LHS1_EXT]], %[[MMAI_RHS1_EXT]], %[[MMAI_ACC1]] : vector<2x4x8xi32>, vector<2x8x2xi32> into vector<2x4x2xi32>
+    %1 = mmai %lhs1, %rhs1, %acc1 unsigned signed : tile<2x4x8xi8>, tile<2x8x2xi8>, tile<2x4x2xi32>
     return
   }
 
@@ -392,7 +421,7 @@ cuda_tile.module @ops_module {
   entry @test_tanh() {
     // CHECK: %[[TANH_IN:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
     %in = constant <f32: [0.0, 1.0, 2.0, 3.0]> : tile<4xf32>
-    // CHECK: %[[TANH_R:.*]] = math.tanh %[[TANH_IN]] {"tir-dropped-rounding" = "full"} : vector<4xf32>
+    // CHECK: %[[TANH_R:.*]] = math.tanh %[[TANH_IN]] : vector<4xf32>
     %res0 = tanh %in : tile<4xf32>
     return
   }
@@ -460,7 +489,8 @@ cuda_tile.module @ops_module {
     // CHECK: %[[FOR_UBI:.*]] = arith.index_cast %[[FOR_UB]] : i32 to index
     // CHECK: %[[FOR_STEPI:.*]] = arith.index_cast %[[FOR_STEP]] : i32 to index
     // CHECK: scf.for %[[FOR_IV:.*]] = %[[FOR_LBI]] to %[[FOR_UBI]] step %[[FOR_STEPI]] {
-    // CHECK:   arith.index_cast %[[FOR_IV]] : index to i32
+    // CHECK-NOT: arith.index_cast
+    // CHECK: }
     for %iv in (%lowerBound to %upperBound, step %step) : tile<i32> {
         continue
     }

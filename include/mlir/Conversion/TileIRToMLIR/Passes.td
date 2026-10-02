@@ -20,13 +20,19 @@ def ConvertTileIRToMLIRPass : Pass<"convert-tileir-to-mlir", "ModuleOp"> {
     launch-coordinate arguments (block-id x/y/z and grid-dim x/y/z), and
     whether dim-query ops read those arguments (`true`) or lower to gpu
     dim-query ops (`false`, GPU target only). `drop-rounding-modes` forces all
-    lowering patterns for rounding-carrying ops to preserve source rounding
-    only as discardable `tir-dropped-rounding` attributes.
+    lowering patterns for floating-point rounding-carrying ops to preserve
+    source rounding only as discardable `tir-dropped-rounding` attributes; the
+    rounding of integer `divi` defines its result and is always lowered exactly.
     `assume-in-bounds` forces all generated vector.transfer_read and
     vector.transfer_write ops to carry fully in-bounds flags.
     `known-block-size`, when given three values, sets the `known_block_size`
     attribute (x, y, z) on the generated `gpu.func` ops; when omitted the
     attribute is not set.
+
+    Scalar pointers become unranked memrefs (`memref<*xT>`). Pointer arguments
+    of the lowered entry functions are bare pointers: callers must pass
+    descriptors whose offset is zero, as the bare-pointer calling convention
+    of `convert-memref-args-to-ptr-args` does.
   }];
   let dependentDialects = [
     "cuda_tile::CudaTileDialect",
@@ -73,6 +79,9 @@ def ConvertMemrefArgsToPtrArgsPass : Pass<"convert-memref-args-to-ptr-args", "Mo
     element type. Matching casts need not have the same rank or layout. Each is
     replaced independently by a memref descriptor materialized from the pointer
     and wrapped in an `unrealized_conversion_cast` to its original ranked type.
+    The pointer carries no sizes or strides: a `memref.cast` must have static
+    strides, and its dynamic sizes become 0. Casts to memref types without an
+    LLVM descriptor, e.g. of `tf32`, are not supported.
 
     The rewrite is conservative. An argument is promoted only when:
       * it is an unranked-memref argument,
@@ -98,8 +107,10 @@ def ConvertMemrefArgsToRankedMemrefPass : Pass<"convert-memref-args-to-ranked-me
 
     For each unranked memref argument (`memref<*xT>`), the pass matches the
     canonical pattern where every use is an identical, zero-offset
-    `memref.reinterpret_cast` to the same ranked result type. The argument type
-    is updated to that ranked memref type and the redundant casts are erased.
+    `memref.reinterpret_cast` to the same ranked result type, whose sizes and
+    strides are fixed per call: values of the entry block, or computed from
+    them by pure ops. The argument type is updated to that ranked memref type
+    and the redundant casts are erased.
 
     Scalar arguments that were originally used to materialize the matched
     cast's dynamic sizes/strides are rewritten to equivalent memref queries

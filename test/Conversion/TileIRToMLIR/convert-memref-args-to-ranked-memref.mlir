@@ -60,3 +60,21 @@ module attributes {gpu.container_module} {
     }
   }
 }
+
+// A cast inside a loop is promoted when its layout is fixed per call, here
+// computed in the loop from a function argument.
+// CHECK-LABEL: func.func private @cast_in_loop(
+// CHECK-SAME: %[[A:[^:]+]]: memref<?xf32, strided<[1]>>, %{{[^:]+}}: index)
+// CHECK-NOT: memref.reinterpret_cast
+// CHECK: vector.transfer_read %[[A]]
+func.func private @cast_in_loop(%arg0: memref<*xf32>, %arg1: i32, %k: index) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %cst = arith.constant 0.0 : f32
+  scf.for %i = %c0 to %k step %c1 {
+    %n = arith.index_cast %arg1 : i32 to index
+    %rc = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%n], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1]>>
+    %v = vector.transfer_read %rc[%i], %cst : memref<?xf32, strided<[1]>>, vector<4xf32>
+  }
+  return
+}

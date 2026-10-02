@@ -150,11 +150,60 @@ cuda_tile.module @m {
     // CHECK: arith.index_cast {{.*}} : i32 to index
     // CHECK: arith.index_cast {{.*}} : i32 to index
     // CHECK: scf.for
-    // CHECK: arith.index_cast {{.*}} : index to i32
+    // CHECK-NOT: arith.index_cast
     // CHECK: scf.yield
     %res = for %iv in (%lb to %ub, step %st) : tile<i32>
       iter_values(%acc = %init) -> (tile<2x2xf32>) {
       continue %acc : tile<2x2xf32>
+    }
+  }
+
+  // --- unsigned for ---
+  // CHECK-LABEL: gpu.func @test_for_unsigned
+  entry @test_for_unsigned() {
+    %lb = constant <i32: 0> : tile<i32>
+    %ub = constant <i32: 0x80000000> : tile<i32>
+    %st = constant <i32: 1> : tile<i32>
+    // CHECK: %[[ULB:.*]] = arith.index_castui %{{.*}} : i32 to index
+    // CHECK: %[[UUB:.*]] = arith.index_castui %{{.*}} : i32 to index
+    // CHECK: %[[UST:.*]] = arith.index_castui %{{.*}} : i32 to index
+    // CHECK: scf.for unsigned %{{.*}} = %[[ULB]] to %[[UUB]] step %[[UST]] {
+    // CHECK-NOT: tir-dropped-unsigned-cmp
+    for unsigned %iv in (%lb to %ub, step %st) : tile<i32> {
+      continue
+    }
+  }
+
+  // --- loop counters as view indices ---
+  // A view index that is a loop counter uses the `index` counter directly; a
+  // negative counter would be outside the index space. Other uses of the
+  // counter keep its i32 cast.
+  // CHECK-LABEL: gpu.func @test_for_counter_view_index
+  entry @test_for_counter_view_index(%p: tile<ptr<f32>>, %n: tile<i32>) {
+    %c0 = constant <i32: 0> : tile<i32>
+    %c1 = constant <i32: 1> : tile<i32>
+    %tv = make_tensor_view %p, shape = [%n, 4], strides = [4, 1] : tile<i32> -> tensor_view<?x4xf32, strides=[4,1]>
+    %pv = make_partition_view %tv : partition_view<tile=(1x4), tensor_view<?x4xf32, strides=[4,1]>>
+    // CHECK: scf.for %[[IV:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
+    // CHECK:   %[[IV32:.*]] = arith.index_cast %[[IV]] : index to i32
+    // CHECK-NOT: arith.index_castui %[[IV32]]
+    // CHECK:   %[[ROW:.*]] = arith.muli %[[IV]], %{{.*}} overflow<nsw> : index
+    // CHECK:   vector.transfer_read %{{.*}}[%[[ROW]], %{{.*}}]
+    // CHECK:   %[[NEXT:.*]] = arith.addi %[[IV32]], %{{.*}} : i32
+    // CHECK:   arith.index_castui %[[NEXT]] : i32 to index
+    for %iv in (%c0 to %n, step %c1) : tile<i32> {
+      %t, %tok = load_view_tko weak %pv[%iv, %c0] : partition_view<tile=(1x4), tensor_view<?x4xf32, strides=[4,1]>>, tile<i32> -> tile<1x4xf32>, !cuda_tile.token
+      %next = addi %iv, %c1 : tile<i32>
+      %t2, %tok2 = load_view_tko weak %pv[%next, %c0] : partition_view<tile=(1x4), tensor_view<?x4xf32, strides=[4,1]>>, tile<i32> -> tile<1x4xf32>, !cuda_tile.token
+      continue
+    }
+    // CHECK: scf.for unsigned %[[UIV:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
+    // CHECK-NOT: arith.index_cast
+    // CHECK:   %[[UROW:.*]] = arith.muli %[[UIV]], %{{.*}} overflow<nsw> : index
+    // CHECK:   vector.transfer_read %{{.*}}[%[[UROW]], %{{.*}}]
+    for unsigned %iv in (%c0 to %n, step %c1) : tile<i32> {
+      %t, %tok = load_view_tko weak %pv[%iv, %c0] : partition_view<tile=(1x4), tensor_view<?x4xf32, strides=[4,1]>>, tile<i32> -> tile<1x4xf32>, !cuda_tile.token
+      continue
     }
   }
 
@@ -611,8 +660,11 @@ cuda_tile.module @m {
     %x = constant <f32: 1.25> : tile<4xf32>
     // CHECK: %[[FTOF_TR:.*]] = arith.truncf %[[FTOF_IN]] to_nearest_even : vector<4xf32> to vector<4xf16>
     %tr = ftof %x rounding<nearest_even> : tile<4xf32> -> tile<4xf16>
-    // CHECK: %[[FTOF_EX:.*]] = arith.extf %[[FTOF_TR]] {{.*}}tir-dropped-rounding{{.*}} : vector<4xf16> to vector<4xf64>
+    // CHECK: %[[FTOF_EX:.*]] = arith.extf %[[FTOF_TR]] : vector<4xf16> to vector<4xf64>
     %ex = ftof %tr rounding<nearest_even> : tile<4xf16> -> tile<4xf64>
+    // Formats of the same width convert with arith.convertf.
+    // CHECK: arith.convertf %[[FTOF_TR]] to_nearest_even : vector<4xf16> to vector<4xbf16>
+    %cv = ftof %tr rounding<nearest_even> : tile<4xf16> -> tile<4xbf16>
     return
   }
 
@@ -740,7 +792,7 @@ cuda_tile.module @m {
   entry @test_sqrt() {
     // CHECK: %[[SQRT_IN:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
     %in = constant <f32: [1.0, 4.0, 9.0, 16.0]> : tile<4xf32>
-    // CHECK: %[[SQRT_R:.*]] = math.sqrt %[[SQRT_IN]] {"tir-dropped-rounding" = "nearest_even"} : vector<4xf32>
+    // CHECK: %[[SQRT_R:.*]] = math.sqrt %[[SQRT_IN]] : vector<4xf32>
     %res = sqrt %in : tile<4xf32>
     return
   }
@@ -750,7 +802,7 @@ cuda_tile.module @m {
     entry @test_sqrt_approx_ftz() {
       // CHECK: %[[SQRTA_IN:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
       %in = constant <f32: [1.0, 4.0, 9.0, 16.0]> : tile<4xf32>
-      // CHECK: %[[SQRTA_R:.*]] = math.sqrt %[[SQRTA_IN]] fastmath<afn> {"tir-dropped-flush-to-zero", "tir-dropped-rounding" = "approx"} : vector<4xf32>
+      // CHECK: %[[SQRTA_R:.*]] = math.sqrt %[[SQRTA_IN]] fastmath<afn> {"tir-dropped-flush-to-zero"} : vector<4xf32>
       %res = sqrt %in rounding<approx> flush_to_zero : tile<4xf32>
       return
     }
@@ -838,6 +890,12 @@ cuda_tile.module @m {
     %s = divi %lhs, %rhs signed : tile<4xi32>
     // CHECK: %[[DIVI_U:.*]] = arith.divui %[[DIVI_LHS]], %[[DIVI_RHS]] : vector<4xi32>
     %u = divi %lhs, %rhs unsigned : tile<4xi32>
+    // CHECK: arith.ceildivsi %[[DIVI_LHS]], %[[DIVI_RHS]] : vector<4xi32>
+    %sc = divi %lhs, %rhs signed rounding<positive_inf> : tile<4xi32>
+    // CHECK: arith.floordivsi %[[DIVI_LHS]], %[[DIVI_RHS]] : vector<4xi32>
+    %sf = divi %lhs, %rhs signed rounding<negative_inf> : tile<4xi32>
+    // CHECK: arith.ceildivui %[[DIVI_LHS]], %[[DIVI_RHS]] : vector<4xi32>
+    %uc = divi %lhs, %rhs unsigned rounding<positive_inf> : tile<4xi32>
     return
   }
 
@@ -879,8 +937,8 @@ cuda_tile.module @m {
     // Unspecified rounding defaults to nearest_even.
     // CHECK: %[[ADDF_R:.*]] = arith.addf %[[ADDF_LHS]], %[[ADDF_RHS]] : vector<4xf32>
     %result = addf %lhs, %rhs : tile<4xf32>
-    // Explicit rounding<zero> is not representable here; preserve it.
-    // CHECK: %[[ADDF_RZ:.*]] = arith.addf %[[ADDF_LHS]], %[[ADDF_RHS]] {"tir-dropped-rounding" = "zero"} : vector<4xf32>
+    // Explicit rounding<zero> maps to the arith rounding mode.
+    // CHECK: %[[ADDF_RZ:.*]] = arith.addf %[[ADDF_LHS]], %[[ADDF_RHS]] toward_zero : vector<4xf32>
     %result_z = addf %lhs, %rhs rounding<zero> : tile<4xf32>
     return
   }
@@ -894,8 +952,8 @@ cuda_tile.module @m {
     %rhs = constant <f32: [1.0, 2.0, 3.0, 4.0]> : tile<4xf32>
     // CHECK: %[[SUBF_R:.*]] = arith.subf %[[SUBF_LHS]], %[[SUBF_RHS]] : vector<4xf32>
     %result = subf %lhs, %rhs : tile<4xf32>
-    // Explicit rounding<negative_inf> is not representable here; preserve it.
-    // CHECK: %[[SUBF_RN:.*]] = arith.subf %[[SUBF_LHS]], %[[SUBF_RHS]] {"tir-dropped-rounding" = "negative_inf"} : vector<4xf32>
+    // Explicit rounding<negative_inf> maps to the arith rounding mode.
+    // CHECK: %[[SUBF_RN:.*]] = arith.subf %[[SUBF_LHS]], %[[SUBF_RHS]] downward : vector<4xf32>
     %result_n = subf %lhs, %rhs rounding<negative_inf> : tile<4xf32>
     return
   }
@@ -909,8 +967,8 @@ cuda_tile.module @m {
     %rhs = constant <f32: [2.0, 3.0, 4.0, 5.0]> : tile<4xf32>
     // CHECK: %[[MULF_R:.*]] = arith.mulf %[[MULF_LHS]], %[[MULF_RHS]] : vector<4xf32>
     %result = mulf %lhs, %rhs : tile<4xf32>
-    // Explicit rounding<positive_inf> is not representable here; preserve it.
-    // CHECK: %[[MULF_RP:.*]] = arith.mulf %[[MULF_LHS]], %[[MULF_RHS]] {"tir-dropped-rounding" = "positive_inf"} : vector<4xf32>
+    // Explicit rounding<positive_inf> maps to the arith rounding mode.
+    // CHECK: %[[MULF_RP:.*]] = arith.mulf %[[MULF_LHS]], %[[MULF_RHS]] upward : vector<4xf32>
     %result_p = mulf %lhs, %rhs rounding<positive_inf> : tile<4xf32>
     return
   }
@@ -939,7 +997,7 @@ cuda_tile.module @m {
     %rhs = constant <f32: [2.0, 3.0, 4.0, 5.0]> : tile<4xf32>
     // CHECK: %[[FMA_ACC:.*]] = arith.constant dense<{{.*}}> : vector<4xf32>
     %acc = constant <f32: [0.5, 0.5, 0.5, 0.5]> : tile<4xf32>
-    // CHECK: %[[FMA_R:.*]] = math.fma %[[FMA_LHS]], %[[FMA_RHS]], %[[FMA_ACC]] {"tir-dropped-rounding" = "nearest_even"} : vector<4xf32>
+    // CHECK: %[[FMA_R:.*]] = math.fma %[[FMA_LHS]], %[[FMA_RHS]], %[[FMA_ACC]] : vector<4xf32>
     %result = fma %lhs, %rhs, %acc : tile<4xf32>
     return
   }
@@ -991,7 +1049,7 @@ cuda_tile.module @m {
     %f = constant <f32: 4.0> : tile<f32>
     // CHECK: %[[SM_I:.*]] = arith.constant -3 : i32
     %i = constant <i32: -3> : tile<i32>
-    // CHECK: %[[SM_SQRT:.*]] = math.sqrt %[[SM_F]] {"tir-dropped-rounding" = "nearest_even"} : f32
+    // CHECK: %[[SM_SQRT:.*]] = math.sqrt %[[SM_F]] : f32
     %sq = sqrt %f : tile<f32>
     // CHECK: %[[SM_ABSF:.*]] = math.absf %[[SM_F]] : f32
     %af = absf %f : tile<f32>
@@ -1041,7 +1099,7 @@ cuda_tile.module @m {
     %mul = mulf %a, %b : tile<f32>
     // CHECK: %[[SF_DIVF:.*]] = arith.divf %[[SF_A]], %[[SF_B]] : f32
     %div = divf %a, %b : tile<f32>
-    // CHECK: %[[SF_FMA:.*]] = math.fma %[[SF_A]], %[[SF_B]], %[[SF_C]] {"tir-dropped-rounding" = "nearest_even"} : f32
+    // CHECK: %[[SF_FMA:.*]] = math.fma %[[SF_A]], %[[SF_B]], %[[SF_C]] : f32
     %fm = fma %a, %b, %c : tile<f32>
     return
   }
@@ -1255,14 +1313,14 @@ cuda_tile.module @m {
     return
   }
 
-  // --- addf: non-representable rounding + flush_to_zero are preserved ---
+  // --- addf: directed rounding is mapped, flush_to_zero is preserved ---
   // CHECK-LABEL: gpu.func @test_addf_dropped_flags
   entry @test_addf_dropped_flags() {
     // CHECK-DAG: %[[DF_LHS:.*]] = arith.constant dense<1.000000e+00> : vector<4xf32>
     %lhs = constant <f32: 1.0> : tile<4xf32>
     // CHECK-DAG: %[[DF_RHS:.*]] = arith.constant dense<2.000000e+00> : vector<4xf32>
     %rhs = constant <f32: 2.0> : tile<4xf32>
-    // CHECK: arith.addf %[[DF_LHS]], %[[DF_RHS]] {"tir-dropped-flush-to-zero", "tir-dropped-rounding" = "zero"} : vector<4xf32>
+    // CHECK: arith.addf %[[DF_LHS]], %[[DF_RHS]] toward_zero {"tir-dropped-flush-to-zero"} : vector<4xf32>
     %r = addf %lhs, %rhs rounding<zero> flush_to_zero : tile<4xf32>
     return
   }
@@ -1279,14 +1337,14 @@ cuda_tile.module @m {
     return
   }
 
-  // --- divf rounding<zero>: non-representable rounding is preserved ---
+  // --- divf rounding<zero>: directed rounding is mapped ---
   // CHECK-LABEL: gpu.func @test_divf_rounding_dropped
   entry @test_divf_rounding_dropped() {
     // CHECK-DAG: %[[DR_LHS:.*]] = arith.constant dense<1.000000e+00> : vector<4xf32>
     %lhs = constant <f32: 1.0> : tile<4xf32>
     // CHECK-DAG: %[[DR_RHS:.*]] = arith.constant dense<2.000000e+00> : vector<4xf32>
     %rhs = constant <f32: 2.0> : tile<4xf32>
-    // CHECK: arith.divf %[[DR_LHS]], %[[DR_RHS]] {"tir-dropped-rounding" = "zero"} : vector<4xf32>
+    // CHECK: arith.divf %[[DR_LHS]], %[[DR_RHS]] toward_zero : vector<4xf32>
     %r = divf %lhs, %rhs rounding<zero> : tile<4xf32>
     return
   }
@@ -1320,7 +1378,7 @@ cuda_tile.module @m {
   entry @test_tanh_approx() {
     // CHECK: %[[TA_IN:.*]] = arith.constant dense<1.000000e+00> : vector<4xf32>
     %in = constant <f32: 1.0> : tile<4xf32>
-    // CHECK: math.tanh %[[TA_IN]] fastmath<afn> {"tir-dropped-rounding" = "approx"} : vector<4xf32>
+    // CHECK: math.tanh %[[TA_IN]] fastmath<afn> : vector<4xf32>
     %r = tanh %in rounding<approx> : tile<4xf32>
     return
   }
@@ -1440,7 +1498,7 @@ cuda_tile.module @m {
     // CHECK: %[[SLO_IDXIN:.*]] = arith.constant 0 : i32
     // CHECK: %[[SLO_PTR:.*]] = memref.reinterpret_cast %[[SLO_UPTR]] to offset: [0], sizes: [8], strides: [1] : memref<*xf32> to memref<8xf32, strided<[1], offset: ?>>
     // offset = index * traversal_strides[0] (= 1 here), not tile_shape.
-    // CHECK: %[[SLO_IDX:.*]] = arith.index_cast %[[SLO_IDXIN]] : i32 to index
+    // CHECK: %[[SLO_IDX:.*]] = arith.index_castui %[[SLO_IDXIN]] : i32 to index
     // CHECK: %[[SLO_C1:.*]] = arith.constant 1 : index
     // CHECK: %[[SLO_OFF:.*]] = arith.muli %[[SLO_IDX]], %[[SLO_C1]] overflow<nsw> : index
     // CHECK: %[[SLO_PAD:.*]] = ub.poison : f32
@@ -1462,7 +1520,7 @@ cuda_tile.module @m {
     // CHECK: %[[SLE_IDXIN:.*]] = arith.constant 1 : i32
     // CHECK: %[[SLE_PTR:.*]] = memref.reinterpret_cast %[[SLE_UPTR]] to offset: [0], sizes: [16], strides: [1] : memref<*xf32> to memref<16xf32, strided<[1], offset: ?>>
     // offset = index * traversal_strides[0] (= 2 here).
-    // CHECK: %[[SLE_IDX:.*]] = arith.index_cast %[[SLE_IDXIN]] : i32 to index
+    // CHECK: %[[SLE_IDX:.*]] = arith.index_castui %[[SLE_IDXIN]] : i32 to index
     // CHECK: %[[SLE_C2:.*]] = arith.constant 2 : index
     // CHECK: %[[SLE_OFF:.*]] = arith.muli %[[SLE_IDX]], %[[SLE_C2]] overflow<nsw> : index
     // Exact tiling (stride 2 == tile 2): every tile fits, so in_bounds = [true].
@@ -1485,11 +1543,11 @@ cuda_tile.module @m {
     // CHECK: %[[SLS_IDX1IN:.*]] = arith.constant 1 : i32
     // CHECK: %[[SLS_PTR:.*]] = memref.reinterpret_cast %[[SLS_UPTR]] to offset: [0], sizes: [64, 16], strides: [16, 1] : memref<*xf32> to memref<64x16xf32, strided<[16, 1], offset: ?>>
     // tile dim0 (index %c0) maps to tensor dim1 with traversal stride 4.
-    // CHECK: %[[SLS_IDX0:.*]] = arith.index_cast %[[SLS_IDX0IN]] : i32 to index
+    // CHECK: %[[SLS_IDX0:.*]] = arith.index_castui %[[SLS_IDX0IN]] : i32 to index
     // CHECK: %[[SLS_S4:.*]] = arith.constant 4 : index
     // CHECK: %[[SLS_OFF0:.*]] = arith.muli %[[SLS_IDX0]], %[[SLS_S4]] overflow<nsw> : index
     // tile dim1 (index %c1) maps to tensor dim0 with traversal stride 3.
-    // CHECK: %[[SLS_IDX1:.*]] = arith.index_cast %[[SLS_IDX1IN]] : i32 to index
+    // CHECK: %[[SLS_IDX1:.*]] = arith.index_castui %[[SLS_IDX1IN]] : i32 to index
     // CHECK: %[[SLS_S3:.*]] = arith.constant 3 : index
     // CHECK: %[[SLS_OFF1:.*]] = arith.muli %[[SLS_IDX1]], %[[SLS_S3]] overflow<nsw> : index
     // CHECK: %[[SLS_PAD:.*]] = arith.constant 0x7FC00000 : f32
@@ -1515,10 +1573,10 @@ cuda_tile.module @m {
     // CHECK: %[[SST_BCAST:.*]] = arith.constant dense<1.000000e+00> : vector<4x2xf32>
     // CHECK: %[[SST_PTR:.*]] = memref.reinterpret_cast %[[SST_UPTR]] to offset: [0], sizes: [64, 16], strides: [16, 1] : memref<*xf32> to memref<64x16xf32, strided<[16, 1], offset: ?>>
     // identity dim_map: tile dim0 uses stride 4, tile dim1 uses stride 2.
-    // CHECK: %[[SST_IDX0:.*]] = arith.index_cast %[[SST_IDX0IN]] : i32 to index
+    // CHECK: %[[SST_IDX0:.*]] = arith.index_castui %[[SST_IDX0IN]] : i32 to index
     // CHECK: %[[SST_S4:.*]] = arith.constant 4 : index
     // CHECK: %[[SST_OFF0:.*]] = arith.muli %[[SST_IDX0]], %[[SST_S4]] overflow<nsw> : index
-    // CHECK: %[[SST_IDX1:.*]] = arith.index_cast %[[SST_IDX1IN]] : i32 to index
+    // CHECK: %[[SST_IDX1:.*]] = arith.index_castui %[[SST_IDX1IN]] : i32 to index
     // CHECK: %[[SST_S2:.*]] = arith.constant 2 : index
     // CHECK: %[[SST_OFF1:.*]] = arith.muli %[[SST_IDX1]], %[[SST_S2]] overflow<nsw> : index
     // identity dim_map: memref index order is [OFF0, OFF1], both dims fit -> in_bounds = [true, true], no permutation_map.

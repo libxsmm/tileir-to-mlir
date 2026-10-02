@@ -5,32 +5,24 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Promotes unranked-memref function arguments to opaque `!llvm.ptr` inputs.
+// Promotes unranked memref arguments of functions to `!llvm.ptr`.
 //
-// The tileir-to-mlir lowering models pointer-typed kernel inputs as unranked
-// `memref<*xT>` and recovers their rank/layout inside the body with a
-// `memref.cast` or `memref.reinterpret_cast`. When every use of such an
-// argument is one of these casts -- or when the argument has no uses -- the
-// argument is really just an opaque pointer. This pass rewrites the signature
-// to take a bare
-// `!llvm.ptr` and, in place of each redundant cast, builds a standard LLVM
-// memref descriptor struct from that pointer -- using the argument pointer as
-// the descriptor's base buffer and storing the cast's offset / sizes / strides
-// directly in the descriptor -- then casts the descriptor back to the ranked
-// memref. Keeping the offset in the descriptor's offset field (rather than
-// folding it into the base pointer) preserves the argument pointer as the base
-// buffer, so a chained `memref.reinterpret_cast` -- whose offset is absolute to
-// that buffer -- or a `memref.extract_strided_metadata` observes the same base
-// pointer and offset as the original source. An argument may be reinterpreted
-// several different ways; each cast is rebuilt independently.
-// The descriptor is laid out exactly as the memref-to-LLVM lowering expects:
+// --convert-tileir-to-mlir passes pointers as `memref<*xT>` and casts them to
+// ranked memrefs where it accesses them. An argument that only such casts use
+// is just a pointer: the pass makes it an `!llvm.ptr` and replaces each cast by
+// a memref descriptor built from the pointer and the offset, sizes and strides
+// of the cast, in the layout of the memref-to-LLVM lowering:
 //
 //   !llvm.struct<(ptr, ptr, i64, array<R x i64>, array<R x i64>)>
 //            allocated^  ^aligned  ^offset  ^sizes        ^strides
 //
+// The pointer stays the base buffer and the offset stays in the descriptor, so
+// chained reinterpret_casts, whose offsets are absolute to the buffer, and
+// extract_strided_metadata observe the same buffer and offset as before.
+//
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Conversion/TileIRToMLIR/ConvertMemrefArgsToPtrArgs.h"
+#include "mlir/Conversion/TileIRToMLIR/Passes.h"
 
 #include "ArgPromotionUtils.h"
 #include "mlir/Conversion/LLVMCommon/MemRefBuilder.h"
@@ -61,25 +53,18 @@ namespace {
 
 using tileir::signatureChangeIsSafe;
 
-/// If `arg` is an unranked-memref argument with no uses, or whose every use is
-/// a `memref.cast` or `memref.reinterpret_cast` of that exact argument, collect
-/// those casts together with their ranked result types into `casts` and return
-/// `true`. Different casts may reinterpret the argument in incompatible ways
-/// (distinct ranks, offsets or layouts); that is fine, since each cast is
-/// rebuilt independently from the recovered pointer. Returns `false` (leaving
-/// `casts` in an unspecified state) if any use is something other than such a
-/// cast, so that the unranked descriptor is never otherwise observed.
+/// Collect the casts of `arg` to ranked memrefs into `casts`, if `arg` is an
+/// unranked memref that nothing else uses and the casts can be rebuilt from a
+/// pointer. The casts may differ in rank and layout, as each one is replaced
+/// separately.
 static bool collectPromotableCasts(
-    BlockArgument arg,
+    BlockArgument arg, const LLVMTypeConverter &typeConverter,
     SmallVectorImpl<std::pair<Operation *, MemRefType>> &casts) {
   auto unranked = dyn_cast<UnrankedMemRefType>(arg.getType());
   if (!unranked)
     return false;
 
   for (Operation *user : arg.getUsers()) {
-    // Only a `memref.cast` / `memref.reinterpret_cast` of this exact argument
-    // is collapsible; any other user means the unranked type is observed
-    // elsewhere and the argument must stay as-is.
     Value source;
     MemRefType resTy;
     if (auto c = dyn_cast<memref::CastOp>(user)) {
@@ -91,19 +76,27 @@ static bool collectPromotableCasts(
     } else {
       return false;
     }
-    // The cast must apply to this argument and yield a ranked memref; a cast
-    // never changes the element type, so guard that defensively too.
+    // Guaranteed by the op verifiers; checked defensively.
     if (source != arg || !resTy ||
         resTy.getElementType() != unranked.getElementType())
+      return false;
+    // The descriptor needs strides and a type of the memref-to-LLVM lowering. A
+    // plain cast would read sizes and strides from the unranked descriptor,
+    // which a pointer does not have, so they must be static.
+    SmallVector<int64_t> strides;
+    int64_t offset;
+    if (failed(resTy.getStridesAndOffset(strides, offset)) ||
+        (isa<memref::CastOp>(user) &&
+         (llvm::any_of(resTy.getShape(), ShapedType::isDynamic) ||
+          llvm::any_of(strides, ShapedType::isDynamic))) ||
+        !typeConverter.convertType(resTy))
       return false;
     casts.emplace_back(user, resTy);
   }
   return true;
 }
 
-/// Materializes `ofr` as a descriptor index-typed (`i64`) value. Static folds
-/// become `llvm.mlir.constant`; dynamic `index` operands are converted with
-/// `arith.index_cast`.
+/// `ofr` as a value of the descriptor index type `indexTy`.
 static Value materializeIndex(OpBuilder &builder, Location loc,
                               OpFoldResult ofr, Type indexTy) {
   if (auto attr = dyn_cast<Attribute>(ofr)) {
@@ -117,11 +110,8 @@ static Value materializeIndex(OpBuilder &builder, Location loc,
   return arith::IndexCastOp::create(builder, loc, indexTy, val);
 }
 
-/// Computes the descriptor layout for `cast` -- an unranked->ranked
-/// `memref.cast` or `memref.reinterpret_cast`. `offset` receives the element
-/// offset as an index-typed value (zero when statically zero or, for a plain
-/// cast, not recoverable). `sizes` and `strides` receive the per-dimension
-/// extents.
+/// The offset, sizes and strides, as `indexTy` values, of the descriptor that
+/// replaces `cast`, whose result type is `ranked`.
 static void getLayout(OpBuilder &builder, Location loc, Operation *cast,
                       MemRefType ranked, Type indexTy, Value &offset,
                       SmallVectorImpl<Value> &sizes,
@@ -135,22 +125,14 @@ static void getLayout(OpBuilder &builder, Location loc, Operation *cast,
     return;
   }
 
-  // Plain `memref.cast`: the layout is taken from the ranked result type.
-  // Dynamic sizes are not recoverable once the unranked descriptor is dropped,
-  // but the consumers only use the base pointer, offset and strides, so a zero
-  // placeholder size is sufficient and never observed.
+  // A plain cast takes the static sizes and strides of its type. A dynamic
+  // offset is 0 by the calling convention of pointer arguments.
   auto constIndex = [&](int64_t v) -> Value {
     return LLVM::ConstantOp::create(
         builder, loc, indexTy,
         builder.getIntegerAttr(indexTy, ShapedType::isDynamic(v) ? 0 : v));
   };
-  SmallVector<int64_t> strideVals;
-  int64_t offsetVal;
-  if (failed(ranked.getStridesAndOffset(strideVals, offsetVal))) {
-    // Non-strided layout: fall back to an identity row-major interpretation.
-    offsetVal = 0;
-    strideVals.assign(ranked.getRank(), 1);
-  }
+  auto [strideVals, offsetVal] = ranked.getStridesAndOffset();
   offset = constIndex(offsetVal);
   for (int64_t size : ranked.getShape())
     sizes.push_back(constIndex(size));
@@ -158,8 +140,8 @@ static void getLayout(OpBuilder &builder, Location loc, Operation *cast,
     strides.push_back(constIndex(stride));
 }
 
-/// Promote eligible unranked-memref arguments of `func` to ranked memrefs.
-/// Returns `true` if the signature changed.
+/// Promote the eligible arguments of `func` to `!llvm.ptr`. Returns whether the
+/// signature changed.
 static bool promoteFunctionArgs(FunctionOpInterface func) {
   // Declarations have no body to inspect.
   if (func.getFunctionBody().empty())
@@ -172,26 +154,22 @@ static bool promoteFunctionArgs(FunctionOpInterface func) {
   bool changed = false;
 
   auto ptrTy = LLVM::LLVMPointerType::get(func.getContext());
-  // The descriptor layout (and its index type) follows the standard
-  // memref-to-LLVM lowering, so consumers can reconcile the cast later.
+  // Build the descriptors of the memref-to-LLVM lowering, so that the casts
+  // back to memrefs cancel out when it runs.
   LLVMTypeConverter typeConverter(func.getContext());
   Type indexTy = typeConverter.getIndexType();
 
   for (unsigned i = 0, e = func.getNumArguments(); i < e; ++i) {
     BlockArgument arg = func.getArgument(i);
     SmallVector<std::pair<Operation *, MemRefType>> casts;
-    if (!collectPromotableCasts(arg, casts))
+    if (!collectPromotableCasts(arg, typeConverter, casts))
       continue;
 
-    // Promote: the argument becomes an opaque `!llvm.ptr`. Each redundant cast
-    // is replaced by a freshly built memref descriptor that wraps the pointer
-    // with the cast's own offset / sizes / strides, then cast back to the
-    // cast's ranked result type. The descriptor is built right before the cast
-    // so the (dynamic) shape operands are guaranteed to dominate it.
     arg.setType(ptrTy);
     argTypes[i] = ptrTy;
 
     for (auto [cast, ranked] : casts) {
+      // Build the descriptor at the cast, where its dynamic operands exist.
       OpBuilder builder(cast);
       Location loc = cast->getLoc();
 
@@ -199,18 +177,11 @@ static bool promoteFunctionArgs(FunctionOpInterface func) {
       SmallVector<Value> sizes, strides;
       getLayout(builder, loc, cast, ranked, indexTy, offset, sizes, strides);
 
-      // Store the element offset in the descriptor's offset field and keep the
-      // argument pointer as the (allocated / aligned) base buffer. This mirrors
-      // the source `memref.reinterpret_cast`, whose offset is absolute to the
-      // underlying buffer: a chained reinterpret_cast or
-      // extract_strided_metadata then recovers the same base pointer and
-      // offset. Folding the offset into the pointer instead would move the base
-      // buffer and silently change those observations.
       SmallVector<Value> values;
       values.reserve(3 + 2 * ranked.getRank());
       values.push_back(arg);    // allocated pointer
       values.push_back(arg);    // aligned pointer
-      values.push_back(offset); // offset (absolute to the base buffer)
+      values.push_back(offset); // offset into the buffer
       llvm::append_range(values, sizes);
       llvm::append_range(values, strides);
 
