@@ -146,9 +146,9 @@ cuda_tile.module @m {
     %st = constant <i32: 1> : tile<i32>
     %init = constant <f32: 0.000000e+00> : tile<2x2xf32>
 
-    // CHECK: arith.index_cast {{.*}} : i32 to index
-    // CHECK: arith.index_cast {{.*}} : i32 to index
-    // CHECK: arith.index_cast {{.*}} : i32 to index
+    // CHECK: arith.constant 0 : index
+    // CHECK: arith.constant 4 : index
+    // CHECK: arith.constant 1 : index
     // CHECK: scf.for
     // CHECK-NOT: arith.index_cast
     // CHECK: scf.yield
@@ -159,25 +159,27 @@ cuda_tile.module @m {
   }
 
   // --- unsigned for ---
+  // Loop bounds have the sign bit clear (see "Integer semantics" in
+  // README.md), where unsigned and signed comparison agree, so the loop is
+  // signed and its bounds are extended with nneg.
   // CHECK-LABEL: gpu.func @test_for_unsigned
-  entry @test_for_unsigned() {
+  // CHECK-SAME: %[[UN:[a-zA-Z0-9_]+]]: i32
+  entry @test_for_unsigned(%n: tile<i32>) {
     %lb = constant <i32: 0> : tile<i32>
-    %ub = constant <i32: 0x80000000> : tile<i32>
     %st = constant <i32: 1> : tile<i32>
-    // CHECK: %[[ULB:.*]] = arith.index_castui %{{.*}} : i32 to index
-    // CHECK: %[[UUB:.*]] = arith.index_castui %{{.*}} : i32 to index
-    // CHECK: %[[UST:.*]] = arith.index_castui %{{.*}} : i32 to index
-    // CHECK: scf.for unsigned %{{.*}} = %[[ULB]] to %[[UUB]] step %[[UST]] {
+    // CHECK-DAG: %[[ULB:.*]] = arith.constant 0 : index
+    // CHECK-DAG: %[[UUB:.*]] = arith.index_castui %[[UN]] nneg : i32 to index
+    // CHECK-DAG: %[[UST:.*]] = arith.constant 1 : index
+    // CHECK: scf.for %{{.*}} = %[[ULB]] to %[[UUB]] step %[[UST]] {
     // CHECK-NOT: tir-dropped-unsigned-cmp
-    for unsigned %iv in (%lb to %ub, step %st) : tile<i32> {
+    for unsigned %iv in (%lb to %n, step %st) : tile<i32> {
       continue
     }
   }
 
-  // --- loop counters as view indices ---
-  // A view index that is a loop counter uses the `index` counter directly; a
-  // negative counter would be outside the index space. Other uses of the
-  // counter keep its i32 cast.
+  // --- loop counters in index computations ---
+  // Index computations on a loop counter are redone in `index` on the counter
+  // itself (see "Integer semantics" in README.md), so the loops cast nothing.
   // CHECK-LABEL: gpu.func @test_for_counter_view_index
   entry @test_for_counter_view_index(%p: tile<ptr<f32>>, %n: tile<i32>) {
     %c0 = constant <i32: 0> : tile<i32>
@@ -185,24 +187,54 @@ cuda_tile.module @m {
     %tv = make_tensor_view %p, shape = [%n, 4], strides = [4, 1] : tile<i32> -> tensor_view<?x4xf32, strides=[4,1]>
     %pv = make_partition_view %tv : partition_view<tile=(1x4), tensor_view<?x4xf32, strides=[4,1]>>
     // CHECK: scf.for %[[IV:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
-    // CHECK:   %[[IV32:.*]] = arith.index_cast %[[IV]] : index to i32
-    // CHECK-NOT: arith.index_castui %[[IV32]]
+    // CHECK-NOT: arith.index_cast
     // CHECK:   %[[ROW:.*]] = arith.muli %[[IV]], %{{.*}} overflow<nsw> : index
     // CHECK:   vector.transfer_read %{{.*}}[%[[ROW]], %{{.*}}]
-    // CHECK:   %[[NEXT:.*]] = arith.addi %[[IV32]], %{{.*}} : i32
-    // CHECK:   arith.index_castui %[[NEXT]] : i32 to index
+    // CHECK-NOT: arith.index_cast
+    // CHECK:   %[[NEXT:.*]] = arith.addi %[[IV]], %{{.*}} overflow<nsw> : index
+    // CHECK:   %[[NEXT_ROW:.*]] = arith.muli %[[NEXT]], %{{.*}} overflow<nsw> : index
+    // CHECK:   vector.transfer_read %{{.*}}[%[[NEXT_ROW]], %{{.*}}]
+    // CHECK-NOT: arith.index_cast
+    // CHECK: }
     for %iv in (%c0 to %n, step %c1) : tile<i32> {
       %t, %tok = load_view_tko weak %pv[%iv, %c0] : partition_view<tile=(1x4), tensor_view<?x4xf32, strides=[4,1]>>, tile<i32> -> tile<1x4xf32>, !cuda_tile.token
       %next = addi %iv, %c1 : tile<i32>
       %t2, %tok2 = load_view_tko weak %pv[%next, %c0] : partition_view<tile=(1x4), tensor_view<?x4xf32, strides=[4,1]>>, tile<i32> -> tile<1x4xf32>, !cuda_tile.token
       continue
     }
-    // CHECK: scf.for unsigned %[[UIV:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
+    // CHECK: scf.for %[[UIV:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
     // CHECK-NOT: arith.index_cast
     // CHECK:   %[[UROW:.*]] = arith.muli %[[UIV]], %{{.*}} overflow<nsw> : index
     // CHECK:   vector.transfer_read %{{.*}}[%[[UROW]], %{{.*}}]
     for unsigned %iv in (%c0 to %n, step %c1) : tile<i32> {
       %t, %tok = load_view_tko weak %pv[%iv, %c0] : partition_view<tile=(1x4), tensor_view<?x4xf32, strides=[4,1]>>, tile<i32> -> tile<1x4xf32>, !cuda_tile.token
+      continue
+    }
+  }
+
+  // --- loop counters in loop bounds and offsets ---
+  // An inner loop bounded by an outer loop counter and a pointer offset scaled
+  // from an inner loop counter use the `index` counters; only the stored
+  // counter, which is not an index, is cast.
+  // CHECK-LABEL: gpu.func @test_for_counter_bound_offset
+  entry @test_for_counter_bound_offset(%p: tile<ptr<i32>>, %n: tile<i32>) {
+    %c0 = constant <i32: 0> : tile<i32>
+    %c1 = constant <i32: 1> : tile<i32>
+    %c4 = constant <i32: 4> : tile<i32>
+    // CHECK: scf.for %[[OUTER:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
+    // CHECK-NOT: arith.index_cast %[[OUTER]]
+    // CHECK:   scf.for %[[INNER:.*]] = %[[OUTER]] to %{{.*}} step %{{.*}} {
+    // CHECK:     %[[VAL:.*]] = arith.index_cast %[[INNER]] : index to i32
+    // CHECK:     %[[OFF:.*]] = arith.muli %[[INNER]], %{{.*}} overflow<nsw> : index
+    // CHECK:     memref.reinterpret_cast %{{.*}} to offset: [%[[OFF]]]
+    // CHECK:     memref.store %[[VAL]]
+    for %i in (%c0 to %n, step %c1) : tile<i32> {
+      for %j in (%i to %n, step %c1) : tile<i32> {
+        %off = muli %j, %c4 : tile<i32>
+        %q = offset %p, %off : tile<ptr<i32>>, tile<i32> -> tile<ptr<i32>>
+        %t = store_ptr_tko weak %q, %j : tile<ptr<i32>>, tile<i32> -> !cuda_tile.token
+        continue
+      }
       continue
     }
   }
@@ -261,9 +293,9 @@ cuda_tile.module @m {
     %tv = make_tensor_view %p, shape = [%m, %n], strides = [%s, 1] : tile<i32> -> tensor_view<?x?xf16, strides=[?,1]>
     // CHECK: %[[GTSD_VIEW:.*]] = memref.reinterpret_cast %[[GTSD_UPTR]]{{.*}} : memref<*xf16> to memref<?x?xf16, strided<[?, 1], offset: ?>>
     // CHECK: %[[GTSD_D0:.*]] = memref.dim %[[GTSD_VIEW]], {{.*}}0
-    // CHECK: %[[GTSD_R0:.*]] = arith.index_castui %[[GTSD_D0]] : index to i32
+    // CHECK: %[[GTSD_R0:.*]] = arith.index_castui %[[GTSD_D0]] nneg : index to i32
     // CHECK: %[[GTSD_D1:.*]] = memref.dim %[[GTSD_VIEW]], {{.*}}1
-    // CHECK: %[[GTSD_R1:.*]] = arith.index_castui %[[GTSD_D1]] : index to i32
+    // CHECK: %[[GTSD_R1:.*]] = arith.index_castui %[[GTSD_D1]] nneg : index to i32
     %d0, %d1 = get_tensor_shape %tv : tensor_view<?x?xf16, strides=[?,1]> -> tile<i32>
     return
   }
@@ -275,9 +307,9 @@ cuda_tile.module @m {
     %tv = make_tensor_view %p, shape = [64, %n], strides = [%s, 1] : tile<i32> -> tensor_view<64x?xf16, strides=[?,1]>
     // CHECK: %[[GTSM_VIEW:.*]] = memref.reinterpret_cast %[[GTSM_UPTR]]{{.*}} : memref<*xf16> to memref<64x?xf16, strided<[?, 1], offset: ?>>
     // CHECK: %[[GTSM_C64:.*]] = arith.constant 64 : index
-    // CHECK: %[[GTSM_R0:.*]] = arith.index_castui %[[GTSM_C64]] : index to i64
+    // CHECK: %[[GTSM_R0:.*]] = arith.index_castui %[[GTSM_C64]] nneg : index to i64
     // CHECK: %[[GTSM_D1:.*]] = memref.dim %[[GTSM_VIEW]], {{.*}}1
-    // CHECK: %[[GTSM_R1:.*]] = arith.index_castui %[[GTSM_D1]] : index to i64
+    // CHECK: %[[GTSM_R1:.*]] = arith.index_castui %[[GTSM_D1]] nneg : index to i64
     %d0, %d1 = get_tensor_shape %tv : tensor_view<64x?xf16, strides=[?,1]> -> tile<i64>
     return
   }
@@ -286,7 +318,7 @@ cuda_tile.module @m {
   // CHECK-LABEL: gpu.func @test_iota_i8
   entry @test_iota_i8() {
     // CHECK: %[[I8_STEP:.*]] = vector.step : vector<4xindex>
-    // CHECK: %[[I8_IOTA:.*]] = arith.index_castui %[[I8_STEP]] : vector<4xindex> to vector<4xi8>
+    // CHECK: %[[I8_IOTA:.*]] = arith.index_castui %[[I8_STEP]] nneg : vector<4xindex> to vector<4xi8>
     %idx = iota : tile<4xi8>
     return
   }
@@ -294,7 +326,7 @@ cuda_tile.module @m {
   // CHECK-LABEL: gpu.func @test_iota_i64
   entry @test_iota_i64() {
     // CHECK: %[[I64_STEP:.*]] = vector.step : vector<16xindex>
-    // CHECK: %[[I64_IOTA:.*]] = arith.index_castui %[[I64_STEP]] : vector<16xindex> to vector<16xi64>
+    // CHECK: %[[I64_IOTA:.*]] = arith.index_castui %[[I64_STEP]] nneg : vector<16xindex> to vector<16xi64>
     %idx = iota : tile<16xi64>
     return
   }
@@ -1198,7 +1230,7 @@ cuda_tile.module @m {
     // CHECK-DAG: %[[E1D_SRC:.*]] = arith.constant dense<1.000000e+00> : vector<16xf32>
     %src = constant <f32: 1.0> : tile<16xf32>
     // CHECK: %[[E1D_RESHAPE:.*]] = vector.shape_cast %[[E1D_SRC]] : vector<16xf32> to vector<4x4xf32>
-    // CHECK: %[[E1D_CAST:.*]] = arith.index_castui %[[E1D_IDX]] : i32 to index
+    // CHECK: %[[E1D_CAST:.*]] = arith.constant 2 : index
     // CHECK: %[[E1D_R:.*]] = vector.extract %[[E1D_RESHAPE]][%[[E1D_CAST]]] : vector<4xf32> from vector<4x4xf32>
     %r = extract %src[%idx] : tile<16xf32> -> tile<4xf32>
     return
@@ -1231,8 +1263,8 @@ cuda_tile.module @m {
     // 8/2=4 slices in dim0, 4/2=2 slices in dim1.
     // CHECK: %[[E2I_RESHAPE:.*]] = vector.shape_cast %[[E2I_SRC]] : vector<8x4xi16> to vector<4x2x2x2xi16>
     // CHECK: %[[E2I_TRANS:.*]] = vector.transpose %[[E2I_RESHAPE]], [0, 2, 1, 3] : vector<4x2x2x2xi16> to vector<4x2x2x2xi16>
-    // CHECK: %[[E2I_IDX0:.*]] = arith.index_castui %[[E2I_I]] : i32 to index
-    // CHECK: %[[E2I_IDX1:.*]] = arith.index_castui %[[E2I_J]] : i32 to index
+    // CHECK: %[[E2I_IDX0:.*]] = arith.constant 1 : index
+    // CHECK: %[[E2I_IDX1:.*]] = arith.constant 0 : index
     // CHECK: %[[E2I_R:.*]] = vector.extract %[[E2I_TRANS]][%[[E2I_IDX0]], %[[E2I_IDX1]]] : vector<2x2xi16> from vector<4x2x2x2xi16>
     %r = extract %src[%i, %j] : tile<8x4xi16> -> tile<2x2xi16>
     return
@@ -1247,7 +1279,7 @@ cuda_tile.module @m {
     %src = constant <f32: 0.0> : tile<8xf32>
     // 8/4=2 slices.
     // CHECK: %[[EH_RESHAPE:.*]] = vector.shape_cast %[[EH_SRC]] : vector<8xf32> to vector<2x4xf32>
-    // CHECK: %[[EH_CAST:.*]] = arith.index_castui %[[EH_IDX]] : i32 to index
+    // CHECK: %[[EH_CAST:.*]] = arith.constant 1 : index
     // CHECK: %[[EH_R:.*]] = vector.extract %[[EH_RESHAPE]][%[[EH_CAST]]] : vector<4xf32> from vector<2x4xf32>
     %r = extract %src[%idx] : tile<8xf32> -> tile<4xf32>
     return
@@ -1498,7 +1530,7 @@ cuda_tile.module @m {
     // CHECK: %[[SLO_IDXIN:.*]] = arith.constant 0 : i32
     // CHECK: %[[SLO_PTR:.*]] = memref.reinterpret_cast %[[SLO_UPTR]] to offset: [0], sizes: [8], strides: [1] : memref<*xf32> to memref<8xf32, strided<[1], offset: ?>>
     // offset = index * traversal_strides[0] (= 1 here), not tile_shape.
-    // CHECK: %[[SLO_IDX:.*]] = arith.index_castui %[[SLO_IDXIN]] : i32 to index
+    // CHECK: %[[SLO_IDX:.*]] = arith.constant 0 : index
     // CHECK: %[[SLO_C1:.*]] = arith.constant 1 : index
     // CHECK: %[[SLO_OFF:.*]] = arith.muli %[[SLO_IDX]], %[[SLO_C1]] overflow<nsw> : index
     // CHECK: %[[SLO_PAD:.*]] = ub.poison : f32
@@ -1520,7 +1552,7 @@ cuda_tile.module @m {
     // CHECK: %[[SLE_IDXIN:.*]] = arith.constant 1 : i32
     // CHECK: %[[SLE_PTR:.*]] = memref.reinterpret_cast %[[SLE_UPTR]] to offset: [0], sizes: [16], strides: [1] : memref<*xf32> to memref<16xf32, strided<[1], offset: ?>>
     // offset = index * traversal_strides[0] (= 2 here).
-    // CHECK: %[[SLE_IDX:.*]] = arith.index_castui %[[SLE_IDXIN]] : i32 to index
+    // CHECK: %[[SLE_IDX:.*]] = arith.constant 1 : index
     // CHECK: %[[SLE_C2:.*]] = arith.constant 2 : index
     // CHECK: %[[SLE_OFF:.*]] = arith.muli %[[SLE_IDX]], %[[SLE_C2]] overflow<nsw> : index
     // Exact tiling (stride 2 == tile 2): every tile fits, so in_bounds = [true].
@@ -1543,11 +1575,11 @@ cuda_tile.module @m {
     // CHECK: %[[SLS_IDX1IN:.*]] = arith.constant 1 : i32
     // CHECK: %[[SLS_PTR:.*]] = memref.reinterpret_cast %[[SLS_UPTR]] to offset: [0], sizes: [64, 16], strides: [16, 1] : memref<*xf32> to memref<64x16xf32, strided<[16, 1], offset: ?>>
     // tile dim0 (index %c0) maps to tensor dim1 with traversal stride 4.
-    // CHECK: %[[SLS_IDX0:.*]] = arith.index_castui %[[SLS_IDX0IN]] : i32 to index
+    // CHECK: %[[SLS_IDX0:.*]] = arith.constant 0 : index
     // CHECK: %[[SLS_S4:.*]] = arith.constant 4 : index
     // CHECK: %[[SLS_OFF0:.*]] = arith.muli %[[SLS_IDX0]], %[[SLS_S4]] overflow<nsw> : index
     // tile dim1 (index %c1) maps to tensor dim0 with traversal stride 3.
-    // CHECK: %[[SLS_IDX1:.*]] = arith.index_castui %[[SLS_IDX1IN]] : i32 to index
+    // CHECK: %[[SLS_IDX1:.*]] = arith.constant 1 : index
     // CHECK: %[[SLS_S3:.*]] = arith.constant 3 : index
     // CHECK: %[[SLS_OFF1:.*]] = arith.muli %[[SLS_IDX1]], %[[SLS_S3]] overflow<nsw> : index
     // CHECK: %[[SLS_PAD:.*]] = arith.constant 0x7FC00000 : f32
@@ -1573,16 +1605,37 @@ cuda_tile.module @m {
     // CHECK: %[[SST_BCAST:.*]] = arith.constant dense<1.000000e+00> : vector<4x2xf32>
     // CHECK: %[[SST_PTR:.*]] = memref.reinterpret_cast %[[SST_UPTR]] to offset: [0], sizes: [64, 16], strides: [16, 1] : memref<*xf32> to memref<64x16xf32, strided<[16, 1], offset: ?>>
     // identity dim_map: tile dim0 uses stride 4, tile dim1 uses stride 2.
-    // CHECK: %[[SST_IDX0:.*]] = arith.index_castui %[[SST_IDX0IN]] : i32 to index
+    // CHECK: %[[SST_IDX0:.*]] = arith.constant 0 : index
     // CHECK: %[[SST_S4:.*]] = arith.constant 4 : index
     // CHECK: %[[SST_OFF0:.*]] = arith.muli %[[SST_IDX0]], %[[SST_S4]] overflow<nsw> : index
-    // CHECK: %[[SST_IDX1:.*]] = arith.index_castui %[[SST_IDX1IN]] : i32 to index
+    // CHECK: %[[SST_IDX1:.*]] = arith.constant 1 : index
     // CHECK: %[[SST_S2:.*]] = arith.constant 2 : index
     // CHECK: %[[SST_OFF1:.*]] = arith.muli %[[SST_IDX1]], %[[SST_S2]] overflow<nsw> : index
     // identity dim_map: memref index order is [OFF0, OFF1], both dims fit -> in_bounds = [true, true], no permutation_map.
     // CHECK: vector.transfer_write %[[SST_BCAST]], %[[SST_PTR]][%[[SST_OFF0]], %[[SST_OFF1]]] {in_bounds = [true, true]} : vector<4x2xf32>, memref<64x16xf32, strided<[16, 1], offset: ?>>
     // CHECK-NOT: permutation_map
     %tok = store_view_tko weak %tile, %sv[%c0, %c1] : tile<4x2xf32>, strided_view<tile=(4x2), traversal_strides=[4,2], tensor_view<64x16xf32, strides=[16,1]>>, tile<i32> -> !cuda_tile.token
+    return
+  }
+
+  // --- view index casts ---
+  // View indices have the sign bit clear (see "Integer semantics" in
+  // README.md), so they are extended with nneg, whatever their type and the
+  // extent of the view.
+  // CHECK-LABEL: gpu.func @test_view_index_nneg
+  // CHECK-SAME: %[[NN_I8:[a-zA-Z0-9_]+]]: i8, %[[NN_I32:[a-zA-Z0-9_]+]]: i32, %[[NN_I64:[a-zA-Z0-9_]+]]: i64
+  entry @test_view_index_nneg(%p: tile<ptr<f32>>, %n: tile<i64>, %i8: tile<i8>, %i32: tile<i32>, %i64: tile<i64>) {
+    %c0_i8 = constant <i8: 0> : tile<i8>
+    %c0_i32 = constant <i32: 0> : tile<i32>
+    %c0_i64 = constant <i64: 0> : tile<i64>
+    %tv = make_tensor_view %p, shape = [%n, 4], strides = [4, 1] : tile<i64> -> tensor_view<?x4xf32, strides=[4,1]>
+    %pv = make_partition_view %tv : partition_view<tile=(1x4), tensor_view<?x4xf32, strides=[4,1]>>
+    // CHECK: arith.index_castui %[[NN_I8]] nneg : i8 to index
+    %t0, %tok0 = load_view_tko weak %pv[%i8, %c0_i8] : partition_view<tile=(1x4), tensor_view<?x4xf32, strides=[4,1]>>, tile<i8> -> tile<1x4xf32>, !cuda_tile.token
+    // CHECK: arith.index_castui %[[NN_I32]] nneg : i32 to index
+    %t1, %tok1 = load_view_tko weak %pv[%i32, %c0_i32] : partition_view<tile=(1x4), tensor_view<?x4xf32, strides=[4,1]>>, tile<i32> -> tile<1x4xf32>, !cuda_tile.token
+    // CHECK: arith.index_castui %[[NN_I64]] nneg : i64 to index
+    %t2, %tok2 = load_view_tko weak %pv[%i64, %c0_i64] : partition_view<tile=(1x4), tensor_view<?x4xf32, strides=[4,1]>>, tile<i64> -> tile<1x4xf32>, !cuda_tile.token
     return
   }
 

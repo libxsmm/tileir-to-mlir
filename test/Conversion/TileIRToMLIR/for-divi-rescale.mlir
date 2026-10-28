@@ -80,9 +80,9 @@ cuda_tile.module @for_wrapped_iv_index_rescale_module {
     %result = for %k in (%i0 to %ub, step %i1) : tile<i32>
         iter_values(%acc_prev = %cst) -> (tile<128x32xf16>)
     {
-      // The upper bound keeps %k below 2^26, so `(%k * 32) / 32` equals %k: the
-      // transfer indexes with the element-space induction variable and the
-      // tile index computation is removed.
+      // The tile index computation is rebuilt in `index`, where
+      // `(%k * 32) / 32` equals %k: the transfer indexes with the
+      // element-space induction variable.
       // CHECK-NOT: arith.divsi
       // CHECK: vector.transfer_read %{{.*}}[%[[WRAPPED_IV]], %{{.*}}]
       %scaled_k = muli %k, %c32 : tile<i32>
@@ -94,13 +94,19 @@ cuda_tile.module @for_wrapped_iv_index_rescale_module {
   }
 }
 
-// Without a bound on %k, `(%k * 32) / 32` may differ from %k because the
-// multiplication can overflow, so the loop stays in tile space.
+// `(%k * 32) / 32` is an index computation, which does not overflow (see
+// "Integer semantics" in README.md), so it equals %k even without a bound on
+// %k and the loop is rescaled.
 
 // CHECK-LABEL: gpu.func @for_unbounded_wrapped_iv_kernel
-// CHECK: scf.for %[[UNBOUNDED_IV:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
-// CHECK: %[[UNBOUNDED_IV_I32:.*]] = arith.index_cast %[[UNBOUNDED_IV]] : index to i32
-// CHECK: arith.muli %[[UNBOUNDED_IV_I32]], %{{.*}} : i32
+// CHECK: %[[UNBOUNDED_C32:.*]] = arith.constant 32 : index
+// CHECK: %{{.*}} = arith.muli %{{.*}}, %[[UNBOUNDED_C32]] : index
+// CHECK: %{{.*}} = arith.muli %{{.*}}, %[[UNBOUNDED_C32]] : index
+// CHECK: %[[UNBOUNDED_STEP:.*]] = arith.muli %{{.*}}, %[[UNBOUNDED_C32]] : index
+// CHECK: scf.for %[[UNBOUNDED_IV:.*]] = %{{.*}} to %{{.*}} step %[[UNBOUNDED_STEP]] {
+// CHECK-NOT: arith.muli
+// CHECK-NOT: arith.divsi
+// CHECK: vector.transfer_read %{{.*}}[%[[UNBOUNDED_IV]]]
 cuda_tile.module @for_unbounded_wrapped_iv_module {
   entry @for_unbounded_wrapped_iv_kernel(%A: !cuda_tile.tensor_view<?xf32, strides=[1]>,
                                          %n: !cuda_tile.tile<i32>) {

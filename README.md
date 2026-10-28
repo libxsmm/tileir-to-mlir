@@ -20,6 +20,21 @@ The tool accepts textual and binary TileIR as input.
     * `all`: Removes every unused argument.
     * `none`: Preserves all unused arguments.
   
+## Integer semantics
+
+`--convert-tileir-to-mlir` computes indices in `index`. It assumes that every integer used as an index (a loop bound, step or induction variable, a view or extract index, a tensor shape or stride, or a pointer offset), including all intermediate values and operands computing it, represents its mathematical value in the signed range `[-2^(w-1), 2^(w-1))` of its original width `w`, without signed overflow. Values must be non-negative wherever cuda_tile interprets them as unsigned, including operands of unsigned division, remainder and extension.
+
+Integer casts in these computations must preserve the signed mathematical value: the input of `trunci` must fit the signed range of its result type, and the input of unsigned `exti` must be non-negative. This restriction applies even when the cast has no overflow flags. For example, truncating an `i32` induction variable of `256` to `i8` to obtain offset `0` is unsupported; truncating `42` to `i8` is supported.
+
+Signed and unsigned extension agree for non-negative values. Negative signed bounds and pointer offsets remain supported and are sign-extended. Under these assumptions, computations on loop induction variables can be done directly in `index`, without integer cast round trips. Integer arithmetic and casts used only for data retain their original semantics, including wrapping where permitted by cuda_tile.
+
+Not supported (undefined behavior):
+* unsigned values of `2^(w-1)` or more in an index role, e.g. an unsigned `for` bound or a view index of `2^31` or more in an `i32`;
+* index computations that overflow, e.g. an `i32` offset of `2^31` or more;
+* value-changing integer casts in index computations, e.g. truncation to an insufficient signed width;
+* `i64` loops whose last increment exceeds `2^63-1`;
+* targets whose `index` type is narrower than 64 bits.
+
 ## Prerequisites
 
 * **CMake 3.20+**
@@ -122,3 +137,10 @@ Example of a full conversion followed by common optimization passes:
 build/tools/tileir-to-mlir --convert-tileir-to-mlir test/Conversion/TileIRToMLIR/cudatile-appendix.mlir | \
 mlir-opt --loop-invariant-code-motion -canonicalize -cse
 ```
+
+The conversion removes unused pure computations inside loops, including nested
+regions, but does not run general CSE. Rebuilt index expressions shared by several
+consumers can therefore be duplicated in conversion-only output. Add `--cse`
+after `--convert-tileir-to-mlir` to share them; `--canonicalize` can additionally
+fold and simplify the resulting IR. These explicit cleanup passes can also remove
+unused loads and pure data operations.

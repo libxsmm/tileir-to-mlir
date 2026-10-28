@@ -49,6 +49,7 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Iterators.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/SymbolTable.h"
@@ -251,6 +252,80 @@ static Value castValueToType(OpBuilder &builder, Location loc, Value value,
       (isa<IntegerType>(value.getType()) && isa<IndexType>(targetType)))
     return arith::IndexCastOp::create(builder, loc, targetType, value);
   return Value();
+}
+
+/// `value` extended to `index`, with `index_castui nneg` if `nonNeg`.
+static Value extendToIndex(OpBuilder &builder, Location loc, Value value,
+                           bool nonNeg) {
+  APInt constant;
+  if (matchPattern(value, m_ConstantInt(&constant)))
+    return arith::ConstantIndexOp::create(builder, loc,
+                                          constant.getSExtValue());
+  if (nonNeg)
+    return arith::IndexCastUIOp::create(builder, loc, builder.getIndexType(),
+                                        value, /*nonNeg=*/true);
+  return arith::IndexCastOp::create(builder, loc, builder.getIndexType(),
+                                    value);
+}
+
+/// `value` recomputed in `index` from the loop counters that it truncates, or
+/// null if it derives from none. `rebuilt` caches the results.
+static Value rebuildInIndex(OpBuilder &builder, Location loc, Value value,
+                            DenseMap<Value, Value> &rebuilt) {
+  if (auto it = rebuilt.find(value); it != rebuilt.end())
+    return it->second;
+  Value result;
+  Operation *def = value.getDefiningOp();
+  if (auto cast = dyn_cast_or_null<arith::IndexCastOp>(def)) {
+    // Only loop counters are looked through: truncating other `index` values,
+    // e.g. shape queries, conveys their range to rescaleTileLoops.
+    auto iv = dyn_cast<BlockArgument>(cast.getIn());
+    auto loop =
+        iv ? dyn_cast<scf::ForOp>(iv.getOwner()->getParentOp()) : scf::ForOp();
+    if (loop && loop.getInductionVar() == iv)
+      result = iv;
+  } else if (isa_and_nonnull<arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp>(
+                 def)) {
+    result = rebuildInIndex(builder, loc, def->getOperand(0), rebuilt);
+  } else if (isa_and_nonnull<arith::AddIOp, arith::SubIOp, arith::MulIOp,
+                             arith::DivSIOp, arith::DivUIOp, arith::CeilDivSIOp,
+                             arith::CeilDivUIOp, arith::FloorDivSIOp,
+                             arith::RemSIOp, arith::RemUIOp>(def)) {
+    Value lhs = rebuildInIndex(builder, loc, def->getOperand(0), rebuilt);
+    Value rhs = rebuildInIndex(builder, loc, def->getOperand(1), rebuilt);
+    if (lhs || rhs) {
+      OperationState state(
+          loc, def->getName(),
+          {lhs ? lhs : extendToIndex(builder, loc, def->getOperand(0), false),
+           rhs ? rhs : extendToIndex(builder, loc, def->getOperand(1), false)},
+          {builder.getIndexType()});
+      if (auto ovf = dyn_cast<arith::ArithIntegerOverflowFlagsInterface>(def))
+        state.addAttribute(
+            ovf.getIntegerOverflowAttrName(),
+            arith::IntegerOverflowFlagsAttr::get(
+                builder.getContext(), arith::IntegerOverflowFlags::nsw));
+      result = builder.create(state)->getResult(0);
+    }
+  }
+  rebuilt[value] = result;
+  return result;
+}
+
+/// `value`, an integer that the conversion uses as an index (a loop bound or
+/// step, a view or extract index, a tensor shape or stride, or a pointer
+/// offset), as an `index`, with `index_castui nneg` if `nonNeg`.
+///
+/// Such integers and their intermediate computations fit their signed types,
+/// and integer casts preserve their signed values (see "Integer semantics" in
+/// README.md). Sign and zero extension agree for non-negative values; negative
+/// signed values are sign-extended. Computations on loop counters are redone
+/// on the `index` counters without round trips through the narrower type.
+static Value toIndex(OpBuilder &builder, Location loc, Value value,
+                     bool nonNeg = false) {
+  DenseMap<Value, Value> rebuilt;
+  if (Value result = rebuildInIndex(builder, loc, value, rebuilt))
+    return result;
+  return extendToIndex(builder, loc, value, nonNeg);
 }
 
 /// Replace `op` with the signed or unsigned target op selected by `signedness`,
@@ -888,26 +963,6 @@ struct TransferViewAccessPlan {
   SmallVector<bool> inBounds;
 };
 
-/// The `index` induction variable that `value` truncates with an index_cast,
-/// if the loop bounds are extended from the type of `value`: the induction
-/// variable then is the unsigned interpretation of `value`, or negative.
-static Value getExtendedInductionVar(Value value) {
-  auto cast = value.getDefiningOp<arith::IndexCastOp>();
-  auto iv = cast ? dyn_cast<BlockArgument>(cast.getIn()) : BlockArgument();
-  auto loop =
-      iv ? dyn_cast<scf::ForOp>(iv.getOwner()->getParentOp()) : scf::ForOp();
-  if (!loop || loop.getInductionVar() != iv)
-    return {};
-  auto isExtended = [&](Value bound) {
-    Operation *def = bound.getDefiningOp();
-    return isa_and_nonnull<arith::IndexCastOp, arith::IndexCastUIOp>(def) &&
-           def->getOperand(0).getType() == value.getType();
-  };
-  if (!isExtended(loop.getLowerBound()) || !isExtended(loop.getUpperBound()))
-    return {};
-  return iv;
-}
-
 /// Plan the transfer that accesses tile `convertedIndices` of `view`.
 ///
 /// Tile index i, scaled by the base advance of the view, indexes memref
@@ -934,11 +989,8 @@ buildTransferViewAccessPlan(ConversionPatternRewriter &rewriter, Operation *op,
       ctx, arith::IntegerOverflowFlags::nsw);
   SmallVector<Value> memrefIndices(rank);
   for (unsigned i = 0; i < rank; ++i) {
-    // A negative loop counter would be an index outside the index space.
-    Value tileIndex = getExtendedInductionVar(convertedIndices[i]);
-    if (!tileIndex)
-      tileIndex = arith::IndexCastUIOp::create(
-          rewriter, loc, rewriter.getIndexType(), convertedIndices[i]);
+    Value tileIndex =
+        toIndex(rewriter, loc, convertedIndices[i], /*nonNeg=*/true);
     Value strideVal =
         arith::ConstantIndexOp::create(rewriter, loc, viewInfo.viewStrides[i]);
     memrefIndices[viewInfo.dimMap[i]] =
@@ -1351,11 +1403,9 @@ struct ConvertExtract : public OpConversionPattern<cuda_tile::ExtractOp> {
     }
 
     // The indices are unsigned.
-    Type indexTy = rewriter.getIndexType();
     SmallVector<OpFoldResult> positions = llvm::map_to_vector(
         adaptor.getIndices(), [&](Value idx) -> OpFoldResult {
-          return arith::IndexCastUIOp::create(rewriter, loc, indexTy, idx)
-              .getResult();
+          return toIndex(rewriter, loc, idx, /*nonNeg=*/true);
         });
     rewriter.replaceOpWithNewOp<vector::ExtractOp>(op, extractSource,
                                                    positions);
@@ -1382,13 +1432,14 @@ struct ConvertFma : public OptionsPattern<cuda_tile::FmaOp> {
   }
 };
 
-/// Convert cuda_tile.for to scf.for over `index`.
+/// Convert cuda_tile.for to a signed scf.for over `index`.
 ///
-/// The bounds are sign-extended to `index`, or zero-extended for `unsignedCmp`,
-/// which maps to scf.for's `unsignedCmp`. The body is merged into the new loop
-/// with the induction variable cast back to its original type. Loops whose
-/// induction variable indexes tiles are rescaled after the conversion (see
-/// rescaleTileLoops).
+/// The bounds and step fit the signed range of their type (see toIndex), where
+/// unsigned and signed comparison agree, so the `unsigned` attribute does not
+/// change the loop. The body is merged into the new loop with the induction
+/// variable truncated to its original type, which toIndex looks through.
+/// Loops whose induction variable indexes tiles are rescaled after the
+/// conversion (see rescaleTileLoops).
 struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -1396,20 +1447,15 @@ struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
   matchAndRewrite(cuda_tile::ForOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    Type indexTy = rewriter.getIndexType();
-    auto toIndex = [&](ValueRange bound) -> Value {
-      if (op.getUnsignedCmp())
-        return arith::IndexCastUIOp::create(rewriter, loc, indexTy,
-                                            bound.front());
-      return arith::IndexCastOp::create(rewriter, loc, indexTy, bound.front());
+    auto toIndexBound = [&](ValueRange bound) {
+      return toIndex(rewriter, loc, bound.front(),
+                     /*nonNeg=*/op.getUnsignedCmp());
     };
-    Value lb = toIndex(adaptor.getLowerBound());
-    Value ub = toIndex(adaptor.getUpperBound());
-    Value step = toIndex(adaptor.getStep());
-
-    auto newForOp = scf::ForOp::create(
-        rewriter, loc, lb, ub, step, flattenValues(adaptor.getInitValues()),
-        /*bodyBuilder=*/nullptr, op.getUnsignedCmp());
+    Value lb = toIndexBound(adaptor.getLowerBound());
+    Value ub = toIndexBound(adaptor.getUpperBound());
+    Value step = toIndexBound(adaptor.getStep());
+    auto newForOp = scf::ForOp::create(rewriter, loc, lb, ub, step,
+                                       flattenValues(adaptor.getInitValues()));
 
     if (failed(
             rewriter.convertRegionTypes(&op.getRegion(), *getTypeConverter())))
@@ -1630,7 +1676,8 @@ using ConvertGetNumTileBlocks =
                       AppendedGridArgLayout::kGridDimBase>;
 
 /// Convert cuda_tile.get_tensor_shape to the extents of the converted memref,
-/// cast with index_castui since the shape is unsigned.
+/// cast with index_castui since the shape is unsigned. Memref extents are
+/// non-negative, so the casts are nneg.
 struct ConvertGetTensorShape
     : public OpConversionPattern<cuda_tile::GetTensorShapeOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -1648,7 +1695,8 @@ struct ConvertGetTensorShape
       if (dstTy == rewriter.getIndexType())
         return indexVal;
       if (isa<IntegerType>(dstTy))
-        return arith::IndexCastUIOp::create(rewriter, loc, dstTy, indexVal);
+        return arith::IndexCastUIOp::create(rewriter, loc, dstTy, indexVal,
+                                            /*nonNeg=*/true);
       return Value();
     };
 
@@ -1750,7 +1798,8 @@ struct ConvertIf : public OpConversionPattern<cuda_tile::IfOp> {
   }
 };
 
-/// Convert cuda_tile.iota to vector.step, cast to the element type.
+/// Convert cuda_tile.iota to vector.step, cast to the element type with a nneg
+/// index_castui since the steps are non-negative.
 struct ConvertIota : public OpConversionPattern<cuda_tile::IotaOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -1770,7 +1819,8 @@ struct ConvertIota : public OpConversionPattern<cuda_tile::IotaOp> {
     auto indexVecTy =
         VectorType::get(dstVecTy.getShape(), rewriter.getIndexType());
     Value step = vector::StepOp::create(rewriter, op.getLoc(), indexVecTy);
-    rewriter.replaceOpWithNewOp<arith::IndexCastUIOp>(op, dstVecTy, step);
+    rewriter.replaceOpWithNewOp<arith::IndexCastUIOp>(op, dstVecTy, step,
+                                                      /*nonNeg=*/true);
     return success();
   }
 };
@@ -1897,9 +1947,8 @@ reinterpretScalarPtrPreservingOffset(ConversionPatternRewriter &rewriter,
 /// pointer at its offset, with the shape and strides of the view.
 ///
 /// cuda_tile specifies the dynamic shape and stride operands as unsigned, but
-/// they are sign-extended: --tileir-ptr-to-view derives them from signed
-/// pointer offsets and mask bounds, which can be negative. Unsigned values of
-/// 2^31 or more in i32 operands are therefore not supported.
+/// they are converted with toIndex as signed: --tileir-ptr-to-view derives them
+/// from signed pointer offsets and mask bounds, which can be negative.
 struct ConvertMakeTensorView
     : public OpConversionPattern<cuda_tile::MakeTensorViewOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -1914,17 +1963,16 @@ struct ConvertMakeTensorView
           op, "tensor_view did not convert to a ranked memref");
 
     Location loc = op.getLoc();
-    auto toIndex = [&](ValueRange values) {
+    auto extend = [&](ValueRange values) {
       return llvm::map_to_vector(values, [&](Value value) -> Value {
-        return arith::IndexCastOp::create(rewriter, loc,
-                                          rewriter.getIndexType(), value);
+        return toIndex(rewriter, loc, value);
       });
     };
     auto tvType = cast<cuda_tile::TensorViewType>(op.getType());
     SmallVector<OpFoldResult> sizes = getMixedValues(
-        tvType.getShape(), toIndex(adaptor.getDynamicShape()), rewriter);
+        tvType.getShape(), extend(adaptor.getDynamicShape()), rewriter);
     SmallVector<OpFoldResult> strides = getMixedValues(
-        tvType.getStrides(), toIndex(adaptor.getDynamicStrides()), rewriter);
+        tvType.getStrides(), extend(adaptor.getDynamicStrides()), rewriter);
     OpFoldResult offset =
         recoverUnrankedPtrOffset(rewriter, loc, adaptor.getBase());
 
@@ -2088,11 +2136,7 @@ struct ConvertOffsetScalarPtr
   LogicalResult
   matchAndRewrite(cuda_tile::OffsetOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    Value offset = castValueToType(rewriter, op.getLoc(), adaptor.getOffset(),
-                                   rewriter.getIndexType());
-    if (!offset)
-      return rewriter.notifyMatchFailure(
-          op, "offset addend could not be converted to index");
+    Value offset = toIndex(rewriter, op.getLoc(), adaptor.getOffset());
     rewriter.replaceOp(
         op, offsetPointer(rewriter, op.getLoc(), adaptor.getPtr(), offset));
     return success();
@@ -2852,15 +2896,13 @@ struct ConvertTileIRToMLIRPass
                                       std::move(patterns))))
       return signalPassFailure();
 
-    // Drop the casts of loop counters to their source type (see ConvertFor)
-    // that only view indices used.
-    module.walk([](scf::ForOp loop) {
-      for (Operation *user :
-           llvm::make_early_inc_range(loop.getInductionVar().getUsers()))
-        if (isOpTriviallyDead(user))
-          user->erase();
+    // Drop what toIndex left unused, including in nested regions. Visiting
+    // users before their operands drops whole chains while preserving reads.
+    module.walk<WalkOrder::PostOrder, ReverseIterator>([](Operation *op) {
+      if (op->getParentOfType<scf::ForOp>() && isMemoryEffectFree(op) &&
+          isOpTriviallyDead(op))
+        op->erase();
     });
-
     tileir::rescaleTileLoops(module);
     tileir::scopeLoopAllocations(module);
 

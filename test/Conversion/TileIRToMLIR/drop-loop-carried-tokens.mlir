@@ -71,14 +71,15 @@ cuda_tile.module @drop_token_module {
     return
   }
 
-  // Dropping the token iter value keeps the unsigned comparison.
+  // Dropping the token iter value keeps the loop, which is signed since its
+  // bounds have the sign bit clear.
   // CHECK-LABEL: gpu.func @drop_token_unsigned_loop
   entry @drop_token_unsigned_loop(%p: !cuda_tile.tile<!cuda_tile.ptr<i32>>) {
     %c0 = constant <i32: 0> : tile<i32>
     %ub = constant <i32: 16> : tile<i32>
     %c1 = constant <i32: 1> : tile<i32>
     %t0 = make_token : !cuda_tile.token
-    // CHECK: scf.for unsigned %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} {
+    // CHECK: scf.for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} {
     %r = for unsigned %iv in (%c0 to %ub, step %c1) : tile<i32>
         iter_values(%t = %t0) -> (!cuda_tile.token) {
       %t1 = store_ptr_tko weak %p, %iv token = %t : tile<ptr<i32>>, tile<i32> -> !cuda_tile.token

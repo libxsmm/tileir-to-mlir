@@ -29,8 +29,8 @@ cuda_tile.module @ops_module {
   entry @test_get_tensor_shape_example(%base: !cuda_tile.tile<!cuda_tile.ptr<f32>>) {
     // CHECK: %[[TS_VIEW:.*]] = memref.reinterpret_cast %[[TS_BASE]] to offset: [0], sizes: [32, 32], strides: [32, 1] : memref<*xf32> to memref<32x32xf32, strided<[32, 1], offset: ?>>
     %tensor_view = make_tensor_view %base, shape = [32, 32], strides = [32, 1] : tensor_view<32x32xf32, strides=[32,1]>
-    // CHECK: arith.index_castui {{.*}} : index to i64
-    // CHECK: arith.index_castui {{.*}} : index to i64
+    // CHECK: arith.index_castui {{.*}} nneg : index to i64
+    // CHECK: arith.index_castui {{.*}} nneg : index to i64
     %dim0, %dim1 = get_tensor_shape %tensor_view : tensor_view<32x32xf32, strides=[32,1]> -> tile<i64>
     return
   }
@@ -41,7 +41,7 @@ cuda_tile.module @ops_module {
   // CHECK-LABEL: gpu.func @test_iota_example
   entry @test_iota_example() {
     // CHECK: %[[STEP:.*]] = vector.step : vector<8xindex>
-    // CHECK: %[[IOTA:.*]] = arith.index_castui %[[STEP]] : vector<8xindex> to vector<8xi32>
+    // CHECK: %[[IOTA:.*]] = arith.index_castui %[[STEP]] nneg : vector<8xindex> to vector<8xi32>
     %offsets = iota : tile<8xi32>
     return
   }
@@ -485,9 +485,10 @@ cuda_tile.module @ops_module {
     // CHECK: %[[FOR_STEP:.*]] = arith.constant 1 : i32
     %step = constant <i32: 1> : tile<i32>
 
-    // CHECK: %[[FOR_LBI:.*]] = arith.index_cast %[[FOR_LB]] : i32 to index
-    // CHECK: %[[FOR_UBI:.*]] = arith.index_cast %[[FOR_UB]] : i32 to index
-    // CHECK: %[[FOR_STEPI:.*]] = arith.index_cast %[[FOR_STEP]] : i32 to index
+    // Constant bounds become `index` constants.
+    // CHECK: %[[FOR_LBI:.*]] = arith.constant 0 : index
+    // CHECK: %[[FOR_UBI:.*]] = arith.constant 10 : index
+    // CHECK: %[[FOR_STEPI:.*]] = arith.constant 1 : index
     // CHECK: scf.for %[[FOR_IV:.*]] = %[[FOR_LBI]] to %[[FOR_UBI]] step %[[FOR_STEPI]] {
     // CHECK-NOT: arith.index_cast
     // CHECK: }
@@ -497,9 +498,9 @@ cuda_tile.module @ops_module {
 
     // CHECK: %[[FOR_INIT:.*]] = arith.constant 0.000000e+00 : f32
     %initVal0 = constant <f32: 0.0> : tile<f32>
-    // CHECK: %[[FOR2_LBI:.*]] = arith.index_cast %[[FOR_LB]] : i32 to index
-    // CHECK: %[[FOR2_UBI:.*]] = arith.index_cast %[[FOR_UB]] : i32 to index
-    // CHECK: %[[FOR2_STEPI:.*]] = arith.index_cast %[[FOR_STEP]] : i32 to index
+    // CHECK: %[[FOR2_LBI:.*]] = arith.constant 0 : index
+    // CHECK: %[[FOR2_UBI:.*]] = arith.constant 10 : index
+    // CHECK: %[[FOR2_STEPI:.*]] = arith.constant 1 : index
     // CHECK: %[[FOR2_R:.*]] = scf.for %{{.*}} = %[[FOR2_LBI]] to %[[FOR2_UBI]] step %[[FOR2_STEPI]] iter_args(%[[FOR2_ACC:.*]] = %[[FOR_INIT]]) -> (f32) {
     // CHECK:   %[[FOR2_VAL:.*]] = arith.constant 1.000000e+00 : f32
     // CHECK:   scf.yield %[[FOR2_VAL]] : f32
@@ -670,8 +671,8 @@ cuda_tile.module @ops_module {
     %t = constant <f32: 0.0> : tile<32x8xf32>
     // CHECK: %[[EXT_RESHAPE:.*]] = vector.shape_cast %[[EXT_SRC]] : vector<32x8xf32> to vector<8x4x4x2xf32>
     // CHECK: %[[EXT_TRANS:.*]] = vector.transpose %[[EXT_RESHAPE]], [0, 2, 1, 3] : vector<8x4x4x2xf32> to vector<8x4x4x2xf32>
-    // CHECK: %[[EXT_IDX0:.*]] = arith.index_castui %[[EXT_I]] : i32 to index
-    // CHECK: %[[EXT_IDX1:.*]] = arith.index_castui %[[EXT_J]] : i32 to index
+    // CHECK: %[[EXT_IDX0:.*]] = arith.constant 1 : index
+    // CHECK: %[[EXT_IDX1:.*]] = arith.constant 2 : index
     // CHECK: %[[EXT_R:.*]] = vector.extract %[[EXT_TRANS]][%[[EXT_IDX0]], %[[EXT_IDX1]]] : vector<4x2xf32> from vector<8x4x4x2xf32>
     %0 = extract %t[%c1, %c2] : tile<32x8xf32> -> tile<4x2xf32>
     return

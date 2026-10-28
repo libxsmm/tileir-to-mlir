@@ -769,8 +769,8 @@ module {
       // CHECK:   %{{.*}}, %{{.*}} = load_view_tko weak %[[PV_ROW_LOOP]][%[[PARTITION_INDEX]]]
       // CHECK-NOT: load_ptr_tko
       // CHECK-GPU: scf.for %[[ROW_LOOP_INDEX:.*]] =
-      // CHECK-GPU:   %[[ROW_LOOP_INDEX_I32:.*]] = arith.index_cast %[[ROW_LOOP_INDEX]] : index to i32
-      // CHECK-GPU:   arith.divui %[[ROW_LOOP_INDEX_I32]], %{{.*}} : i32
+      // CHECK-GPU-NOT: arith.index_cast %[[ROW_LOOP_INDEX]]
+      // CHECK-GPU:   arith.divui %[[ROW_LOOP_INDEX]], %{{.*}} : index
       // CHECK-GPU:   vector.transfer_read %{{.*}}[%{{.*}}], %{{.*}} : memref<?xf32, strided<[1], offset: ?>>, vector<32xf32>
       for %loopIdx in (%c0 to %c1024, step %c32) : tile<i32> {
         %start = addi %row_offset, %loopIdx : tile<i32>
