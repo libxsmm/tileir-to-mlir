@@ -1,5 +1,8 @@
 // RUN: tileir-to-mlir --tileir-ptr-to-view %s | FileCheck %s
-// RUN: tileir-to-mlir --tileir-ptr-to-view --convert-tileir-to-mlir %s | FileCheck %s --check-prefix=CHECK-GPU
+// RUN: tileir-to-mlir --tileir-ptr-to-view --convert-tileir-to-mlir --canonicalize-from-tileir %s | FileCheck %s --check-prefix=CHECK-GPU
+
+// Kernels store the tiles they load to %out, so that the loads survive the
+// cleanup of --canonicalize-from-tileir.
 
 // CHECK-GPU-LABEL: gpu.module @cuda_tile_module {
 
@@ -8,7 +11,7 @@ module {
 
     // CHECK-LABEL: entry @load_1d
     // CHECK-GPU-LABEL: gpu.func @load_1d
-    entry @load_1d(%arg0: tile<ptr<f32>>, %arg1: tile<i32>) {
+    entry @load_1d(%arg0: tile<ptr<f32>>, %arg1: tile<i32>, %out: tensor_view<1024xf32, strides=[1]>) {
       %cst_1024 = constant <i32: 1024> : tile<i32>
       %block_id_x, %block_id_y, %block_id_z = get_tile_block_id : tile<i32>
       %start = muli %block_id_x, %cst_1024 : tile<i32>
@@ -28,6 +31,9 @@ module {
       // CHECK-GPU: %[[LOAD1D_VIEW:.*]] = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%{{.*}}], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1], offset: ?>>
       // CHECK-GPU: %[[LOAD1D_TILE:.*]] = vector.transfer_read %[[LOAD1D_VIEW]][%{{.*}}], %{{.*}} : memref<?xf32, strided<[1], offset: ?>>, vector<1024xf32>
       %tile, %token = load_ptr_tko weak %ptr, %mask : tile<1024xptr<f32>>, tile<1024xi1> -> tile<1024xf32>, !cuda_tile.token
+      %out_view = make_partition_view %out : partition_view<tile=(1024), tensor_view<1024xf32, strides=[1]>>
+      %out_index = constant <i32: 0> : tile<i32>
+      %stored = store_view_tko weak %tile, %out_view[%out_index] : tile<1024xf32>, partition_view<tile=(1024), tensor_view<1024xf32, strides=[1]>>, tile<i32> -> !cuda_tile.token
       return
     }
 
@@ -114,7 +120,7 @@ module {
     // access lower to a contiguous 2-D transfer instead of a scalarized gather.
     // CHECK-LABEL: entry @load_2d_mask_result_reshape
     // CHECK-GPU-LABEL: gpu.func @load_2d_mask_result_reshape
-    entry @load_2d_mask_result_reshape(%arg0: tile<ptr<bf16>>, %arg1: tile<i32>, %arg2: tile<i32>, %arg3: tile<i32>) {
+    entry @load_2d_mask_result_reshape(%arg0: tile<ptr<bf16>>, %arg1: tile<i32>, %arg2: tile<i32>, %arg3: tile<i32>, %out: tensor_view<32x32xbf16, strides=[32,1]>) {
       %cst_32 = constant <i32: 32> : tile<i32>
       %pad = constant <bf16: 0.000000e+00> : tile<32x32xbf16>
       %block_id_x, %block_id_y, %block_id_z = get_tile_block_id : tile<i32>
@@ -163,6 +169,9 @@ module {
       // CHECK-GPU: %[[LOAD2DR_TILE:.*]] = vector.transfer_read %[[LOAD2DR_VIEW]][%{{.*}}, %{{.*}}], %{{.*}} : memref<?x?xbf16, strided<[?, 1], offset: ?>>, vector<32x32xbf16>
       // CHECK-GPU-NOT: vector.gather
       %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<32x32xptr<bf16>>, tile<32x32xi1>, tile<32x32xbf16> -> tile<32x32xbf16>, !cuda_tile.token
+      %out_view = make_partition_view %out : partition_view<tile=(32x32), tensor_view<32x32xbf16, strides=[32,1]>>
+      %out_index = constant <i32: 0> : tile<i32>
+      %stored = store_view_tko weak %tile, %out_view[%out_index, %out_index] : tile<32x32xbf16>, partition_view<tile=(32x32), tensor_view<32x32xbf16, strides=[32,1]>>, tile<i32> -> !cuda_tile.token
       return
     }
 
@@ -214,7 +223,7 @@ module {
 
     // CHECK-LABEL: entry @k_nan
     // CHECK-GPU-LABEL: gpu.func @k_nan
-    entry @k_nan(%arg0: tile<ptr<f32>>, %arg1: tile<i32>) {
+    entry @k_nan(%arg0: tile<ptr<f32>>, %arg1: tile<i32>, %out: tensor_view<1024xf32, strides=[1]>) {
       %cst_1024 = constant <i32: 1024> : tile<i32>
       %pad = constant <f32: 0x7FC00000> : tile<1024xf32>
       %block_id_x, %block_id_y, %block_id_z = get_tile_block_id : tile<i32>
@@ -235,6 +244,9 @@ module {
       // CHECK-GPU: %[[NANPAD:.*]] = arith.constant 0x7FC00000 : f32
       // CHECK-GPU: vector.transfer_read %{{.*}}[%{{.*}}], %[[NANPAD]] : memref<?xf32, strided<[1], offset: ?>>, vector<1024xf32>
       %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<1024xptr<f32>>, tile<1024xi1>, tile<1024xf32> -> tile<1024xf32>, !cuda_tile.token
+      %out_view = make_partition_view %out : partition_view<tile=(1024), tensor_view<1024xf32, strides=[1]>>
+      %out_index = constant <i32: 0> : tile<i32>
+      %stored = store_view_tko weak %tile, %out_view[%out_index] : tile<1024xf32>, partition_view<tile=(1024), tensor_view<1024xf32, strides=[1]>>, tile<i32> -> !cuda_tile.token
       return
     }
 
@@ -293,7 +305,7 @@ module {
     entry @load_in_loop (
         %base: tile<ptr<f16>>,
         %M: tile<i32>, %K: tile<i32>,
-        %stride: tile<i32>, %num_tiles: tile<i32>) {
+        %stride: tile<i32>, %num_tiles: tile<i32>, %out: tensor_view<128x32xf16, strides=[32,1]>) {
 
       %cst_0_i32 = constant <i32: 0> : tile<i32>
       %cst_1_i32 = constant <i32: 1> : tile<i32>
@@ -347,15 +359,18 @@ module {
       // CHECK: for %[[IDX:.*]] in
       // CHECK:   load_view_tko weak %{{.*}}[%{{.*}}, %[[IDX]]]
       // CHECK-NOT: load_ptr_tko
+      // CHECK-GPU: %[[LOOP_VIEW:.*]] = memref.reinterpret_cast
       // CHECK-GPU: scf.for %[[IV:.*]] =
-      // CHECK-GPU:   memref.reinterpret_cast
-      // CHECK-GPU:   vector.transfer_read
+      // CHECK-GPU:   vector.transfer_read %[[LOOP_VIEW]][%{{.*}}, %[[IV]]]
       %for:2 = for %loopIdx in (%cst_0_i32 to %num_tiles, step %cst_1_i32) : tile<i32>
           iter_values(%iterPtr = %ptr_init, %iterAcc = %cst_0_f32)
           -> (tile<128x32xptr<f16>>, tile<128x64xf32>) {
         %tile, %tok = load_ptr_tko weak %iterPtr, %mask, %cst_pad
             : tile<128x32xptr<f16>>, tile<128x32xi1>, tile<128x32xf16>
             -> tile<128x32xf16>, !cuda_tile.token
+        %out_view = make_partition_view %out : partition_view<tile=(128x32), tensor_view<128x32xf16, strides=[32,1]>>
+        %out_index = constant <i32: 0> : tile<i32>
+        %stored = store_view_tko weak %tile, %out_view[%out_index, %out_index] : tile<128x32xf16>, partition_view<tile=(128x32), tensor_view<128x32xf16, strides=[32,1]>>, tile<i32> -> !cuda_tile.token
         %next_ptr = offset %iterPtr, %cst_32_step
             : tile<128x32xptr<f16>>, tile<128x32xi32> -> tile<128x32xptr<f16>>
         continue %next_ptr, %iterAcc
@@ -490,7 +505,7 @@ module {
 
     // CHECK-LABEL: entry @load_loop_iv_base
     // CHECK-GPU-LABEL: gpu.func @load_loop_iv_base
-    entry @load_loop_iv_base(%arg0: tile<ptr<f32>>, %N: tile<i32>) {
+    entry @load_loop_iv_base(%arg0: tile<ptr<f32>>, %N: tile<i32>, %out: tensor_view<32xf32, strides=[1]>) {
       %c0 = constant <i32: 0> : tile<i32>
       %c32 = constant <i32: 32> : tile<i32>
       %iota = iota : tile<32xi32>
@@ -517,6 +532,9 @@ module {
         %base_bc = broadcast %base_1d : tile<1xptr<f32>> -> tile<32xptr<f32>>
         %ptr = offset %base_bc, %off : tile<32xptr<f32>>, tile<32xi32> -> tile<32xptr<f32>>
         %tile, %tok = load_ptr_tko weak %ptr, %mask : tile<32xptr<f32>>, tile<32xi1> -> tile<32xf32>, !cuda_tile.token
+        %out_view = make_partition_view %out : partition_view<tile=(32), tensor_view<32xf32, strides=[1]>>
+        %out_index = constant <i32: 0> : tile<i32>
+        %stored = store_view_tko weak %tile, %out_view[%out_index] : tile<32xf32>, partition_view<tile=(32), tensor_view<32xf32, strides=[1]>>, tile<i32> -> !cuda_tile.token
         continue
       }
       return
@@ -527,10 +545,10 @@ module {
     // lift this even though flattenOffset splits the addi at the top level.
     // -----------------------------------------------------------------------
     // CHECK-LABEL: entry @load_1d_bias
-    // CHECK-SAME: (%[[BASE_B:.*]]: tile<ptr<bf16>>, %[[N_B:.*]]: tile<i32>)
+    // CHECK-SAME: (%[[BASE_B:.*]]: tile<ptr<bf16>>, %[[N_B:.*]]: tile<i32>, %{{.*}}: tensor_view<32xbf16, strides=[1]>)
     // CHECK-GPU-LABEL: gpu.func @load_1d_bias
-    // CHECK-GPU-SAME: (%[[GBASE:.*]]: memref<*xbf16>, %[[GN:.*]]: i32)
-    entry @load_1d_bias(%base: tile<ptr<bf16>>, %N: tile<i32>) {
+    // CHECK-GPU-SAME: (%[[GBASE:.*]]: memref<*xbf16>, %[[GN:.*]]: i32, %{{.*}}: memref<32xbf16, strided<[1], offset: ?>>)
+    entry @load_1d_bias(%base: tile<ptr<bf16>>, %N: tile<i32>, %out: tensor_view<32xbf16, strides=[1]>) {
       %iota = iota : tile<32xi32>
       %blockId_x, %blockId_y, %blockId_z = get_tile_block_id : tile<i32>
       %c32 = constant <i32: 32> : tile<i32>
@@ -552,11 +570,14 @@ module {
       // The original pointer-arithmetic ops must be fully gone after lifting.
       // CHECK-NOT: load_ptr_tko
       // CHECK-NOT: offset
+      // CHECK-GPU: %[[GPAD:.*]] = arith.constant 0.000000e+00 : bf16
       // CHECK-GPU: %[[GSIZE:.*]] = arith.index_cast %[[GN]] : i32 to index
       // CHECK-GPU: %[[GVIEW:.*]] = memref.reinterpret_cast %[[GBASE]] to offset: [0], sizes: [%[[GSIZE]]], strides: [1] : memref<*xbf16> to memref<?xbf16, strided<[1], offset: ?>>
-      // CHECK-GPU: %[[GPAD:.*]] = arith.constant 0.000000e+00 : bf16
       // CHECK-GPU: %{{.*}} = vector.transfer_read %[[GVIEW]][%{{.*}}], %[[GPAD]] : memref<?xbf16, strided<[1], offset: ?>>, vector<32xbf16>
       %v, %t = load_ptr_tko weak %ptr, %mask, %cst_pad : tile<32xptr<bf16>>, tile<32xi1>, tile<32xbf16> -> tile<32xbf16>, !cuda_tile.token
+      %out_view = make_partition_view %out : partition_view<tile=(32), tensor_view<32xbf16, strides=[1]>>
+      %out_index = constant <i32: 0> : tile<i32>
+      %stored = store_view_tko weak %v, %out_view[%out_index] : tile<32xbf16>, partition_view<tile=(32), tensor_view<32xbf16, strides=[1]>>, tile<i32> -> !cuda_tile.token
       return
     }
 
@@ -714,7 +735,7 @@ module {
     // factor them into one partition index.
     // CHECK-LABEL: entry @load_flat_row_slice
     // CHECK-GPU-LABEL: gpu.func @load_flat_row_slice
-    entry @load_flat_row_slice(%base: tile<ptr<f32>>, %N: tile<i32>, %row: tile<i32>, %block: tile<i32>) {
+    entry @load_flat_row_slice(%base: tile<ptr<f32>>, %N: tile<i32>, %row: tile<i32>, %block: tile<i32>, %out: tensor_view<32xf32, strides=[1]>) {
       %D = constant <i32: 1024> : tile<i32>
       %BLOCK_SIZE = constant <i32: 32> : tile<i32>
       %lane = iota : tile<32xi32>
@@ -739,6 +760,9 @@ module {
       // CHECK-GPU: vector.transfer_read %[[ROW_VIEW]][%{{.*}}], %{{.*}} : memref<?xf32, strided<[1], offset: ?>>, vector<32xf32>
       // CHECK-GPU-NOT: vector.gather
       %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<32xptr<f32>>, tile<32xi1>, tile<32xf32> -> tile<32xf32>, !cuda_tile.token
+      %out_view = make_partition_view %out : partition_view<tile=(32), tensor_view<32xf32, strides=[1]>>
+      %out_index = constant <i32: 0> : tile<i32>
+      %stored = store_view_tko weak %tile, %out_view[%out_index] : tile<32xf32>, partition_view<tile=(32), tensor_view<32xf32, strides=[1]>>, tile<i32> -> !cuda_tile.token
       return
     }
 
@@ -747,7 +771,7 @@ module {
     // the induction variable is a valid tile index after division by 32.
     // CHECK-LABEL: entry @load_flat_row_loop_slice
     // CHECK-GPU-LABEL: gpu.func @load_flat_row_loop_slice
-    entry @load_flat_row_loop_slice(%base: tile<ptr<f32>>, %N: tile<i32>) {
+    entry @load_flat_row_loop_slice(%base: tile<ptr<f32>>, %N: tile<i32>, %out: tensor_view<32xf32, strides=[1]>) {
       %c0 = constant <i32: 0> : tile<i32>
       %c32 = constant <i32: 32> : tile<i32>
       %c1024 = constant <i32: 1024> : tile<i32>
@@ -780,6 +804,9 @@ module {
         %mask = cmpi less_than %index, %N_bc, signed : tile<32xi32> -> tile<32xi1>
         %ptr = offset %base_bc, %index : tile<32xptr<f32>>, tile<32xi32> -> tile<32xptr<f32>>
         %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<32xptr<f32>>, tile<32xi1>, tile<32xf32> -> tile<32xf32>, !cuda_tile.token
+        %out_view = make_partition_view %out : partition_view<tile=(32), tensor_view<32xf32, strides=[1]>>
+        %out_index = constant <i32: 0> : tile<i32>
+        %stored = store_view_tko weak %tile, %out_view[%out_index] : tile<32xf32>, partition_view<tile=(32), tensor_view<32xf32, strides=[1]>>, tile<i32> -> !cuda_tile.token
         continue
       }
       return
@@ -790,7 +817,7 @@ module {
     // loop index for a static-width row view.
     // CHECK-LABEL: entry @load_row_local_loop_slice
     // CHECK-GPU-LABEL: gpu.func @load_row_local_loop_slice
-    entry @load_row_local_loop_slice(%base: tile<ptr<f32>>) {
+    entry @load_row_local_loop_slice(%base: tile<ptr<f32>>, %out: tensor_view<32xf32, strides=[1]>) {
       %c0 = constant <i32: 0> : tile<i32>
       %c32 = constant <i32: 32> : tile<i32>
       %c1024 = constant <i32: 1024> : tile<i32>
@@ -824,6 +851,9 @@ module {
         %global_index = addi %global_bc, %lane : tile<32xi32>
         %ptr = offset %base_bc, %global_index : tile<32xptr<f32>>, tile<32xi32> -> tile<32xptr<f32>>
         %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<32xptr<f32>>, tile<32xi1>, tile<32xf32> -> tile<32xf32>, !cuda_tile.token
+        %out_view = make_partition_view %out : partition_view<tile=(32), tensor_view<32xf32, strides=[1]>>
+        %out_index = constant <i32: 0> : tile<i32>
+        %stored = store_view_tko weak %tile, %out_view[%out_index] : tile<32xf32>, partition_view<tile=(32), tensor_view<32xf32, strides=[1]>>, tile<i32> -> !cuda_tile.token
         continue
       }
       return
@@ -839,11 +869,11 @@ module {
     // CHECK-NOT: make_tensor_view
     // CHECK: load_ptr_tko
     // CHECK-GPU-LABEL: gpu.func @maskedload_2d_conv
+    // CHECK-GPU: %[[LIMIT:.*]] = arith.constant dense<2147483644> : vector<2xi32>
     // CHECK-GPU: %[[OFFS:.*]] = arith.addi %{{.*}}, %{{.*}} : vector<2x4xi32>
     // CHECK-GPU: arith.index_cast %[[OFFS]] : vector<2x4xi32> to vector<2x4xindex>
     // CHECK-GPU: %[[FIRSTS2D:.*]] = vector.extract_strided_slice %[[OFFS]] offsets = [0, 0], sizes = [2, 1], strides = [1, 1]
     // CHECK-GPU: %[[FIRSTS:.*]] = vector.shape_cast %[[FIRSTS2D]] : vector<2x1xi32> to vector<2xi32>
-    // CHECK-GPU: %[[LIMIT:.*]] = arith.constant dense<2147483644> : vector<2xi32>
     // CHECK-GPU: %[[FITS:.*]] = arith.cmpi sle, %[[FIRSTS]], %[[LIMIT]] : vector<2xi32>
     // CHECK-GPU: %[[NOWRAP:.*]] = vector.reduction <and>, %[[FITS]] : vector<2xi1> into i1
     // CHECK-GPU: scf.if %[[NOWRAP]] -> (vector<2x4xf16>) {
@@ -851,7 +881,7 @@ module {
     // CHECK-GPU: } else {
     // CHECK-GPU: vector.gather {{.*}} into vector<8xf16>
     // CHECK-GPU: }
-    entry @maskedload_2d_conv(%base: tile<ptr<f16>>, %shift: tile<i32>, %stride: tile<i32>) {
+    entry @maskedload_2d_conv(%base: tile<ptr<f16>>, %shift: tile<i32>, %stride: tile<i32>, %out: tensor_view<2x4xf16, strides=[4,1]>) {
       %zero = constant <i32: 0> : tile<i32>
       %start = subi %zero, %shift : tile<i32>
       %rows = iota : tile<2xi32>
@@ -883,17 +913,21 @@ module {
       %mask = trunci %mask_i16 : tile<2x4xi16> -> tile<2x4xi1>
       %pad = constant <f16: 0.000000e+00> : tile<2x4xf16>
       %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<2x4xptr<f16>>, tile<2x4xi1>, tile<2x4xf16> -> tile<2x4xf16>, !cuda_tile.token
+      %out_view = make_partition_view %out : partition_view<tile=(2x4), tensor_view<2x4xf16, strides=[4,1]>>
+      %out_index = constant <i32: 0> : tile<i32>
+      %stored = store_view_tko weak %tile, %out_view[%out_index, %out_index] : tile<2x4xf16>, partition_view<tile=(2x4), tensor_view<2x4xf16, strides=[4,1]>>, tile<i32> -> !cuda_tile.token
       return
     }
 
     // CHECK-LABEL: entry @maskedload_3d_conv
     // CHECK-NOT: make_tensor_view
     // CHECK: load_ptr_tko
+    // The rows are unmasked, so they load with vector.load.
     // CHECK-GPU-LABEL: gpu.func @maskedload_3d_conv
     // CHECK-GPU-NOT: scf.if
-    // CHECK-GPU-COUNT-8: vector.maskedload
+    // CHECK-GPU-COUNT-8: vector.load
     // CHECK-GPU-NOT: vector.gather
-    entry @maskedload_3d_conv(%base: tile<ptr<f32>>) {
+    entry @maskedload_3d_conv(%base: tile<ptr<f32>>, %out: tensor_view<2x4x4xf32, strides=[16,4,1]>) {
       %cols = iota : tile<4xi32>
       %cols_3d = reshape %cols : tile<4xi32> -> tile<1x1x4xi32>
       %offset = broadcast %cols_3d : tile<1x1x4xi32> -> tile<2x4x4xi32>
@@ -901,6 +935,9 @@ module {
       %base_bc = broadcast %base_3d : tile<1x1x1xptr<f32>> -> tile<2x4x4xptr<f32>>
       %ptr = offset %base_bc, %offset : tile<2x4x4xptr<f32>>, tile<2x4x4xi32> -> tile<2x4x4xptr<f32>>
       %tile, %token = load_ptr_tko weak %ptr : tile<2x4x4xptr<f32>> -> tile<2x4x4xf32>, !cuda_tile.token
+      %out_view = make_partition_view %out : partition_view<tile=(2x4x4), tensor_view<2x4x4xf32, strides=[16,4,1]>>
+      %out_index = constant <i32: 0> : tile<i32>
+      %stored = store_view_tko weak %tile, %out_view[%out_index, %out_index, %out_index] : tile<2x4x4xf32>, partition_view<tile=(2x4x4), tensor_view<2x4x4xf32, strides=[16,4,1]>>, tile<i32> -> !cuda_tile.token
       return
     }
 
@@ -916,7 +953,7 @@ module {
     // CHECK-GPU-COUNT-2: vector.maskedload
     // CHECK-GPU: } else {
     // CHECK-GPU: vector.gather
-    entry @maskedload_shifted_cols(%base: tile<ptr<f16>>, %shift: tile<i32>, %stride: tile<i32>, %col_start: tile<i32>) {
+    entry @maskedload_shifted_cols(%base: tile<ptr<f16>>, %shift: tile<i32>, %stride: tile<i32>, %col_start: tile<i32>, %out: tensor_view<2x4xf16, strides=[4,1]>) {
       %zero = constant <i32: 0> : tile<i32>
       %start = subi %zero, %shift : tile<i32>
       %rows = iota : tile<2xi32>
@@ -951,18 +988,22 @@ module {
       %mask = trunci %mask_i16 : tile<2x4xi16> -> tile<2x4xi1>
       %pad = constant <f16: 0.000000e+00> : tile<2x4xf16>
       %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<2x4xptr<f16>>, tile<2x4xi1>, tile<2x4xf16> -> tile<2x4xf16>, !cuda_tile.token
+      %out_view = make_partition_view %out : partition_view<tile=(2x4), tensor_view<2x4xf16, strides=[4,1]>>
+      %out_index = constant <i32: 0> : tile<i32>
+      %stored = store_view_tko weak %tile, %out_view[%out_index, %out_index] : tile<2x4xf16>, partition_view<tile=(2x4), tensor_view<2x4xf16, strides=[4,1]>>, tile<i32> -> !cuda_tile.token
       return
     }
 
     // Shifts flagged no_signed_wrap cannot wrap before the signed offset cast,
-    // so the row loads need no runtime check.
+    // so the row loads need no runtime check. The rows are unmasked, so they
+    // load with vector.load.
     // CHECK-LABEL: entry @maskedload_shifted_cols_nsw
     // CHECK-GPU-LABEL: gpu.func @maskedload_shifted_cols_nsw
     // CHECK-GPU-NOT: scf.if
-    // CHECK-GPU-COUNT-2: vector.maskedload
+    // CHECK-GPU-COUNT-2: vector.load
     // CHECK-GPU-NOT: vector.gather
     // CHECK-GPU: gpu.return
-    entry @maskedload_shifted_cols_nsw(%base: tile<ptr<f16>>, %stride: tile<i32>, %col_start: tile<i32>) {
+    entry @maskedload_shifted_cols_nsw(%base: tile<ptr<f16>>, %stride: tile<i32>, %col_start: tile<i32>, %out: tensor_view<2x4xf16, strides=[4,1]>) {
       %rows = iota : tile<2xi32>
       %rows_2d = reshape %rows : tile<2xi32> -> tile<2x1xi32>
       %stride_2d = reshape %stride : tile<i32> -> tile<1x1xi32>
@@ -980,6 +1021,9 @@ module {
       %base_bc = broadcast %base_2d : tile<1x1xptr<f16>> -> tile<2x4xptr<f16>>
       %ptr = offset %base_bc, %offset : tile<2x4xptr<f16>>, tile<2x4xi32> -> tile<2x4xptr<f16>>
       %tile, %token = load_ptr_tko weak %ptr : tile<2x4xptr<f16>> -> tile<2x4xf16>, !cuda_tile.token
+      %out_view = make_partition_view %out : partition_view<tile=(2x4), tensor_view<2x4xf16, strides=[4,1]>>
+      %out_index = constant <i32: 0> : tile<i32>
+      %stored = store_view_tko weak %tile, %out_view[%out_index, %out_index] : tile<2x4xf16>, partition_view<tile=(2x4), tensor_view<2x4xf16, strides=[4,1]>>, tile<i32> -> !cuda_tile.token
       return
     }
 
@@ -990,8 +1034,8 @@ module {
     // CHECK: load_ptr_tko
     // CHECK-GPU-LABEL: gpu.func @gather_minor_invariant
     // CHECK-GPU: vector.gather
-    // CHECK-GPU-NOT: vector.maskedload
-    entry @gather_minor_invariant(%base: tile<ptr<f32>>) {
+    // CHECK-GPU-NOT: vector.{{(masked)?}}load
+    entry @gather_minor_invariant(%base: tile<ptr<f32>>, %out: tensor_view<4x4xf32, strides=[4,1]>) {
       %rows = iota : tile<4xi32>
       %rows_2d = reshape %rows : tile<4xi32> -> tile<4x1xi32>
       %offset = broadcast %rows_2d : tile<4x1xi32> -> tile<4x4xi32>
@@ -999,6 +1043,9 @@ module {
       %base_bc = broadcast %base_2d : tile<1x1xptr<f32>> -> tile<4x4xptr<f32>>
       %ptr = offset %base_bc, %offset : tile<4x4xptr<f32>>, tile<4x4xi32> -> tile<4x4xptr<f32>>
       %tile, %token = load_ptr_tko weak %ptr : tile<4x4xptr<f32>> -> tile<4x4xf32>, !cuda_tile.token
+      %out_view = make_partition_view %out : partition_view<tile=(4x4), tensor_view<4x4xf32, strides=[4,1]>>
+      %out_index = constant <i32: 0> : tile<i32>
+      %stored = store_view_tko weak %tile, %out_view[%out_index, %out_index] : tile<4x4xf32>, partition_view<tile=(4x4), tensor_view<4x4xf32, strides=[4,1]>>, tile<i32> -> !cuda_tile.token
       return
     }
 
@@ -1055,21 +1102,20 @@ module {
       // The pointer tile is kept as an explicit offset op (no view lifting).
       // CHECK: %[[OFF:.*]] = offset %{{.*}}, %{{.*}} : tile<32x32xptr<bf16>>, tile<32x32xi32> -> tile<32x32xptr<bf16>>
       // CHECK: %[[GV:.*]], %[[GTOK:.*]] = load_ptr_tko weak %[[OFF]], %[[GMASK:.*]], %{{.*}} : tile<32x32xptr<bf16>>, tile<32x32xi1>, tile<32x32xbf16> -> tile<32x32xbf16>, token
-      // CHECK-GPU-DAG: %[[GBASE:.*]] = memref.cast %[[SBASE]] : memref<*xbf16> to memref<?xbf16, strided<[1], offset: ?>>
       // vector.gather only lowers to LLVM for rank-1 vectors, so the multi-dim
-      // index/mask/passthrough are flattened to rank-1 with vector.shape_cast,
-      // a single rank-1 gather is emitted, and the result is shape_cast back.
+      // index/mask/passthrough are flattened to rank-1 with vector.shape_cast
+      // (the constant passthrough folds) and a single rank-1 gather is emitted.
+      // CHECK-GPU-DAG: %[[GPAD:.*]] = arith.constant dense<0.000000e+00> : vector<1024xbf16>
+      // CHECK-GPU-DAG: %[[GBASE:.*]] = memref.cast %[[SBASE]] : memref<*xbf16> to memref<?xbf16, strided<[1], offset: ?>>
       // CHECK-GPU: %[[GIDX:.*]] = vector.shape_cast %{{.*}} : vector<32x32xindex> to vector<1024xindex>
       // CHECK-GPU: %[[GMASK1D:.*]] = vector.shape_cast %{{.*}} : vector<32x32xi1> to vector<1024xi1>
-      // CHECK-GPU: %[[GPAD:.*]] = vector.shape_cast %{{.*}} : vector<32x32xbf16> to vector<1024xbf16>
-      // CHECK-GPU: %[[GATHERED1D:.*]] = vector.gather %[[GBASE]][%{{.*}}] [%[[GIDX]]], %[[GMASK1D]], %[[GPAD]] : memref<?xbf16, strided<[1], offset: ?>>, vector<1024xindex>, vector<1024xi1>, vector<1024xbf16> into vector<1024xbf16>
-      // CHECK-GPU: %[[GATHERED:.*]] = vector.shape_cast %[[GATHERED1D]] : vector<1024xbf16> to vector<32x32xbf16>
+      // CHECK-GPU: %[[GATHERED:.*]] = vector.gather %[[GBASE]][%{{.*}}] [%[[GIDX]]], %[[GMASK1D]], %[[GPAD]] : memref<?xbf16, strided<[1], offset: ?>>, vector<1024xindex>, vector<1024xi1>, vector<1024xbf16> into vector<1024xbf16>
       %v, %t = load_ptr_tko weak %ptr, %mask, %pad : tile<32x32xptr<bf16>>, tile<32x32xi1>, tile<32x32xbf16> -> tile<32x32xbf16>, !cuda_tile.token
       // Store (scatter)
       // CHECK: store_ptr_tko weak %[[OFF]], %[[GV]], %[[GMASK]] : tile<32x32xptr<bf16>>, tile<32x32xbf16>, tile<32x32xi1> -> token
-      // The value is likewise flattened to rank-1 before the rank-1 scatter.
-      // CHECK-GPU: %[[SVAL:.*]] = vector.shape_cast %[[GATHERED]] : vector<32x32xbf16> to vector<1024xbf16>
-      // CHECK-GPU: vector.scatter %{{.*}}[%{{.*}}] [%{{.*}}], %{{.*}}, %[[SVAL]] : memref<?xbf16, strided<[1], offset: ?>>, vector<1024xindex>, vector<1024xi1>, vector<1024xbf16>
+      // The scatter is likewise flattened to rank-1. It stores the rank-1
+      // gather result directly, as the shape_casts in between cancel.
+      // CHECK-GPU: vector.scatter %[[GBASE]][%{{.*}}] [%[[GIDX]]], %[[GMASK1D]], %[[GATHERED]] : memref<?xbf16, strided<[1], offset: ?>>, vector<1024xindex>, vector<1024xi1>, vector<1024xbf16>
       %57 = store_ptr_tko weak %ptr, %v, %mask : tile<32x32xptr<bf16>>, tile<32x32xbf16>, tile<32x32xi1> -> !cuda_tile.token
       return
     }
@@ -1114,20 +1160,17 @@ module {
       // Load (gather) — no mask operand.
       // CHECK: %[[NMOFF:.*]] = offset %{{.*}}, %{{.*}} : tile<16x16xptr<f32>>, tile<16x16xi32> -> tile<16x16xptr<f32>>
       // CHECK: %[[NMV:.*]], %{{.*}} = load_ptr_tko weak %[[NMOFF]] : tile<16x16xptr<f32>> -> tile<16x16xf32>, token
+      // With no original mask, an all-true mask is materialized then flattened,
+      // which folds to a rank-1 all-true constant.
+      // CHECK-GPU-DAG: %[[NMMASK1D:.*]] = arith.constant dense<true> : vector<256xi1>
+      // CHECK-GPU-DAG: %[[NMPAD:.*]] = arith.constant dense<0.000000e+00> : vector<256xf32>
       // CHECK-GPU-DAG: %[[NMB:.*]] = memref.cast %[[NMBASE]] : memref<*xf32> to memref<?xf32, strided<[1], offset: ?>>
-      // With no original mask, an all-true mask is materialized then flattened.
-      // CHECK-GPU: %[[NMTRUE:.*]] = arith.constant true
-      // CHECK-GPU: %[[NMMASK2D:.*]] = vector.broadcast %[[NMTRUE]] : i1 to vector<16x16xi1>
       // CHECK-GPU: %[[NMIDX:.*]] = vector.shape_cast %{{.*}} : vector<16x16xindex> to vector<256xindex>
-      // CHECK-GPU: %[[NMMASK1D:.*]] = vector.shape_cast %[[NMMASK2D]] : vector<16x16xi1> to vector<256xi1>
-      // CHECK-GPU: %[[NMPAD:.*]] = vector.shape_cast %{{.*}} : vector<16x16xf32> to vector<256xf32>
-      // CHECK-GPU: %[[NMGATH1D:.*]] = vector.gather %[[NMB]][%{{.*}}] [%[[NMIDX]]], %[[NMMASK1D]], %[[NMPAD]] : memref<?xf32, strided<[1], offset: ?>>, vector<256xindex>, vector<256xi1>, vector<256xf32> into vector<256xf32>
-      // CHECK-GPU: %[[NMGATH:.*]] = vector.shape_cast %[[NMGATH1D]] : vector<256xf32> to vector<16x16xf32>
+      // CHECK-GPU: %[[NMGATH:.*]] = vector.gather %[[NMB]][%{{.*}}] [%[[NMIDX]]], %[[NMMASK1D]], %[[NMPAD]] : memref<?xf32, strided<[1], offset: ?>>, vector<256xindex>, vector<256xi1>, vector<256xf32> into vector<256xf32>
       %v, %t = load_ptr_tko weak %ptr : tile<16x16xptr<f32>> -> tile<16x16xf32>, !cuda_tile.token
       // Store (scatter) — no mask operand.
       // CHECK: store_ptr_tko weak %[[NMOFF]], %[[NMV]] : tile<16x16xptr<f32>>, tile<16x16xf32> -> token
-      // CHECK-GPU: %[[NMSVAL:.*]] = vector.shape_cast %[[NMGATH]] : vector<16x16xf32> to vector<256xf32>
-      // CHECK-GPU: vector.scatter %{{.*}}[%{{.*}}] [%{{.*}}], %{{.*}}, %[[NMSVAL]] : memref<?xf32, strided<[1], offset: ?>>, vector<256xindex>, vector<256xi1>, vector<256xf32>
+      // CHECK-GPU: vector.scatter %[[NMB]][%{{.*}}] [%[[NMIDX]]], %[[NMMASK1D]], %[[NMGATH]] : memref<?xf32, strided<[1], offset: ?>>, vector<256xindex>, vector<256xi1>, vector<256xf32>
       %st = store_ptr_tko weak %ptr, %v : tile<16x16xptr<f32>>, tile<16x16xf32> -> !cuda_tile.token
       return
     }
@@ -1212,7 +1255,7 @@ module {
     // -----------------------------------------------------------------------
     // CHECK-LABEL: entry @matmul_lhs_loop
     // CHECK-GPU-LABEL: gpu.func @matmul_lhs_loop
-    entry @matmul_lhs_loop(%A: tile<ptr<f32>>, %M: tile<i32>, %K: tile<i32>, %stride_am: tile<i32>) {
+    entry @matmul_lhs_loop(%A: tile<ptr<f32>>, %M: tile<i32>, %K: tile<i32>, %stride_am: tile<i32>, %out: tensor_view<64x16xf32, strides=[16,1]>) {
       %c0 = constant <i32: 0> : tile<i32>
       %c1 = constant <i32: 1> : tile<i32>
       %c16 = constant <i32: 16> : tile<i32>
@@ -1269,6 +1312,9 @@ module {
         %kcmp = cmpi less_than %cols_2d, %resid_bc, signed : tile<1x16xi32> -> tile<1x16xi1>
         %mask = broadcast %kcmp : tile<1x16xi1> -> tile<64x16xi1>
         %v, %t = load_ptr_tko weak %iterPtr, %mask, %pad : tile<64x16xptr<f32>>, tile<64x16xi1>, tile<64x16xf32> -> tile<64x16xf32>, !cuda_tile.token
+        %out_view = make_partition_view %out : partition_view<tile=(64x16), tensor_view<64x16xf32, strides=[16,1]>>
+        %out_index = constant <i32: 0> : tile<i32>
+        %stored = store_view_tko weak %v, %out_view[%out_index, %out_index] : tile<64x16xf32>, partition_view<tile=(64x16), tensor_view<64x16xf32, strides=[16,1]>>, tile<i32> -> !cuda_tile.token
         %next = offset %iterPtr, %c16_2d : tile<64x16xptr<f32>>, tile<64x16xi32> -> tile<64x16xptr<f32>>
         continue %next : tile<64x16xptr<f32>>
       }
@@ -1279,7 +1325,7 @@ module {
     // K dimension, so the base pointer moves to the K tile of each iteration.
     // CHECK-LABEL: entry @matmul_lhs_loop_unmasked_k
     // CHECK-GPU-LABEL: gpu.func @matmul_lhs_loop_unmasked_k
-    entry @matmul_lhs_loop_unmasked_k(%A: tile<ptr<f32>>, %M: tile<i32>, %K: tile<i32>, %stride_am: tile<i32>) {
+    entry @matmul_lhs_loop_unmasked_k(%A: tile<ptr<f32>>, %M: tile<i32>, %K: tile<i32>, %stride_am: tile<i32>, %out: tensor_view<64x16xf32, strides=[16,1]>) {
       %c0 = constant <i32: 0> : tile<i32>
       %c1 = constant <i32: 1> : tile<i32>
       %c64 = constant <i32: 64> : tile<i32>
@@ -1328,6 +1374,9 @@ module {
       %for = for %loopIdx in (%c0 to %K, step %c1) : tile<i32>
           iter_values(%iterPtr = %ptr_init) -> (tile<64x16xptr<f32>>) {
         %v, %t = load_ptr_tko weak %iterPtr, %mask, %pad : tile<64x16xptr<f32>>, tile<64x16xi1>, tile<64x16xf32> -> tile<64x16xf32>, !cuda_tile.token
+        %out_view = make_partition_view %out : partition_view<tile=(64x16), tensor_view<64x16xf32, strides=[16,1]>>
+        %out_index = constant <i32: 0> : tile<i32>
+        %stored = store_view_tko weak %v, %out_view[%out_index, %out_index] : tile<64x16xf32>, partition_view<tile=(64x16), tensor_view<64x16xf32, strides=[16,1]>>, tile<i32> -> !cuda_tile.token
         %next = offset %iterPtr, %c16_2d : tile<64x16xptr<f32>>, tile<64x16xi32> -> tile<64x16xptr<f32>>
         continue %next : tile<64x16xptr<f32>>
       }
@@ -1378,7 +1427,7 @@ module {
     // -----------------------------------------------------------------------
     // CHECK-LABEL: entry @load_1d_widened_index
     // CHECK-GPU-LABEL: gpu.func @load_1d_widened_index
-    entry @load_1d_widened_index(%arg0: tile<ptr<i32>>, %arg1: tile<i32>) {
+    entry @load_1d_widened_index(%arg0: tile<ptr<i32>>, %arg1: tile<i32>, %out: tensor_view<128xi32, strides=[1]>) {
       %cst_0 = constant <i32: 0> : tile<i32>
       %cst_128 = constant <i32: 128> : tile<i32>
       %block_id_x, %block_id_y, %block_id_z = get_tile_block_id : tile<i32>
@@ -1405,6 +1454,9 @@ module {
       // CHECK-GPU: vector.transfer_read %[[WVIEW]][%{{.*}}], %{{.*}} : memref<?xi32, strided<[1], offset: ?>>, vector<128xi32>
       // CHECK-GPU-NOT: vector.gather
       %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<128xptr<i32>>, tile<128xi1>, tile<128xi32> -> tile<128xi32>, !cuda_tile.token
+      %out_view = make_partition_view %out : partition_view<tile=(128), tensor_view<128xi32, strides=[1]>>
+      %out_index = constant <i32: 0> : tile<i32>
+      %stored = store_view_tko weak %tile, %out_view[%out_index] : tile<128xi32>, partition_view<tile=(128), tensor_view<128xi32, strides=[1]>>, tile<i32> -> !cuda_tile.token
       return
     }
 
@@ -1414,7 +1466,7 @@ module {
     // access lifts exactly like the signed-widened one above.
     // CHECK-LABEL: entry @load_1d_widened_index_unsigned
     // CHECK-GPU-LABEL: gpu.func @load_1d_widened_index_unsigned
-    entry @load_1d_widened_index_unsigned(%arg0: tile<ptr<f32>>, %arg1: tile<i32>) {
+    entry @load_1d_widened_index_unsigned(%arg0: tile<ptr<f32>>, %arg1: tile<i32>, %out: tensor_view<128xf32, strides=[1]>) {
       %cst_128 = constant <i32: 128> : tile<i32>
       %block_id_x, %block_id_y, %block_id_z = get_tile_block_id : tile<i32>
       %start = muli %block_id_x, %cst_128 : tile<i32>
@@ -1437,12 +1489,15 @@ module {
       // CHECK-GPU: vector.transfer_read
       // CHECK-GPU-NOT: vector.gather
       %tile, %token = load_ptr_tko weak %ptr, %mask : tile<128xptr<f32>>, tile<128xi1> -> tile<128xf32>, !cuda_tile.token
+      %out_view = make_partition_view %out : partition_view<tile=(128), tensor_view<128xf32, strides=[1]>>
+      %out_index = constant <i32: 0> : tile<i32>
+      %stored = store_view_tko weak %tile, %out_view[%out_index] : tile<128xf32>, partition_view<tile=(128), tensor_view<128xf32, strides=[1]>>, tile<i32> -> !cuda_tile.token
       return
     }
 
     // CHECK-LABEL: entry @load_static_splat_bounds
     // CHECK-GPU-LABEL: gpu.func @load_static_splat_bounds
-    entry @load_static_splat_bounds(%arg0: tile<ptr<f16>>) {
+    entry @load_static_splat_bounds(%arg0: tile<ptr<f16>>, %out: tensor_view<4x8xf16, strides=[8,1]>) {
       %rows = iota : tile<4xi32>
       %cols = iota : tile<8xi32>
       %rows_i64 = exti %rows signed : tile<4xi32> -> tile<4xi64>
@@ -1486,6 +1541,9 @@ module {
       // CHECK-GPU: vector.transfer_read
       // CHECK-GPU-NOT: vector.gather
       %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<4x8xptr<f16>>, tile<4x8xi1>, tile<4x8xf16> -> tile<4x8xf16>, !cuda_tile.token
+      %out_view = make_partition_view %out : partition_view<tile=(4x8), tensor_view<4x8xf16, strides=[8,1]>>
+      %out_index = constant <i32: 0> : tile<i32>
+      %stored = store_view_tko weak %tile, %out_view[%out_index, %out_index] : tile<4x8xf16>, partition_view<tile=(4x8), tensor_view<4x8xf16, strides=[8,1]>>, tile<i32> -> !cuda_tile.token
       return
     }
   }

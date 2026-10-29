@@ -1,7 +1,7 @@
 add_library(TileIRToMLIR STATIC
+  CanonicalizeFromTileIR.cpp
   ConvertMemrefArgsToRankedMemref.cpp
   ConvertMemrefArgsToPtrArgs.cpp
-  PostConversion.cpp
   TileIRToMLIR.cpp
   TileIRPtrToView.cpp
 )

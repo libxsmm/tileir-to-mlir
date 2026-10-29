@@ -33,6 +33,9 @@ def ConvertTileIRToMLIRPass : Pass<"convert-tileir-to-mlir", "ModuleOp"> {
     of the lowered entry functions are bare pointers: callers must pass
     descriptors whose offset is zero, as the bare-pointer calling convention
     of `convert-memref-args-to-ptr-args` does.
+
+    The result is meant to be optimized with `canonicalize-from-tileir`, which
+    also flattens n-D gathers and scatters for the LLVM lowering.
   }];
   let dependentDialects = [
     "cuda_tile::CudaTileDialect",
@@ -66,6 +69,30 @@ def ConvertTileIRToMLIRPass : Pass<"convert-tileir-to-mlir", "ModuleOp"> {
     ListOption<"knownBlockSize", "known-block-size", "int32_t",
                "Block size (x, y, z) to set as the known_block_size attribute on generated gpu.func ops; must be empty or exactly three values">
   ]; 
+}
+
+def CanonicalizeFromTileIRPass : Pass<"canonicalize-from-tileir", "ModuleOp"> {
+  let summary = "Optimize and clean up the output of convert-tileir-to-mlir";
+  let description = [{
+    Rewrites the IR that `convert-tileir-to-mlir` produces, then runs `cse`
+    and `canonicalize` on it:
+      * a loop whose induction variable indexes vector transfers tile by tile
+        is rescaled to step over element indices, so that the transfers are
+        indexed by the induction variable itself;
+      * a select between an unmasked `vector.transfer_read` and its padding
+        folds into the mask of the read;
+      * an n-D gather whose offsets are contiguous within each row becomes one
+        masked load per row, guarded by a runtime check if the offsets may wrap
+        in a narrower integer type;
+      * other n-D gathers and scatters are flattened to 1-D, the only form the
+        LLVM lowering supports.
+    Facts beyond the local IR are proven with integer range analysis.
+  }];
+  let dependentDialects = [
+    "arith::ArithDialect",
+    "scf::SCFDialect",
+    "vector::VectorDialect",
+  ];
 }
 
 def ConvertMemrefArgsToPtrArgsPass : Pass<"convert-memref-args-to-ptr-args", "ModuleOp"> {

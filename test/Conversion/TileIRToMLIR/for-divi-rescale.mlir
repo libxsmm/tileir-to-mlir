@@ -1,4 +1,4 @@
-// RUN: tileir-to-mlir --convert-tileir-to-mlir %s | FileCheck %s
+// RUN: tileir-to-mlir --convert-tileir-to-mlir --canonicalize-from-tileir %s | FileCheck %s
 
 // A loop whose induction variable indexes a view tile by tile is rescaled to
 // iterate over element indices, so that the transfers index with the induction
@@ -31,11 +31,10 @@ cuda_tile.module @for_divi_rescale_module {
     %k_bounded = assume bounded<0, ?>, %k_plus : tile<i32>
     %ub = divi %k_bounded, %c32 signed : tile<i32>
 
-    // CHECK: %[[C32_STEP:.*]] = arith.constant 32 : index
-    // CHECK: %{{.*}} = arith.muli %{{.*}}, %[[C32_STEP]] : index
-    // CHECK: %{{.*}} = arith.muli %{{.*}}, %[[C32_STEP]] : index
-    // CHECK: %[[LOOP_STEP:.*]] = arith.muli %{{.*}}, %[[C32_STEP]] : index
-    // CHECK: scf.for %[[IV:.*]] = %{{.*}} to %{{.*}} step %[[LOOP_STEP]]
+    // CHECK-DAG: %[[C0:.*]] = arith.constant 0 : index
+    // CHECK-DAG: %[[C32_STEP:.*]] = arith.constant 32 : index
+    // CHECK: %[[LOOP_UB:.*]] = arith.muli %{{.*}}, %[[C32_STEP]] : index
+    // CHECK: scf.for %[[IV:.*]] = %[[C0]] to %[[LOOP_UB]] step %[[C32_STEP]]
     %result = for %k in (%i0 to %ub, step %i1) : tile<i32>
         iter_values(%acc_prev = %cst) -> (tile<128x32xf16>)
     {
@@ -44,6 +43,7 @@ cuda_tile.module @for_divi_rescale_module {
       %A_frag, %t1 = load_view_tko weak %A_block[%bidx, %k] : partition_view<tile=(128x32), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>, tile<i32> -> tile<128x32xf16>, !cuda_tile.token
       continue %A_frag : tile<128x32xf16>
     }
+    %t2 = store_view_tko weak %result, %A_block[%bidx, %i0] : tile<128x32xf16>, partition_view<tile=(128x32), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>, tile<i32> -> !cuda_tile.token
     return
   }
 }
@@ -72,11 +72,10 @@ cuda_tile.module @for_wrapped_iv_index_rescale_module {
     %k_bounded = assume bounded<0, ?>, %k_plus : tile<i32>
     %ub = divi %k_bounded, %c32 signed : tile<i32>
 
-    // CHECK: %[[WRAPPED_C32_STEP:.*]] = arith.constant 32 : index
-    // CHECK: %{{.*}} = arith.muli %{{.*}}, %[[WRAPPED_C32_STEP]] : index
-    // CHECK: %{{.*}} = arith.muli %{{.*}}, %[[WRAPPED_C32_STEP]] : index
-    // CHECK: %[[WRAPPED_LOOP_STEP:.*]] = arith.muli %{{.*}}, %[[WRAPPED_C32_STEP]] : index
-    // CHECK: scf.for %[[WRAPPED_IV:.*]] = %{{.*}} to %{{.*}} step %[[WRAPPED_LOOP_STEP]]
+    // CHECK-DAG: %[[WRAPPED_C0:.*]] = arith.constant 0 : index
+    // CHECK-DAG: %[[WRAPPED_C32_STEP:.*]] = arith.constant 32 : index
+    // CHECK: %[[WRAPPED_LOOP_UB:.*]] = arith.muli %{{.*}}, %[[WRAPPED_C32_STEP]] : index
+    // CHECK: scf.for %[[WRAPPED_IV:.*]] = %[[WRAPPED_C0]] to %[[WRAPPED_LOOP_UB]] step %[[WRAPPED_C32_STEP]]
     %result = for %k in (%i0 to %ub, step %i1) : tile<i32>
         iter_values(%acc_prev = %cst) -> (tile<128x32xf16>)
     {
@@ -90,6 +89,7 @@ cuda_tile.module @for_wrapped_iv_index_rescale_module {
       %A_frag, %t1 = load_view_tko weak %A_block[%bidx, %wrapped_k] : partition_view<tile=(128x32), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>, tile<i32> -> tile<128x32xf16>, !cuda_tile.token
       continue %A_frag : tile<128x32xf16>
     }
+    %t2 = store_view_tko weak %result, %A_block[%bidx, %i0] : tile<128x32xf16>, partition_view<tile=(128x32), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>, tile<i32> -> !cuda_tile.token
     return
   }
 }
@@ -99,14 +99,14 @@ cuda_tile.module @for_wrapped_iv_index_rescale_module {
 // %k and the loop is rescaled.
 
 // CHECK-LABEL: gpu.func @for_unbounded_wrapped_iv_kernel
-// CHECK: %[[UNBOUNDED_C32:.*]] = arith.constant 32 : index
-// CHECK: %{{.*}} = arith.muli %{{.*}}, %[[UNBOUNDED_C32]] : index
-// CHECK: %{{.*}} = arith.muli %{{.*}}, %[[UNBOUNDED_C32]] : index
-// CHECK: %[[UNBOUNDED_STEP:.*]] = arith.muli %{{.*}}, %[[UNBOUNDED_C32]] : index
-// CHECK: scf.for %[[UNBOUNDED_IV:.*]] = %{{.*}} to %{{.*}} step %[[UNBOUNDED_STEP]] {
+// CHECK-DAG: %[[UNBOUNDED_C0:.*]] = arith.constant 0 : index
+// CHECK-DAG: %[[UNBOUNDED_C32:.*]] = arith.constant 32 : index
+// CHECK: %[[UNBOUNDED_UB:.*]] = arith.muli %{{.*}}, %[[UNBOUNDED_C32]] : index
+// CHECK: scf.for %[[UNBOUNDED_IV:.*]] = %[[UNBOUNDED_C0]] to %[[UNBOUNDED_UB]] step %[[UNBOUNDED_C32]] {
 // CHECK-NOT: arith.muli
 // CHECK-NOT: arith.divsi
 // CHECK: vector.transfer_read %{{.*}}[%[[UNBOUNDED_IV]]]
+// CHECK: vector.transfer_write %{{.*}}, %{{.*}}[%[[UNBOUNDED_IV]]]
 cuda_tile.module @for_unbounded_wrapped_iv_module {
   entry @for_unbounded_wrapped_iv_kernel(%A: !cuda_tile.tensor_view<?xf32, strides=[1]>,
                                          %n: !cuda_tile.tile<i32>) {
@@ -118,6 +118,7 @@ cuda_tile.module @for_unbounded_wrapped_iv_module {
       %scaled_k = muli %k, %c32 : tile<i32>
       %wrapped_k = divi %scaled_k, %c32 signed : tile<i32>
       %x, %t = load_view_tko weak %pv[%wrapped_k] : partition_view<tile=(32), tensor_view<?xf32, strides=[1]>>, tile<i32> -> tile<32xf32>, !cuda_tile.token
+      %t2 = store_view_tko weak %x, %pv[%wrapped_k] : tile<32xf32>, partition_view<tile=(32), tensor_view<?xf32, strides=[1]>>, tile<i32> -> !cuda_tile.token
       continue
     }
     return

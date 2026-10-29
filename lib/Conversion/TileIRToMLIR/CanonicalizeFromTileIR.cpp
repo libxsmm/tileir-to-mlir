@@ -1,41 +1,47 @@
-//===- PostConversion.cpp - Rewrites after the Tile IR conversion ---------===//
+//===- CanonicalizeFromTileIR.cpp - Clean up converted Tile IR ------------===//
 //
 // Part of the tileir-to-mlir project, under the Apache License v2.0 with LLVM
 // Exceptions. See https://llvm.org/LICENSE.txt for license information.
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Rewrites of the IR that --convert-tileir-to-mlir produces. They run after the
-// dialect conversion so that they see the final vector, arith and scf ops:
+// Rewrites of the IR that --convert-tileir-to-mlir produces, which no longer
+// contains Tile IR:
 //   - rescaleTileLoops makes loops over tile indices step over element indices,
 //     so that transfers are indexed by the induction variable itself;
-//   - scopeLoopAllocations bounds stack allocations in loops to one iteration,
-//     as in cuda_tile.for;
 //   - local patterns fold selects into transfer_read masks, load contiguous
 //     gather rows with masked loads, and flatten n-D gathers and scatters for
 //     the LLVM lowering.
 // Facts beyond the local IR are proven with integer range analysis
-// (IntegerFacts).
+// (IntegerFacts). CSE and canonicalization then clean up the result.
 //
 //===----------------------------------------------------------------------===//
 
-#include "PostConversion.h"
+#include "mlir/Conversion/TileIRToMLIR/Passes.h"
 
 #include "mlir/Analysis/DataFlow/IntegerRangeAnalysis.h"
 #include "mlir/Analysis/DataFlow/Utils.h"
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/VectorInterfaces.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/Passes.h"
+#include "mlir/Transforms/WalkPatternRewriteDriver.h"
 
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
+
+namespace mlir {
+#define GEN_PASS_DEF_CANONICALIZEFROMTILEIRPASS
+#include "mlir/Conversion/TileIRToMLIR/Passes.h.inc"
+} // namespace mlir
 
 using namespace mlir;
 
@@ -324,7 +330,8 @@ enum class StrideMode {
   Wide,
   /// Below the cast checked at runtime, in its narrower source type.
   Narrow,
-  /// Below a cast that must preserve the lanes exactly, so shifts must not wrap.
+  /// Below a cast that must preserve the lanes exactly, so shifts must not
+  /// wrap.
   Exact,
 };
 } // namespace
@@ -338,7 +345,7 @@ static FailureOr<Operation *> matchUnitMinorStride(
     arith::IntegerOverflowFlags noWrap = arith::IntegerOverflowFlags::none) {
   Operation *def = value.getDefiningOp();
   if (isa_and_nonnull<arith::IndexCastOp, arith::IndexCastUIOp, arith::ExtSIOp,
-                     arith::ExtUIOp>(def)) {
+                      arith::ExtUIOp>(def)) {
     Value source = def->getOperand(0);
     unsigned sourceWidth =
         ConstantIntRanges::getStorageBitwidth(source.getType());
@@ -370,16 +377,14 @@ static FailureOr<Operation *> matchUnitMinorStride(
   if (auto shapeCast = value.getDefiningOp<vector::ShapeCastOp>()) {
     if (!isMinorOnlyShape(shapeCast.getSourceVectorType(), minorSize))
       return failure();
-    return matchUnitMinorStride(shapeCast.getSource(), minorSize, mode,
-                                noWrap);
+    return matchUnitMinorStride(shapeCast.getSource(), minorSize, mode, noWrap);
   }
   if (auto broadcast = value.getDefiningOp<vector::BroadcastOp>()) {
     // A scalar source cannot carry a step, so a vector source is required.
     auto sourceTy = dyn_cast<VectorType>(broadcast.getSource().getType());
     if (!isMinorOnlyShape(sourceTy, minorSize))
       return failure();
-    return matchUnitMinorStride(broadcast.getSource(), minorSize, mode,
-                                noWrap);
+    return matchUnitMinorStride(broadcast.getSource(), minorSize, mode, noWrap);
   }
   // Shifting by a minor-invariant term moves a row without restriding it. The
   // shift may sit either side of a replication, e.g. `broadcast(start + iota)`.
@@ -425,16 +430,16 @@ static Value createNoRowWrapCheck(PatternRewriter &rewriter, Location loc,
 
   bool signedCast = isa<arith::IndexCastOp, arith::ExtSIOp>(wrapCast);
   unsigned width = sourceTy.getElementTypeBitWidth();
-  APInt max = signedCast ? APInt::getSignedMaxValue(width)
-                         : APInt::getMaxValue(width);
+  APInt max =
+      signedCast ? APInt::getSignedMaxValue(width) : APInt::getMaxValue(width);
   APInt limit = max - (columns - 1);
   Value bound = arith::ConstantOp::create(
       rewriter, loc,
       DenseElementsAttr::get(cast<VectorType>(firsts.getType()), limit));
-  Value fits = arith::CmpIOp::create(
-      rewriter, loc,
-      signedCast ? arith::CmpIPredicate::sle : arith::CmpIPredicate::ule,
-      firsts, bound);
+  Value fits = arith::CmpIOp::create(rewriter, loc,
+                                     signedCast ? arith::CmpIPredicate::sle
+                                                : arith::CmpIPredicate::ule,
+                                     firsts, bound);
   return vector::ReductionOp::create(rewriter, loc, vector::CombiningKind::AND,
                                      fits);
 }
@@ -465,9 +470,9 @@ static Value createRowLoads(PatternRewriter &rewriter,
     Value rowPassThru = vector::ExtractOp::create(rewriter, loc, passThru, row);
     // The gather's alignment holds only for the lanes it accesses, which
     // need not include the first lane of the row.
-    auto load = vector::MaskedLoadOp::create(
-        rewriter, loc, rowTy, gather.getBase(), offsets, rowMask, rowPassThru,
-        llvm::MaybeAlign());
+    auto load = vector::MaskedLoadOp::create(rewriter, loc, rowTy,
+                                             gather.getBase(), offsets, rowMask,
+                                             rowPassThru, llvm::MaybeAlign());
     load->setDiscardableAttrs(gather->getDiscardableAttrDictionary());
     result =
         vector::InsertOp::create(rewriter, loc, load.getResult(), result, row);
@@ -585,12 +590,14 @@ struct FlattenScatter : public OpRewritePattern<vector::ScatterOp> {
 
 } // namespace
 
-void mlir::tileir::populatePostConversionPatterns(RewritePatternSet &patterns) {
-  patterns.add<FoldSelectIntoTransferReadMask, LowerGatherToRowLoads,
-               FlattenGather, FlattenScatter>(patterns.getContext());
-}
-
-void mlir::tileir::rescaleTileLoops(Operation *root) {
+/// Index vector transfers directly by loop induction variables:
+///   - a loop whose induction variable `iv` indexes transfers as `iv * T` is
+///     rescaled to step over element indices, which makes those indices `iv`;
+///     other uses get `iv / T`;
+///   - a transfer index `(iv / T) * T`, where `iv` is always a multiple of
+///     `T`, becomes `iv`.
+/// Integer range analysis proves every rewrite exact.
+static void rescaleTileLoops(Operation *root) {
   IntegerFacts facts(root);
   if (!facts.isValid())
     return;
@@ -680,28 +687,27 @@ void mlir::tileir::rescaleTileLoops(Operation *root) {
   }
 }
 
-void mlir::tileir::scopeLoopAllocations(Operation *root) {
-  llvm::SetVector<scf::ForOp> loops;
-  root->walk([&](memref::AllocaOp alloca) {
-    Operation *scope = alloca->getParentOp();
-    while (scope && !isa<scf::ForOp>(scope) &&
-           !scope->hasTrait<OpTrait::AutomaticAllocationScope>())
-      scope = scope->getParentOp();
-    if (auto loop = dyn_cast_or_null<scf::ForOp>(scope))
-      loops.insert(loop);
-  });
-  for (scf::ForOp loop : loops) {
-    Block *body = loop.getBody();
-    auto yield = cast<scf::YieldOp>(body->getTerminator());
-    OpBuilder builder(yield);
-    auto scope = memref::AllocaScopeOp::create(builder, loop.getLoc(),
-                                               yield.getOperandTypes());
-    Block *scopeBody = builder.createBlock(&scope.getBodyRegion());
-    scopeBody->getOperations().splice(scopeBody->end(), body->getOperations(),
-                                      body->begin(), scope->getIterator());
-    builder.setInsertionPointToEnd(scopeBody);
-    memref::AllocaScopeReturnOp::create(builder, loop.getLoc(),
-                                        yield.getOperands());
-    yield->setOperands(scope.getResults());
+namespace {
+
+struct CanonicalizeFromTileIRPass
+    : public impl::CanonicalizeFromTileIRPassBase<CanonicalizeFromTileIRPass> {
+  void runOnOperation() override {
+    MLIRContext *ctx = &getContext();
+    ModuleOp module = getOperation();
+
+    rescaleTileLoops(module);
+
+    RewritePatternSet patterns(ctx);
+    patterns.add<FoldSelectIntoTransferReadMask, LowerGatherToRowLoads,
+                 FlattenGather, FlattenScatter>(ctx);
+    walkAndApplyPatterns(module, std::move(patterns));
+
+    OpPassManager cleanup(ModuleOp::getOperationName());
+    cleanup.addPass(createCSEPass());
+    cleanup.addPass(createCanonicalizerPass());
+    if (failed(runPipeline(cleanup, module)))
+      return signalPassFailure();
   }
-}
+};
+
+} // namespace

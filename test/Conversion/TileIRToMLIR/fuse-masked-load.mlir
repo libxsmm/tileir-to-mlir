@@ -1,4 +1,4 @@
-// RUN: tileir-to-mlir --convert-tileir-to-mlir='target=gpu append-grid-args=false' %s | FileCheck %s
+// RUN: tileir-to-mlir --convert-tileir-to-mlir='target=gpu append-grid-args=false' --canonicalize-from-tileir %s | FileCheck %s
 
 // A select that rewrites lanes with the loaded view's own padding value is
 // folded into the transfer_read mask, so those lanes are never loaded. The
@@ -6,9 +6,9 @@
 // out-of-bounds protection.
 
 // CHECK-LABEL: gpu.func @fuse_mask_into_load
+// CHECK: %[[PAD:.*]] = arith.constant 0xFF800000 : f32
 // CHECK: %[[MASK:.*]] = arith.cmpi slt, %{{.*}} : vector<32xi32>
 // CHECK: memref.reinterpret_cast
-// CHECK: %[[PAD:.*]] = arith.constant 0xFF800000 : f32
 // CHECK-NEXT: vector.transfer_read %{{.*}}[%{{.*}}], %[[PAD]], %[[MASK]] : memref<?xf32, strided<[1], offset: ?>>, vector<32xf32>
 // CHECK-NOT: arith.select
 

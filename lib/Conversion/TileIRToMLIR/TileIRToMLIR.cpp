@@ -23,7 +23,7 @@
 //
 // The file holds shared helpers and pattern templates, the patterns roughly in
 // alphabetical order of the cuda_tile op, the type converter and pattern list,
-// and the pass, which applies the rewrites of PostConversion.h afterwards.
+// and the pass. --canonicalize-from-tileir optimizes and cleans up the result.
 //
 // Not lowered: AssertOp, AtomicCASTkoOp, AtomicRedViewTkoOp, BreakOp,
 // IntToPtrOp, LoopOp, MmafScaledOp, PrintTkoOp, PtrToIntOp, accesses through a
@@ -34,8 +34,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Conversion/TileIRToMLIR/Passes.h"
-
-#include "PostConversion.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
@@ -49,15 +47,14 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/Iterators.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
-#include "mlir/Transforms/WalkPatternRewriteDriver.h"
 
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 #include "cuda_tile/Dialect/CudaTile/IR/Dialect.h"
@@ -278,7 +275,7 @@ static Value rebuildInIndex(OpBuilder &builder, Location loc, Value value,
   Operation *def = value.getDefiningOp();
   if (auto cast = dyn_cast_or_null<arith::IndexCastOp>(def)) {
     // Only loop counters are looked through: truncating other `index` values,
-    // e.g. shape queries, conveys their range to rescaleTileLoops.
+    // e.g. shape queries, conveys their range to --canonicalize-from-tileir.
     auto iv = dyn_cast<BlockArgument>(cast.getIn());
     auto loop =
         iv ? dyn_cast<scf::ForOp>(iv.getOwner()->getParentOp()) : scf::ForOp();
@@ -1438,8 +1435,8 @@ struct ConvertFma : public OptionsPattern<cuda_tile::FmaOp> {
 /// unsigned and signed comparison agree, so the `unsigned` attribute does not
 /// change the loop. The body is merged into the new loop with the induction
 /// variable truncated to its original type, which toIndex looks through.
-/// Loops whose induction variable indexes tiles are rescaled after the
-/// conversion (see rescaleTileLoops).
+/// --canonicalize-from-tileir rescales loops whose induction variable indexes
+/// tiles.
 struct ConvertFor : public OpConversionPattern<cuda_tile::ForOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -2852,7 +2849,35 @@ static void populateTileIRToMLIRConversionPatterns(
 // Pass Definition
 //===----------------------------------------------------------------------===//
 
-/// Converts all cuda_tile ops, then applies the rewrites of PostConversion.h.
+/// Wrap the body of every scf.for that allocates on the stack in a
+/// memref.alloca_scope, which cuda_tile.for implies but scf.for does not.
+static void scopeLoopAllocations(Operation *root) {
+  llvm::SetVector<scf::ForOp> loops;
+  root->walk([&](memref::AllocaOp alloca) {
+    Operation *scope = alloca->getParentOp();
+    while (scope && !isa<scf::ForOp>(scope) &&
+           !scope->hasTrait<OpTrait::AutomaticAllocationScope>())
+      scope = scope->getParentOp();
+    if (auto loop = dyn_cast_or_null<scf::ForOp>(scope))
+      loops.insert(loop);
+  });
+  for (scf::ForOp loop : loops) {
+    Block *body = loop.getBody();
+    auto yield = cast<scf::YieldOp>(body->getTerminator());
+    OpBuilder builder(yield);
+    auto scope = memref::AllocaScopeOp::create(builder, loop.getLoc(),
+                                               yield.getOperandTypes());
+    Block *scopeBody = builder.createBlock(&scope.getBodyRegion());
+    scopeBody->getOperations().splice(scopeBody->end(), body->getOperations(),
+                                      body->begin(), scope->getIterator());
+    builder.setInsertionPointToEnd(scopeBody);
+    memref::AllocaScopeReturnOp::create(builder, loop.getLoc(),
+                                        yield.getOperands());
+    yield->setOperands(scope.getResults());
+  }
+}
+
+/// Converts all cuda_tile ops, then scopes the allocations in loops.
 struct ConvertTileIRToMLIRPass
     : public impl::ConvertTileIRToMLIRPassBase<ConvertTileIRToMLIRPass> {
   using Base::Base;
@@ -2896,19 +2921,7 @@ struct ConvertTileIRToMLIRPass
                                       std::move(patterns))))
       return signalPassFailure();
 
-    // Drop what toIndex left unused, including in nested regions. Visiting
-    // users before their operands drops whole chains while preserving reads.
-    module.walk<WalkOrder::PostOrder, ReverseIterator>([](Operation *op) {
-      if (op->getParentOfType<scf::ForOp>() && isMemoryEffectFree(op) &&
-          isOpTriviallyDead(op))
-        op->erase();
-    });
-    tileir::rescaleTileLoops(module);
-    tileir::scopeLoopAllocations(module);
-
-    RewritePatternSet postConversionPatterns(ctx);
-    tileir::populatePostConversionPatterns(postConversionPatterns);
-    walkAndApplyPatterns(module, std::move(postConversionPatterns));
+    scopeLoopAllocations(module);
 
     // gpu.module ops need a container module.
     if (target == TileIRTarget::GPU)

@@ -3,13 +3,14 @@ A conversion pass and tooling to lower Tile IR to MLIR dialects, including GPU, 
 
 The tool accepts textual and binary TileIR as input.
 
-* **`--tileir-to-mlir-pipeline`**: A convenience pipeline that runs `--tileir-ptr-to-view` followed by `--convert-tileir-to-mlir`. It forwards all options of `--convert-tileir-to-mlir` (`target`, `append-grid-args`, `drop-rounding-modes`, `assume-in-bounds`, `known-block-size`).
+* **`--tileir-to-mlir-pipeline`**: A convenience pipeline that runs `--tileir-ptr-to-view`, `--convert-tileir-to-mlir` and `--canonicalize-from-tileir`. It forwards all options of `--convert-tileir-to-mlir` (`target`, `append-grid-args`, `drop-rounding-modes`, `assume-in-bounds`, `known-block-size`).
 * **`--convert-tileir-to-mlir`**: Lowers Tile IR to a mix of standard dialects.
   * `target={gpu|cpu}` (default: `gpu`): The `gpu` target wraps the result in a GPU container module; `cpu` lowers without the container marker.
   * `append-grid-args={true|false}` (default: `false`): If `true`, appends six `i32` launch-coordinate arguments (block-id x/y/z, grid-dim x/y/z) to entry functions and sources dimension queries from them. Required on the `cpu` target when dimension queries are present.
   * `drop-rounding-modes={true|false}`(default: `false`): If true, always drop source floating-point rounding-mode semantics and preserve them only as tir-dropped-rounding annotations. The rounding of integer `divi` defines its result and is always lowered exactly.
   * `assume-in-bounds={true|false}`(default: `false`): If true, assume all load and store ops are in bounds.
   * `known-block-size=x,y,z` (default: unset): If given exactly three values, sets the `known_block_size` attribute on the generated `gpu.func` ops; if omitted, the attribute is not set.
+* **`--canonicalize-from-tileir`**: Optimizes and cleans up the output of `--convert-tileir-to-mlir`. It rescales loops over tile indices to step over element indices, folds selects into `vector.transfer_read` masks, loads contiguous gather rows with masked loads, and flattens n-D gathers and scatters, which the LLVM lowering requires. It then runs `--cse` and `--canonicalize`.
 * **`--tileir-ptr-to-view`**: Recognizes gather/scatter-style pointer arithmetic (iota, reshape, broadcast, offset) feeding `load_ptr_tko` or `store_ptr_tko` and lifts them into higher-level "view" operations for more efficient lowering in `--convert-tileir-to-mlir`.
 * **`--convert-memref-args-to-ptr-args`**: Promotes unranked memref arguments (`memref<*xT>`) to bare `!llvm.ptr` when they have no uses or every use is a direct `memref.cast` or `memref.reinterpret_cast`. Each cast may recover a distinct ranked layout. The function must have no in-module symbol uses. Intended for use after the core conversion.
 * **`--convert-memref-args-to-ranked-memref`**: Promotes an unranked memref argument (`memref<*xT>`) to a ranked memref when every use is the same zero-offset `memref.reinterpret_cast`. It rewrites unambiguous dynamic size and stride scalar uses to memref queries. The function must have no in-module symbol uses. Intended for use after the core conversion.
@@ -131,16 +132,15 @@ build/tools/tileir-to-mlir --convert-tileir-to-mlir test/Conversion/TileIRToMLIR
 
 ### Full Pipeline with Post-Processing
 
-Example of a full conversion followed by common optimization passes:
+Example of a full conversion followed by its cleanup and common optimization passes:
 
 ```bash
-build/tools/tileir-to-mlir --convert-tileir-to-mlir test/Conversion/TileIRToMLIR/cudatile-appendix.mlir | \
+build/tools/tileir-to-mlir --convert-tileir-to-mlir --canonicalize-from-tileir test/Conversion/TileIRToMLIR/cudatile-appendix.mlir | \
 mlir-opt --loop-invariant-code-motion -canonicalize -cse
 ```
 
-The conversion removes unused pure computations inside loops, including nested
-regions, but does not run general CSE. Rebuilt index expressions shared by several
-consumers can therefore be duplicated in conversion-only output. Add `--cse`
-after `--convert-tileir-to-mlir` to share them; `--canonicalize` can additionally
-fold and simplify the resulting IR. These explicit cleanup passes can also remove
-unused loads and pure data operations.
+The conversion itself does not clean up. It leaves unused computations, e.g.
+casts of loop induction variables, and rebuilds index expressions separately for
+each consumer. `--canonicalize-from-tileir` removes and shares them with `--cse`
+and `--canonicalize`, which can also remove unused loads and pure data
+operations.

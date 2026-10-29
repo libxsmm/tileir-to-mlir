@@ -485,13 +485,14 @@ cuda_tile.module @ops_module {
     // CHECK: %[[FOR_STEP:.*]] = arith.constant 1 : i32
     %step = constant <i32: 1> : tile<i32>
 
-    // Constant bounds become `index` constants.
+    // Constant bounds become `index` constants. The body casts the counter to
+    // its original type, which --canonicalize-from-tileir drops if unused.
     // CHECK: %[[FOR_LBI:.*]] = arith.constant 0 : index
     // CHECK: %[[FOR_UBI:.*]] = arith.constant 10 : index
     // CHECK: %[[FOR_STEPI:.*]] = arith.constant 1 : index
     // CHECK: scf.for %[[FOR_IV:.*]] = %[[FOR_LBI]] to %[[FOR_UBI]] step %[[FOR_STEPI]] {
-    // CHECK-NOT: arith.index_cast
-    // CHECK: }
+    // CHECK-NEXT: arith.index_cast %[[FOR_IV]] : index to i32
+    // CHECK-NEXT: }
     for %iv in (%lowerBound to %upperBound, step %step) : tile<i32> {
         continue
     }

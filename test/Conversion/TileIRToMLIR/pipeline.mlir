@@ -1,8 +1,14 @@
 // RUN: tileir-to-mlir --tileir-to-mlir-pipeline %s | FileCheck %s --check-prefix=GPU
 // RUN: tileir-to-mlir --tileir-to-mlir-pipeline='target=cpu append-grid-args=true' %s | FileCheck %s --check-prefix=CPU
+// RUN: tileir-to-mlir --tileir-to-mlir-pipeline='target=cpu append-grid-args=true' --dump-pass-pipeline %s -o /dev/null 2>&1 | FileCheck %s --check-prefix=PIPE
 // RUN: not tileir-to-mlir --tileir-to-mlir-pipeline='no-such-option=1' %s 2>&1 | FileCheck %s --check-prefix=ERR
 
-// The pipeline passes its options on to --convert-tileir-to-mlir.
+// The pipeline passes its options on to --convert-tileir-to-mlir and cleans up
+// the result with --canonicalize-from-tileir.
+
+// PIPE: tileir-ptr-to-view,
+// PIPE-NEXT: convert-tileir-to-mlir{append-grid-args=true {{.*}}target=cpu},
+// PIPE-NEXT: canonicalize-from-tileir
 
 // GPU: gpu.func @coords(%{{.*}}: memref<*xi32>) kernel
 // GPU:   gpu.block_id x

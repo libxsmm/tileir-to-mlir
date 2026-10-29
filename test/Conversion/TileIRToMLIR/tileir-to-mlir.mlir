@@ -149,9 +149,9 @@ cuda_tile.module @m {
     // CHECK: arith.constant 0 : index
     // CHECK: arith.constant 4 : index
     // CHECK: arith.constant 1 : index
-    // CHECK: scf.for
-    // CHECK-NOT: arith.index_cast
-    // CHECK: scf.yield
+    // CHECK: scf.for %[[VIV:[^ ]*]] =
+    // CHECK-NEXT: arith.index_cast %[[VIV]] : index to i32
+    // CHECK-NEXT: scf.yield
     %res = for %iv in (%lb to %ub, step %st) : tile<i32>
       iter_values(%acc = %init) -> (tile<2x2xf32>) {
       continue %acc : tile<2x2xf32>
@@ -179,7 +179,9 @@ cuda_tile.module @m {
 
   // --- loop counters in index computations ---
   // Index computations on a loop counter are redone in `index` on the counter
-  // itself (see "Integer semantics" in README.md), so the loops cast nothing.
+  // itself (see "Integer semantics" in README.md), so the loops cast nothing
+  // but their counters to the original type, which --canonicalize-from-tileir
+  // drops if unused.
   // CHECK-LABEL: gpu.func @test_for_counter_view_index
   entry @test_for_counter_view_index(%p: tile<ptr<f32>>, %n: tile<i32>) {
     %c0 = constant <i32: 0> : tile<i32>
@@ -187,6 +189,7 @@ cuda_tile.module @m {
     %tv = make_tensor_view %p, shape = [%n, 4], strides = [4, 1] : tile<i32> -> tensor_view<?x4xf32, strides=[4,1]>
     %pv = make_partition_view %tv : partition_view<tile=(1x4), tensor_view<?x4xf32, strides=[4,1]>>
     // CHECK: scf.for %[[IV:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
+    // CHECK-NEXT: arith.index_cast %[[IV]] : index to i32
     // CHECK-NOT: arith.index_cast
     // CHECK:   %[[ROW:.*]] = arith.muli %[[IV]], %{{.*}} overflow<nsw> : index
     // CHECK:   vector.transfer_read %{{.*}}[%[[ROW]], %{{.*}}]
@@ -203,6 +206,7 @@ cuda_tile.module @m {
       continue
     }
     // CHECK: scf.for %[[UIV:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
+    // CHECK-NEXT: arith.index_cast %[[UIV]] : index to i32
     // CHECK-NOT: arith.index_cast
     // CHECK:   %[[UROW:.*]] = arith.muli %[[UIV]], %{{.*}} overflow<nsw> : index
     // CHECK:   vector.transfer_read %{{.*}}[%[[UROW]], %{{.*}}]
@@ -214,14 +218,16 @@ cuda_tile.module @m {
 
   // --- loop counters in loop bounds and offsets ---
   // An inner loop bounded by an outer loop counter and a pointer offset scaled
-  // from an inner loop counter use the `index` counters; only the stored
-  // counter, which is not an index, is cast.
+  // from an inner loop counter use the `index` counters. Only the stored
+  // counter, which is not an index, needs the cast of a counter to its original
+  // type; --canonicalize-from-tileir drops the unused casts.
   // CHECK-LABEL: gpu.func @test_for_counter_bound_offset
   entry @test_for_counter_bound_offset(%p: tile<ptr<i32>>, %n: tile<i32>) {
     %c0 = constant <i32: 0> : tile<i32>
     %c1 = constant <i32: 1> : tile<i32>
     %c4 = constant <i32: 4> : tile<i32>
     // CHECK: scf.for %[[OUTER:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
+    // CHECK-NEXT: arith.index_cast %[[OUTER]] : index to i32
     // CHECK-NOT: arith.index_cast %[[OUTER]]
     // CHECK:   scf.for %[[INNER:.*]] = %[[OUTER]] to %{{.*}} step %{{.*}} {
     // CHECK:     %[[VAL:.*]] = arith.index_cast %[[INNER]] : index to i32

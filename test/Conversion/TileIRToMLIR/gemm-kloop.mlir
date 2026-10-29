@@ -1,5 +1,5 @@
-// RUN: tileir-to-mlir --convert-tileir-to-mlir %s | FileCheck %s
-// RUN: tileir-to-mlir --convert-tileir-to-mlir='target=cpu append-grid-args=true' %s | FileCheck %s --check-prefix=CPU
+// RUN: tileir-to-mlir --convert-tileir-to-mlir --canonicalize-from-tileir %s | FileCheck %s
+// RUN: tileir-to-mlir --convert-tileir-to-mlir='target=cpu append-grid-args=true' --canonicalize-from-tileir %s | FileCheck %s --check-prefix=CPU
 
 // An implementation of GEMM in cuda_tile.
 //

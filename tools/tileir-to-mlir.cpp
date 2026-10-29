@@ -54,13 +54,14 @@ int main(int argc, char **argv) {
 
   mlir::registerTileIRToMLIRPasses();
 
-  // The common path: raise Triton-style pointer arithmetic to view ops, then
-  // lower Tile IR. The arg-promotion passes are left out because they are
-  // mutually exclusive ABI choices that the caller adds explicitly.
+  // The common path: raise Triton-style pointer arithmetic to view ops, lower
+  // Tile IR, then optimize the result. The arg-promotion passes are left out
+  // because they are mutually exclusive ABI choices that the caller adds
+  // explicitly.
   mlir::registerPassPipeline(
       "tileir-to-mlir-pipeline",
-      "Run --tileir-ptr-to-view, then --convert-tileir-to-mlir with the given "
-      "options",
+      "Run --tileir-ptr-to-view, --convert-tileir-to-mlir with the given "
+      "options, then --canonicalize-from-tileir",
       [](mlir::OpPassManager &pm, llvm::StringRef options,
          llvm::function_ref<mlir::LogicalResult(const llvm::Twine &)>
              errorHandler) {
@@ -70,6 +71,7 @@ int main(int argc, char **argv) {
         if (mlir::failed(convert->initializeOptions(options, errorHandler)))
           return mlir::failure();
         pm.addPass(std::move(convert));
+        pm.addPass(mlir::createCanonicalizeFromTileIRPass());
         return mlir::success();
       },
       [](llvm::function_ref<void(const mlir::detail::PassOptions &)>) {});
