@@ -9,7 +9,7 @@
 // CHECK: %[[PAD:.*]] = arith.constant 0xFF800000 : f32
 // CHECK: %[[MASK:.*]] = arith.cmpi slt, %{{.*}} : vector<32xi32>
 // CHECK: memref.reinterpret_cast
-// CHECK-NEXT: vector.transfer_read %{{.*}}[%{{.*}}], %[[PAD]], %[[MASK]] : memref<?xf32, strided<[1], offset: ?>>, vector<32xf32>
+// CHECK-NEXT: vector.transfer_read %{{.*}}[%{{.*}}], %[[PAD]], %[[MASK]] : memref<?xf32, strided<[1]>>, vector<32xf32>
 // CHECK-NOT: arith.select
 
 // A padding value that differs from the view's padding is not foldable: the

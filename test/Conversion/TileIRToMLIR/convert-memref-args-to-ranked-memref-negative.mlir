@@ -12,7 +12,7 @@
 // CHECK: memref.reinterpret_cast %[[P]]
 func.func private @callee(%arg0: memref<*xf32>, %arg1: i32) {
   %n = arith.index_cast %arg1 : i32 to index
-  %v = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%n], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1], offset: ?>>
+  %v = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%n], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1]>>
   return
 }
 
@@ -31,8 +31,8 @@ module attributes {gpu.container_module} {
     // CHECK: memref.reinterpret_cast
     gpu.func @divergent_cast(%arg0: memref<*xf32>, %arg1: i32) attributes {sym_visibility = "private"} {
       %n = arith.index_cast %arg1 : i32 to index
-      %a = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%n], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1], offset: ?>>
-      %b = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%n, %n], strides: [%n, 1] : memref<*xf32> to memref<?x?xf32, strided<[?, 1], offset: ?>>
+      %a = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%n], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1]>>
+      %b = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%n, %n], strides: [%n, 1] : memref<*xf32> to memref<?x?xf32, strided<[?, 1]>>
       gpu.return
     }
 
@@ -40,14 +40,14 @@ module attributes {gpu.container_module} {
     // Both pointer args can be promoted, but %arg2 must remain because there
     // is no unique memref recipe to replace all of its uses.
     // CHECK-LABEL: gpu.func @conflicting_scalar(
-    // CHECK-SAME: %[[A:[^:]+]]: memref<?xf16, strided<[1], offset: ?>>,
-    // CHECK-SAME: %[[B:[^:]+]]: memref<?xf16, strided<[1], offset: ?>>,
+    // CHECK-SAME: %[[A:[^:]+]]: memref<?xf16, strided<[1]>>,
+    // CHECK-SAME: %[[B:[^:]+]]: memref<?xf16, strided<[1]>>,
     // CHECK-SAME: %[[N:[^:]+]]: i32)
     // CHECK-NOT: memref.reinterpret_cast
     gpu.func @conflicting_scalar(%arg0: memref<*xf16>, %arg1: memref<*xf16>, %arg2: i32) attributes {sym_visibility = "private"} {
       %n = arith.index_cast %arg2 : i32 to index
-      %a = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%n], strides: [1] : memref<*xf16> to memref<?xf16, strided<[1], offset: ?>>
-      %b = memref.reinterpret_cast %arg1 to offset: [0], sizes: [%n], strides: [1] : memref<*xf16> to memref<?xf16, strided<[1], offset: ?>>
+      %a = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%n], strides: [1] : memref<*xf16> to memref<?xf16, strided<[1]>>
+      %b = memref.reinterpret_cast %arg1 to offset: [0], sizes: [%n], strides: [1] : memref<*xf16> to memref<?xf16, strided<[1]>>
       %u = arith.addi %arg2, %arg2 : i32
       gpu.return
     }
