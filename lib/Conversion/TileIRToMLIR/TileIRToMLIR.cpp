@@ -161,6 +161,8 @@ mapRoundingModeToArith(cuda_tile::RoundingMode rounding) {
     return arith::RoundingMode::downward;
   case CtRM::POSITIVE_INF:
     return arith::RoundingMode::upward;
+  case CtRM::NEAREST_AWAY:
+    return arith::RoundingMode::to_nearest_away;
   case CtRM::APPROX:
   case CtRM::FULL:
   case CtRM::NEAREST_INT_TO_ZERO:
@@ -1921,6 +1923,25 @@ recoverUnrankedPtrOffset(ConversionPatternRewriter &rewriter, Location loc,
   return meta.getOffset();
 }
 
+/// A memref.reinterpret_cast of `source` to `offset`, `sizes` and `strides`,
+/// as a value of `resultTy`. The cast must have the type that its static
+/// metadata determines, so it is cast to `resultTy`, which may leave some of
+/// that metadata dynamic, if they differ.
+static Value createReinterpretCast(OpBuilder &builder, Location loc,
+                                   MemRefType resultTy, Value source,
+                                   OpFoldResult offset,
+                                   ArrayRef<OpFoldResult> sizes,
+                                   ArrayRef<OpFoldResult> strides) {
+  MemRefType castTy = updateTypeFromMetadata(resultTy, offset, sizes, strides);
+  Value view = memref::ReinterpretCastOp::create(builder, loc, castTy, source,
+                                                 offset, sizes, strides);
+  if (castTy == resultTy)
+    return view;
+  assert(memref::CastOp::areCastCompatible(castTy, resultTy) &&
+         "result type must generalize the reinterpret_cast metadata");
+  return memref::CastOp::create(builder, loc, resultTy, view);
+}
+
 /// A rank-0 memref at the unranked pointer `unrankedBase`, keeping the offset
 /// of the pointer; an offset of 0 would address the start of the buffer.
 static Value
@@ -1928,10 +1949,12 @@ reinterpretScalarPtrPreservingOffset(ConversionPatternRewriter &rewriter,
                                      Location loc, Value unrankedBase) {
   auto unrankedTy = cast<UnrankedMemRefType>(unrankedBase.getType());
   OpFoldResult off = recoverUnrankedPtrOffset(rewriter, loc, unrankedBase);
-  auto rank0Ty = MemRefType::get(
-      {}, unrankedTy.getElementType(),
-      StridedLayoutAttr::get(rewriter.getContext(), ShapedType::kDynamic, {}),
-      unrankedTy.getMemorySpace());
+  auto rank0Ty = updateTypeFromMetadata(
+      MemRefType::get({}, unrankedTy.getElementType(),
+                      StridedLayoutAttr::get(rewriter.getContext(),
+                                             ShapedType::kDynamic, {}),
+                      unrankedTy.getMemorySpace()),
+      off, /*sizes=*/{}, /*strides=*/{});
   return memref::ReinterpretCastOp::create(
              rewriter, loc, rank0Ty, unrankedBase,
              /*offset=*/off,
@@ -1973,8 +1996,9 @@ struct ConvertMakeTensorView
     OpFoldResult offset =
         recoverUnrankedPtrOffset(rewriter, loc, adaptor.getBase());
 
-    rewriter.replaceOpWithNewOp<memref::ReinterpretCastOp>(
-        op, resultTy, adaptor.getBase(), offset, sizes, strides);
+    rewriter.replaceOp(op, createReinterpretCast(rewriter, loc, resultTy,
+                                                 adaptor.getBase(), offset,
+                                                 sizes, strides));
     return success();
   }
 };
@@ -2115,12 +2139,11 @@ static Value offsetPointer(ConversionPatternRewriter &rewriter, Location loc,
             .getResult();
 
   auto ptrTy = cast<UnrankedMemRefType>(ptr.getType());
-  Value view = memref::ReinterpretCastOp::create(
+  Value view = createReinterpretCast(
       rewriter, loc,
       get1DDynamicOffsetMemRefType(ptrTy.getElementType(), /*size=*/1,
                                    ptrTy.getMemorySpace()),
-      ptr, totalOffset, SmallVector<OpFoldResult>{rewriter.getIndexAttr(1)},
-      SmallVector<OpFoldResult>{rewriter.getIndexAttr(1)});
+      ptr, totalOffset, {rewriter.getIndexAttr(1)}, {rewriter.getIndexAttr(1)});
   return memref::CastOp::create(rewriter, loc, ptrTy, view);
 }
 
@@ -2812,7 +2835,7 @@ static void populateTileIRToMLIRConversionPatterns(
       DirectConversion<cuda_tile::NegFOp, arith::NegFOp>,
       DirectConversion<cuda_tile::OrIOp, arith::OrIOp>,
       DirectConversion<cuda_tile::PackOp, vector::BitCastOp>,
-      DirectConversion<cuda_tile::PowOp, math::PowFOp>,
+      DirectConversion<cuda_tile::FPowFOp, math::PowFOp>,
       DirectConversion<cuda_tile::RemFOp, arith::RemFOp>,
       DirectConversion<cuda_tile::SelectOp, arith::SelectOp>,
       DirectConversion<cuda_tile::SinOp, math::SinOp>,

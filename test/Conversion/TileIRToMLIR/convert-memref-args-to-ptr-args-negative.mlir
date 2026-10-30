@@ -85,7 +85,7 @@ func.func private @non_strided_cast(%arg0: memref<*xf32>) -> f32 {
 // CHECK-SAME:    %{{[^:]+}}: memref<*xtf32>
 // CHECK:         memref.reinterpret_cast
 func.func private @no_llvm_descriptor(%arg0: memref<*xtf32>) -> tf32 {
-  %v = memref.reinterpret_cast %arg0 to offset: [0], sizes: [], strides: [] : memref<*xtf32> to memref<tf32, strided<[], offset: ?>>
-  %x = memref.load %v[] : memref<tf32, strided<[], offset: ?>>
+  %v = memref.reinterpret_cast %arg0 to offset: [0], sizes: [], strides: [] : memref<*xtf32> to memref<tf32, strided<[]>>
+  %x = memref.load %v[] : memref<tf32, strided<[]>>
   return %x : tf32
 }

@@ -42,9 +42,12 @@ cuda_tile.module @gemm_kloop_module {
 
         // Convert the unstructured pointers `ptr` to `tensor_view`.
         //
-        // CHECK: %[[A_ARG:.*]] = memref.reinterpret_cast {{.*}} memref<*xf16> to memref<?x?xf16, strided<[?, 1], offset: ?>>
-        // CHECK: %[[B_ARG:.*]] = memref.reinterpret_cast {{.*}} memref<*xf16> to memref<?x?xf16, strided<[?, 1], offset: ?>>
-        // CHECK: %[[C_ARG:.*]] = memref.reinterpret_cast {{.*}} memref<*xf32> to memref<?x?xf32, strided<[?, 1], offset: ?>>
+        // CHECK: %[[A_ARG_RC:.*]] = memref.reinterpret_cast {{.*}} to offset: [0], {{.*}} : memref<*xf16> to memref<?x?xf16, strided<[?, 1]>>
+        // CHECK-NEXT: %[[A_ARG:.*]] = memref.cast %[[A_ARG_RC]] : memref<?x?xf16, strided<[?, 1]>> to memref<?x?xf16, strided<[?, 1], offset: ?>>
+        // CHECK: %[[B_ARG_RC:.*]] = memref.reinterpret_cast {{.*}} to offset: [0], {{.*}} : memref<*xf16> to memref<?x?xf16, strided<[?, 1]>>
+        // CHECK-NEXT: %[[B_ARG:.*]] = memref.cast %[[B_ARG_RC]] : memref<?x?xf16, strided<[?, 1]>> to memref<?x?xf16, strided<[?, 1], offset: ?>>
+        // CHECK: %[[C_ARG_RC:.*]] = memref.reinterpret_cast {{.*}} to offset: [0], {{.*}} : memref<*xf32> to memref<?x?xf32, strided<[?, 1]>>
+        // CHECK-NEXT: %[[C_ARG:.*]] = memref.cast %[[C_ARG_RC]] : memref<?x?xf32, strided<[?, 1]>> to memref<?x?xf32, strided<[?, 1], offset: ?>>
         // A reference to the A tensor pointed to by A_ptr, (K x M)
         %A = make_tensor_view %A_ptr_assume, shape = [%K, %M], strides = [%stride_ak, 1] : tile<i32> -> tensor_view<?x?xf16, strides=[?,1]>
         // A reference to the B tensor pointed to by B_ptr, (N x K)
@@ -98,13 +101,13 @@ cuda_tile.module @gemm_kloop_module {
             // Load a single 256x64 matrix from the tile.
             // CHECK: %[[A_K:.*]] = arith.muli %[[IV]], %{{.*}} overflow<nsw> : index
             // CHECK: %[[A_FRAG:.*]] = vector.transfer_read %[[A_ARG]][%[[A_K]], %{{.*}}], %{{.*}} {permutation_map = #map} : memref<?x?xf16, strided<[?, 1], offset: ?>>, vector<256x64xf16>
-            // CANON: vector.transfer_read %{{.*}}[%[[IV]], %{{.*}}], %{{.*}} {permutation_map = #map} : memref<?x?xf16, strided<[?, 1], offset: ?>>, vector<256x64xf16>
+            // CANON: vector.transfer_read %{{.*}}[%[[IV]], %{{.*}}], %{{.*}} {permutation_map = #map} : memref<?x?xf16, strided<[?, 1]>>, vector<256x64xf16>
             %A_frag, %t1 = load_view_tko weak %A_block[%bidx, %k] : partition_view<tile=(256x64), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>, tile<i32> -> tile<256x64xf16>, !cuda_tile.token
 
             // Load a single 64x128 matrix from the tile.
             // CHECK: %[[B_K:.*]] = arith.muli %[[IV]], %{{.*}} overflow<nsw> : index
             // CHECK: %[[B_FRAG:.*]] = vector.transfer_read %[[B_ARG]][%{{.*}}, %[[B_K]]], %{{.*}} {permutation_map = #map} : memref<?x?xf16, strided<[?, 1], offset: ?>>, vector<64x128xf16>
-            // CANON: vector.transfer_read %{{.*}}[%{{.*}}, %[[IV]]], %{{.*}} {permutation_map = #map} : memref<?x?xf16, strided<[?, 1], offset: ?>>, vector<64x128xf16>
+            // CANON: vector.transfer_read %{{.*}}[%{{.*}}, %[[IV]]], %{{.*}} {permutation_map = #map} : memref<?x?xf16, strided<[?, 1]>>, vector<64x128xf16>
             %B_frag, %t2 = load_view_tko weak %B_block [%k, %bidy] : partition_view<tile=(64x128), tensor_view<?x?xf16, strides=[?,1]>, dim_map=[1, 0]>, tile<i32> -> tile<64x128xf16>, !cuda_tile.token
 
             // Compute the mma(A_frag, B_frag) + acc_prev.

@@ -30,7 +30,7 @@
 // CPU:         memref.get_global @g_tf32 : memref<2xf32>
 // CPU:         arith.constant 1.500000e+00 : f32
 // CPU:         arith.constant dense<[1.000000e+00, 2.000000e+00, 3.000000e+00, 4.000000e+00]> : vector<4xf32>
-// CPU:         memref.store %{{.*}} : memref<f32, strided<[], offset: ?>>
+// CPU:         memref.store %{{.*}} : memref<f32, strided<[]>>
 // CPU:         vector.transfer_read {{.*}} : memref<4xf32, strided<[1], offset: ?>>, vector<4xf32>
 // CPU:         vector.transfer_write {{.*}} : vector<4xf32>, memref<4xf32, strided<[1], offset: ?>>
 

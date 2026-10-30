@@ -28,8 +28,8 @@ module {
       // CHECK: %[[TV0:.*]] = make_tensor_view %arg0, shape = [%arg1], strides = [1] : tile<i32> -> tensor_view<?xf32, strides=[1]>
       // CHECK: %[[PV0:.*]] = make_partition_view %[[TV0]] : partition_view<tile=(1024), padding_value = zero, tensor_view<?xf32, strides=[1]>>
       // CHECK: %[[LD0:.*]], %[[TOK0:.*]] = load_view_tko weak %[[PV0]][%{{.*}}] : partition_view<tile=(1024), padding_value = zero, tensor_view<?xf32, strides=[1]>>, tile<i32> -> tile<1024xf32>, token
-      // CHECK-GPU: %[[LOAD1D_VIEW:.*]] = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%{{.*}}], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1], offset: ?>>
-      // CHECK-GPU: %[[LOAD1D_TILE:.*]] = vector.transfer_read %[[LOAD1D_VIEW]][%{{.*}}], %{{.*}} : memref<?xf32, strided<[1], offset: ?>>, vector<1024xf32>
+      // CHECK-GPU: %[[LOAD1D_VIEW:.*]] = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%{{.*}}], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1]>>
+      // CHECK-GPU: %[[LOAD1D_TILE:.*]] = vector.transfer_read %[[LOAD1D_VIEW]][%{{.*}}], %{{.*}} : memref<?xf32, strided<[1]>>, vector<1024xf32>
       %tile, %token = load_ptr_tko weak %ptr, %mask : tile<1024xptr<f32>>, tile<1024xi1> -> tile<1024xf32>, !cuda_tile.token
       %out_view = make_partition_view %out : partition_view<tile=(1024), tensor_view<1024xf32, strides=[1]>>
       %out_index = constant <i32: 0> : tile<i32>
@@ -57,8 +57,8 @@ module {
       // CHECK: %[[TV1:.*]] = make_tensor_view %arg0, shape = [%arg1], strides = [1] : tile<i32> -> tensor_view<?xf32, strides=[1]>
       // CHECK: %[[PV1:.*]] = make_partition_view %[[TV1]] : partition_view<tile=(1024), padding_value = zero, tensor_view<?xf32, strides=[1]>>
       // CHECK: %[[ST1:.*]] = store_view_tko weak %{{.*}}, %[[PV1]][%{{.*}}] : tile<1024xf32>, partition_view<tile=(1024), padding_value = zero, tensor_view<?xf32, strides=[1]>>, tile<i32> -> token
-      // CHECK-GPU: %[[STORE1D_VIEW:.*]] = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%{{.*}}], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1], offset: ?>>
-      // CHECK-GPU: vector.transfer_write %{{.*}}, %[[STORE1D_VIEW]][%{{.*}}] : vector<1024xf32>, memref<?xf32, strided<[1], offset: ?>>
+      // CHECK-GPU: %[[STORE1D_VIEW:.*]] = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%{{.*}}], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1]>>
+      // CHECK-GPU: vector.transfer_write %{{.*}}, %[[STORE1D_VIEW]][%{{.*}}] : vector<1024xf32>, memref<?xf32, strided<[1]>>
       %token = store_ptr_tko weak %ptr, %value, %mask : tile<1024xptr<f32>>, tile<1024xf32>, tile<1024xi1> -> !cuda_tile.token
       return
     }
@@ -106,8 +106,8 @@ module {
       // CHECK: %[[TV2:.*]] = make_tensor_view %arg0, shape = [%arg1, %arg2], strides = [%arg3, 1] : tile<i32> -> tensor_view<?x?xf16, strides=[?,1]>
       // CHECK: %[[PV2:.*]] = make_partition_view %[[TV2]] : partition_view<tile=(128x64), padding_value = zero, tensor_view<?x?xf16, strides=[?,1]>>
       // CHECK: %[[ST2:.*]] = store_view_tko weak %{{.*}}, %[[PV2]][%{{.*}}, %{{.*}}] : tile<128x64xf16>, partition_view<tile=(128x64), padding_value = zero, tensor_view<?x?xf16, strides=[?,1]>>, tile<i32> -> token
-      // CHECK-GPU: %[[STORE2D_VIEW:.*]] = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%{{.*}}, %{{.*}}], strides: [%{{.*}}, 1] : memref<*xf16> to memref<?x?xf16, strided<[?, 1], offset: ?>>
-      // CHECK-GPU: vector.transfer_write %{{.*}}, %[[STORE2D_VIEW]][%{{.*}}, %{{.*}}] : vector<128x64xf16>, memref<?x?xf16, strided<[?, 1], offset: ?>>
+      // CHECK-GPU: %[[STORE2D_VIEW:.*]] = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%{{.*}}, %{{.*}}], strides: [%{{.*}}, 1] : memref<*xf16> to memref<?x?xf16, strided<[?, 1]>>
+      // CHECK-GPU: vector.transfer_write %{{.*}}, %[[STORE2D_VIEW]][%{{.*}}, %{{.*}}] : vector<128x64xf16>, memref<?x?xf16, strided<[?, 1]>>
       %token = store_ptr_tko weak %ptr, %value, %mask : tile<128x64xptr<f16>>, tile<128x64xf16>, tile<128x64xi1> -> !cuda_tile.token
       return
     }
@@ -165,8 +165,8 @@ module {
       // CHECK: %[[PV2R:.*]] = make_partition_view %[[TV2R]] : partition_view<tile=(32x32), padding_value = zero, tensor_view<?x?xbf16, strides=[?,1]>>
       // CHECK: %[[LD2R:.*]], %[[TOK2R:.*]] = load_view_tko weak %[[PV2R]][%{{.*}}, %{{.*}}] : partition_view<tile=(32x32), padding_value = zero, tensor_view<?x?xbf16, strides=[?,1]>>, tile<i32> -> tile<32x32xbf16>, token
       // CHECK-NOT: load_ptr_tko
-      // CHECK-GPU: %[[LOAD2DR_VIEW:.*]] = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%{{.*}}, %{{.*}}], strides: [%{{.*}}, 1] : memref<*xbf16> to memref<?x?xbf16, strided<[?, 1], offset: ?>>
-      // CHECK-GPU: %[[LOAD2DR_TILE:.*]] = vector.transfer_read %[[LOAD2DR_VIEW]][%{{.*}}, %{{.*}}], %{{.*}} : memref<?x?xbf16, strided<[?, 1], offset: ?>>, vector<32x32xbf16>
+      // CHECK-GPU: %[[LOAD2DR_VIEW:.*]] = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%{{.*}}, %{{.*}}], strides: [%{{.*}}, 1] : memref<*xbf16> to memref<?x?xbf16, strided<[?, 1]>>
+      // CHECK-GPU: %[[LOAD2DR_TILE:.*]] = vector.transfer_read %[[LOAD2DR_VIEW]][%{{.*}}, %{{.*}}], %{{.*}} : memref<?x?xbf16, strided<[?, 1]>>, vector<32x32xbf16>
       // CHECK-GPU-NOT: vector.gather
       %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<32x32xptr<bf16>>, tile<32x32xi1>, tile<32x32xbf16> -> tile<32x32xbf16>, !cuda_tile.token
       %out_view = make_partition_view %out : partition_view<tile=(32x32), tensor_view<32x32xbf16, strides=[32,1]>>
@@ -242,7 +242,7 @@ module {
       // CHECK: %[[PVN:.*]] = make_partition_view %[[TVN]] : partition_view<tile=(1024), padding_value = nan, tensor_view<?xf32, strides=[1]>>
       // CHECK: %[[LDN:.*]], %[[TOKN:.*]] = load_view_tko weak %[[PVN]][%{{.*}}] : partition_view<tile=(1024), padding_value = nan, tensor_view<?xf32, strides=[1]>>, tile<i32> -> tile<1024xf32>, token
       // CHECK-GPU: %[[NANPAD:.*]] = arith.constant 0x7FC00000 : f32
-      // CHECK-GPU: vector.transfer_read %{{.*}}[%{{.*}}], %[[NANPAD]] : memref<?xf32, strided<[1], offset: ?>>, vector<1024xf32>
+      // CHECK-GPU: vector.transfer_read %{{.*}}[%{{.*}}], %[[NANPAD]] : memref<?xf32, strided<[1]>>, vector<1024xf32>
       %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<1024xptr<f32>>, tile<1024xi1>, tile<1024xf32> -> tile<1024xf32>, !cuda_tile.token
       %out_view = make_partition_view %out : partition_view<tile=(1024), tensor_view<1024xf32, strides=[1]>>
       %out_index = constant <i32: 0> : tile<i32>
@@ -522,7 +522,7 @@ module {
       // itself because the loop starts at 0 and advances by 32.
       // CHECK-GPU: scf.for %[[LOOP_IV:.*]] =
       // CHECK-GPU-NOT: arith.divui
-      // CHECK-GPU:   vector.transfer_read %{{.*}}[%[[LOOP_IV]]], %{{.*}} : memref<?xf32, strided<[1], offset: ?>>, vector<32xf32>
+      // CHECK-GPU:   vector.transfer_read %{{.*}}[%[[LOOP_IV]]], %{{.*}} : memref<?xf32, strided<[1]>>, vector<32xf32>
       for %iv in (%c0 to %N, step %c32) : tile<i32> {
         %iv_1d = reshape %iv : tile<i32> -> tile<1xi32>
         %iv_bc = broadcast %iv_1d : tile<1xi32> -> tile<32xi32>
@@ -572,8 +572,8 @@ module {
       // CHECK-NOT: offset
       // CHECK-GPU: %[[GPAD:.*]] = arith.constant 0.000000e+00 : bf16
       // CHECK-GPU: %[[GSIZE:.*]] = arith.index_cast %[[GN]] : i32 to index
-      // CHECK-GPU: %[[GVIEW:.*]] = memref.reinterpret_cast %[[GBASE]] to offset: [0], sizes: [%[[GSIZE]]], strides: [1] : memref<*xbf16> to memref<?xbf16, strided<[1], offset: ?>>
-      // CHECK-GPU: %{{.*}} = vector.transfer_read %[[GVIEW]][%{{.*}}], %[[GPAD]] : memref<?xbf16, strided<[1], offset: ?>>, vector<32xbf16>
+      // CHECK-GPU: %[[GVIEW:.*]] = memref.reinterpret_cast %[[GBASE]] to offset: [0], sizes: [%[[GSIZE]]], strides: [1] : memref<*xbf16> to memref<?xbf16, strided<[1]>>
+      // CHECK-GPU: %{{.*}} = vector.transfer_read %[[GVIEW]][%{{.*}}], %[[GPAD]] : memref<?xbf16, strided<[1]>>, vector<32xbf16>
       %v, %t = load_ptr_tko weak %ptr, %mask, %cst_pad : tile<32xptr<bf16>>, tile<32xi1>, tile<32xbf16> -> tile<32xbf16>, !cuda_tile.token
       %out_view = make_partition_view %out : partition_view<tile=(32), tensor_view<32xbf16, strides=[1]>>
       %out_index = constant <i32: 0> : tile<i32>
@@ -756,8 +756,8 @@ module {
       // CHECK: %[[PV_ROW:.*]] = make_partition_view %[[TV_ROW]] : partition_view<tile=(32), padding_value = zero, tensor_view<?xf32, strides=[1]>>
       // CHECK: %{{.*}}, %{{.*}} = load_view_tko weak %[[PV_ROW]][%{{.*}}] : partition_view<tile=(32), padding_value = zero, tensor_view<?xf32, strides=[1]>>, tile<i32> -> tile<32xf32>, token
       // CHECK-NOT: load_ptr_tko
-      // CHECK-GPU: %[[ROW_VIEW:.*]] = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%{{.*}}], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1], offset: ?>>
-      // CHECK-GPU: vector.transfer_read %[[ROW_VIEW]][%{{.*}}], %{{.*}} : memref<?xf32, strided<[1], offset: ?>>, vector<32xf32>
+      // CHECK-GPU: %[[ROW_VIEW:.*]] = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%{{.*}}], strides: [1] : memref<*xf32> to memref<?xf32, strided<[1]>>
+      // CHECK-GPU: vector.transfer_read %[[ROW_VIEW]][%{{.*}}], %{{.*}} : memref<?xf32, strided<[1]>>, vector<32xf32>
       // CHECK-GPU-NOT: vector.gather
       %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<32xptr<f32>>, tile<32xi1>, tile<32xf32> -> tile<32xf32>, !cuda_tile.token
       %out_view = make_partition_view %out : partition_view<tile=(32), tensor_view<32xf32, strides=[1]>>
@@ -795,7 +795,7 @@ module {
       // CHECK-GPU: scf.for %[[ROW_LOOP_INDEX:.*]] =
       // CHECK-GPU-NOT: arith.index_cast %[[ROW_LOOP_INDEX]]
       // CHECK-GPU:   arith.divui %[[ROW_LOOP_INDEX]], %{{.*}} : index
-      // CHECK-GPU:   vector.transfer_read %{{.*}}[%{{.*}}], %{{.*}} : memref<?xf32, strided<[1], offset: ?>>, vector<32xf32>
+      // CHECK-GPU:   vector.transfer_read %{{.*}}[%{{.*}}], %{{.*}} : memref<?xf32, strided<[1]>>, vector<32xf32>
       for %loopIdx in (%c0 to %c1024, step %c32) : tile<i32> {
         %start = addi %row_offset, %loopIdx : tile<i32>
         %start_1d = reshape %start : tile<i32> -> tile<1xi32>
@@ -1450,8 +1450,8 @@ module {
       // CHECK: %[[PVW:.*]] = make_partition_view %[[TVW]] : partition_view<tile=(128), padding_value = zero, tensor_view<?xi32, strides=[1]>>
       // CHECK: load_view_tko weak %[[PVW]][%{{.*}}]
       // CHECK-NOT: load_ptr_tko
-      // CHECK-GPU: %[[WVIEW:.*]] = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%{{.*}}], strides: [1] : memref<*xi32> to memref<?xi32, strided<[1], offset: ?>>
-      // CHECK-GPU: vector.transfer_read %[[WVIEW]][%{{.*}}], %{{.*}} : memref<?xi32, strided<[1], offset: ?>>, vector<128xi32>
+      // CHECK-GPU: %[[WVIEW:.*]] = memref.reinterpret_cast %arg0 to offset: [0], sizes: [%{{.*}}], strides: [1] : memref<*xi32> to memref<?xi32, strided<[1]>>
+      // CHECK-GPU: vector.transfer_read %[[WVIEW]][%{{.*}}], %{{.*}} : memref<?xi32, strided<[1]>>, vector<128xi32>
       // CHECK-GPU-NOT: vector.gather
       %tile, %token = load_ptr_tko weak %ptr, %mask, %pad : tile<128xptr<i32>>, tile<128xi1>, tile<128xi32> -> tile<128xi32>, !cuda_tile.token
       %out_view = make_partition_view %out : partition_view<tile=(128), tensor_view<128xi32, strides=[1]>>
