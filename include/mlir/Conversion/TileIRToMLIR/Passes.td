@@ -107,8 +107,12 @@ def ConvertMemrefArgsToPtrArgsPass : Pass<"convert-memref-args-to-ptr-args", "Mo
     replaced independently by a memref descriptor materialized from the pointer
     and wrapped in an `unrealized_conversion_cast` to its original ranked type.
     The pointer carries no sizes or strides: a `memref.cast` must have static
-    strides, and its dynamic sizes become 0. Casts to memref types without an
-    LLVM descriptor, e.g. of `tf32`, are not supported.
+    strides. Dynamic sizes become zero placeholders only when every direct
+    user is a `vector.gather`, `vector.scatter`, `vector.maskedload`, or
+    `vector.maskedstore`, which address memory without reading dimension
+    sizes. Size queries, implicit bounds checks, and other users block such
+    promotion. Casts to memref types without an LLVM descriptor, e.g. of
+    `tf32`, are not supported.
 
     The rewrite is conservative. An argument is promoted only when:
       * it is an unranked-memref argument,
@@ -123,6 +127,22 @@ def ConvertMemrefArgsToPtrArgsPass : Pass<"convert-memref-args-to-ptr-args", "Mo
     "arith::ArithDialect",
     "LLVM::LLVMDialect",
   ];
+}
+
+def PackCPUKernelArgumentsPass : Pass<"pack-cpu-kernel-arguments", "ModuleOp"> {
+  let summary = "Pack CPU kernel arguments into eight-byte slots";
+  let description = [{
+    After memref argument promotion, changes public CPU entry points from
+    (arguments..., block-id x/y/z, grid-dim x/y/z) to
+    (!llvm.ptr, block-id x/y/z, grid-dim x/y/z). The first pointer addresses
+    immutable, native-endian, eight-byte slots, one for each original argument.
+    Pointers, integers up to 64 bits, f32, and f64 are loaded from the start of
+    their slots with alignment one. Grid arguments remain six trailing i32s.
+    Kernels must return void and have no in-module symbol uses.
+    Private functions and declarations are unchanged. Repeated application
+    leaves already-packed kernels unchanged.
+  }];
+  let dependentDialects = ["func::FuncDialect", "LLVM::LLVMDialect"];
 }
 
 def ConvertMemrefArgsToRankedMemrefPass : Pass<"convert-memref-args-to-ranked-memref", "ModuleOp"> {

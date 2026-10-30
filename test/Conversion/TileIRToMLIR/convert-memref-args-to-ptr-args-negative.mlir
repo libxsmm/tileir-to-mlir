@@ -69,6 +69,35 @@ func.func private @dynamic_size_cast(%arg0: memref<*xf32>) -> index {
   return %size : index
 }
 
+// A safe data access does not make an accompanying size query safe.
+// CHECK-LABEL: func.func private @dynamic_size_mixed_users(
+// CHECK-SAME:    %{{[^:]+}}: memref<*xf32>
+// CHECK:         memref.cast
+// CHECK:         vector.gather
+// CHECK:         memref.dim
+func.func private @dynamic_size_mixed_users(%arg0: memref<*xf32>, %offsets: vector<4xindex>) -> index {
+  %c0 = arith.constant 0 : index
+  %mask = arith.constant dense<true> : vector<4xi1>
+  %pass = arith.constant dense<0.0> : vector<4xf32>
+  %v = memref.cast %arg0 : memref<*xf32> to memref<?xf32, strided<[1], offset: ?>>
+  %g = vector.gather %v[%c0] [%offsets], %mask, %pass : memref<?xf32, strided<[1], offset: ?>>, vector<4xindex>, vector<4xi1>, vector<4xf32> into vector<4xf32>
+  %size = memref.dim %v, %c0 : memref<?xf32, strided<[1], offset: ?>>
+  return %size : index
+}
+
+// Transfer reads perform implicit bounds checks against the dynamic size.
+// CHECK-LABEL: func.func private @dynamic_size_transfer(
+// CHECK-SAME:    %{{[^:]+}}: memref<*xf32>
+// CHECK:         memref.cast
+// CHECK:         vector.transfer_read
+func.func private @dynamic_size_transfer(%arg0: memref<*xf32>) -> vector<4xf32> {
+  %c0 = arith.constant 0 : index
+  %pad = arith.constant 0.0 : f32
+  %v = memref.cast %arg0 : memref<*xf32> to memref<?xf32, strided<[1], offset: ?>>
+  %read = vector.transfer_read %v[%c0], %pad : memref<?xf32, strided<[1], offset: ?>>, vector<4xf32>
+  return %read : vector<4xf32>
+}
+
 // CHECK-LABEL: func.func private @non_strided_cast(
 // CHECK-SAME:    %{{[^:]+}}: memref<*xf32>
 // CHECK:         memref.cast

@@ -162,3 +162,25 @@ func.func private @gather_base(%arg0: memref<*xf32>, %offsets: vector<4xindex>) 
   %g = vector.gather %base[%c0] [%offsets], %mask, %pass : memref<4xf32, strided<[1], offset: ?>>, vector<4xindex>, vector<4xi1>, vector<4xf32> into vector<4xf32>
   return %g : vector<4xf32>
 }
+
+// Explicit-mask accesses do not read dimension sizes. A dynamically sized
+// cast with static strides can supply their pointer and stride metadata.
+// CHECK-LABEL: func.func private @dynamic_masked_accesses(
+// CHECK-SAME:    %[[P:[^:]+]]: !llvm.ptr,
+// CHECK-NOT:     memref.cast
+// CHECK:         llvm.insertvalue %[[P]]
+// CHECK:         %[[M:.*]] = builtin.unrealized_conversion_cast %{{.*}} to memref<?xf32, strided<[1], offset: ?>>
+// CHECK:         vector.gather %[[M]]
+// CHECK:         vector.scatter %[[M]]
+// CHECK:         vector.maskedload %[[M]]
+// CHECK:         vector.maskedstore %[[M]]
+func.func private @dynamic_masked_accesses(%arg0: memref<*xf32>, %offsets: vector<4xindex>, %mask: vector<4xi1>) {
+  %c0 = arith.constant 0 : index
+  %pass = arith.constant dense<0.0> : vector<4xf32>
+  %base = memref.cast %arg0 : memref<*xf32> to memref<?xf32, strided<[1], offset: ?>>
+  %g = vector.gather %base[%c0] [%offsets], %mask, %pass : memref<?xf32, strided<[1], offset: ?>>, vector<4xindex>, vector<4xi1>, vector<4xf32> into vector<4xf32>
+  vector.scatter %base[%c0] [%offsets], %mask, %g : memref<?xf32, strided<[1], offset: ?>>, vector<4xindex>, vector<4xi1>, vector<4xf32>
+  %v = vector.maskedload %base[%c0], %mask, %pass : memref<?xf32, strided<[1], offset: ?>>, vector<4xi1>, vector<4xf32> into vector<4xf32>
+  vector.maskedstore %base[%c0], %mask, %v : memref<?xf32, strided<[1], offset: ?>>, vector<4xi1>, vector<4xf32>
+  return
+}
