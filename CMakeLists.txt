@@ -115,7 +115,14 @@ else()
       "TileIRToMLIR requires an LLVM Git checkout at "
       "${USE_LLVM_REVISION}.")
   endif()
-  if(NOT _tileir_to_mlir_llvm_revision STREQUAL USE_LLVM_REVISION)
+  execute_process(
+    COMMAND "${_tileir_to_mlir_git_executable}" -C "${LLVM_MAIN_SRC_DIR}"
+            rev-parse --verify "${USE_LLVM_REVISION}^{commit}"
+    RESULT_VARIABLE _tileir_to_mlir_required_revision_result
+    OUTPUT_VARIABLE _tileir_to_mlir_required_revision
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(NOT _tileir_to_mlir_required_revision_result EQUAL 0 OR
+     NOT _tileir_to_mlir_llvm_revision STREQUAL _tileir_to_mlir_required_revision)
     message(FATAL_ERROR
       "TileIRToMLIR requires LLVM revision "
       "${USE_LLVM_REVISION}, but found "

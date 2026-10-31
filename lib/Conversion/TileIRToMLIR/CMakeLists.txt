@@ -3,8 +3,16 @@ add_library(TileIRToMLIR STATIC
   ConvertMemrefArgsToRankedMemref.cpp
   ConvertMemrefArgsToPtrArgs.cpp
   PackCPUKernelArguments.cpp
+  Pipeline.cpp
   TileIRToMLIR.cpp
   TileIRPtrToView.cpp
+)
+
+target_include_directories(TileIRToMLIR PUBLIC
+  "${PROJECT_SOURCE_DIR}/include"
+  "${PROJECT_BINARY_DIR}/include"
+  "${CUDA_TILE_PUBLIC_INCLUDE_DIR}"
+  "${CUDA_TILE_GEN_INCLUDE_DIR}"
 )
 
 add_dependencies(TileIRToMLIR MLIRTileIRToMLIRConversionPassIncGen)
