@@ -62,18 +62,7 @@ int main(int argc, char **argv) {
       "tileir-to-mlir-pipeline",
       "Run --tileir-ptr-to-view, --convert-tileir-to-mlir with the given "
       "options, then --canonicalize-from-tileir",
-      [](mlir::OpPassManager &pm, llvm::StringRef options,
-         llvm::function_ref<mlir::LogicalResult(const llvm::Twine &)>
-             errorHandler) {
-        pm.addPass(mlir::createTileIRPtrToViewPass());
-        std::unique_ptr<mlir::Pass> convert =
-            mlir::createConvertTileIRToMLIRPass();
-        if (mlir::failed(convert->initializeOptions(options, errorHandler)))
-          return mlir::failure();
-        pm.addPass(std::move(convert));
-        pm.addPass(mlir::createCanonicalizeFromTileIRPass());
-        return mlir::success();
-      },
+      mlir::buildTileIRToMLIRPipeline,
       [](llvm::function_ref<void(const mlir::detail::PassOptions &)>) {});
 
   mlir::registerTransformsPasses();
