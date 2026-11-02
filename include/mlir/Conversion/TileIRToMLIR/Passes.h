@@ -13,8 +13,13 @@
 #define MLIR_CONVERSION_TILEIRTOMLIR_PASSES_H
 
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/Twine.h"
 
 namespace mlir {
+
+class OpPassManager;
 
 /// Selects the lowering target of --convert-tileir-to-mlir.
 enum class TileIRTarget { GPU, CPU };
@@ -32,6 +37,10 @@ enum class MemrefArgRemovalMode {
 #define GEN_PASS_DECL
 #define GEN_PASS_REGISTRATION
 #include "mlir/Conversion/TileIRToMLIR/Passes.h.inc"
+
+LogicalResult buildTileIRToMLIRPipeline(
+    OpPassManager &pm, llvm::StringRef options,
+    llvm::function_ref<LogicalResult(const llvm::Twine &)> errorHandler);
 
 } // namespace mlir
 

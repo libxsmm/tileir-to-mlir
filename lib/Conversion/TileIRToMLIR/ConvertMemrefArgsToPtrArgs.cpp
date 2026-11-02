@@ -31,6 +31,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -80,17 +81,25 @@ static bool collectPromotableCasts(
     if (source != arg || !resTy ||
         resTy.getElementType() != unranked.getElementType())
       return false;
-    // The descriptor needs strides and a type of the memref-to-LLVM lowering. A
-    // plain cast would read sizes and strides from the unranked descriptor,
-    // which a pointer does not have, so they must be static.
+    // A pointer cannot supply dynamic sizes or strides from a descriptor.
+    // Sizes may be omitted only when every user addresses memory using an
+    // explicit mask, without querying sizes or performing implicit bounds
+    // checks.
     SmallVector<int64_t> strides;
     int64_t offset;
     if (failed(resTy.getStridesAndOffset(strides, offset)) ||
-        (isa<memref::CastOp>(user) &&
-         (llvm::any_of(resTy.getShape(), ShapedType::isDynamic) ||
-          llvm::any_of(strides, ShapedType::isDynamic))) ||
         !typeConverter.convertType(resTy))
       return false;
+    if (isa<memref::CastOp>(user)) {
+      if (llvm::any_of(strides, ShapedType::isDynamic))
+        return false;
+      if (llvm::any_of(resTy.getShape(), ShapedType::isDynamic) &&
+          !llvm::all_of(user->getUsers(), [](Operation *access) {
+            return isa<vector::GatherOp, vector::ScatterOp,
+                       vector::MaskedLoadOp, vector::MaskedStoreOp>(access);
+          }))
+        return false;
+    }
     casts.emplace_back(user, resTy);
   }
   return true;
@@ -125,8 +134,8 @@ static void getLayout(OpBuilder &builder, Location loc, Operation *cast,
     return;
   }
 
-  // A plain cast takes the static sizes and strides of its type. A dynamic
-  // offset is 0 by the calling convention of pointer arguments.
+  // Unobserved dynamic sizes are zero placeholders. A dynamic offset is 0 by
+  // the calling convention of pointer arguments.
   auto constIndex = [&](int64_t v) -> Value {
     return LLVM::ConstantOp::create(
         builder, loc, indexTy,

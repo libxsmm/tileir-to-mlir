@@ -1319,8 +1319,7 @@ struct ConvertEntry : public OptionsPattern<cuda_tile::EntryOp> {
       // gpu.func creates its entry block; merge the converted body into it.
       auto gpuFunc =
           gpu::GPUFuncOp::create(rewriter, loc, entryOp.getSymName(), funcType);
-      gpuFunc->setAttr(gpu::GPUDialect::getKernelFuncAttrName(),
-                       rewriter.getUnitAttr());
+      gpuFunc.setKernelAttr(rewriter.getUnitAttr());
       if (!options.knownBlockSize.empty())
         gpuFunc.setKnownBlockSizeAttr(
             rewriter.getDenseI32ArrayAttr(options.knownBlockSize));
