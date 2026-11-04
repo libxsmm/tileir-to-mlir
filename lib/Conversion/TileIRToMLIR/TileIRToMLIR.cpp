@@ -966,13 +966,15 @@ struct TransferViewAccessPlan {
 ///
 /// Tile index i, scaled by the base advance of the view, indexes memref
 /// dimension dim_map[i], and the permutation map sends that dimension to
-/// vector dimension i. A dimension is in bounds only if its extent is static
-/// and the last tile that starts inside the tensor also ends inside it; the
-/// transfer masks the other dimensions.
+/// vector dimension i. A dimension is in bounds if the op's `inbounds`
+/// attribute declares it so, or if its extent is static and the last tile that
+/// starts inside the tensor also ends inside it; the transfer masks the other
+/// dimensions.
 static FailureOr<TransferViewAccessPlan>
 buildTransferViewAccessPlan(ConversionPatternRewriter &rewriter, Operation *op,
                             Value view, Value convertedView,
-                            ValueRange convertedIndices) {
+                            ValueRange convertedIndices,
+                            ArrayRef<bool> declaredInBounds) {
   auto viewInfoOr = getViewInfo(op, view, convertedView, rewriter);
   if (failed(viewInfoOr))
     return failure();
@@ -1004,8 +1006,10 @@ buildTransferViewAccessPlan(ConversionPatternRewriter &rewriter, Operation *op,
 
   auto memrefTy = cast<MemRefType>(viewInfo.memref.getType());
   auto memrefShape = memrefTy.getShape();
-  SmallVector<bool> inBounds(rank, false);
+  SmallVector<bool> inBounds(declaredInBounds);
   for (unsigned i = 0; i < rank; ++i) {
+    if (inBounds[i])
+      continue;
     int64_t ext = memrefShape[viewInfo.dimMap[i]];
     if (ext == ShapedType::kDynamic)
       continue;
@@ -1848,7 +1852,8 @@ struct ConvertLoadViewTko
       return rewriter.notifyMatchFailure(op, "cannot convert tile type");
 
     auto plan = buildTransferViewAccessPlan(
-        rewriter, op, op.getView(), adaptor.getView(), adaptor.getIndex());
+        rewriter, op, op.getView(), adaptor.getView(), adaptor.getIndex(),
+        op.getInbounds());
     if (failed(plan))
       return failure();
 
@@ -2681,7 +2686,8 @@ struct ConvertStoreViewTko
       return failure();
 
     auto plan = buildTransferViewAccessPlan(
-        rewriter, op, op.getView(), adaptor.getView(), adaptor.getIndex());
+        rewriter, op, op.getView(), adaptor.getView(), adaptor.getIndex(),
+        op.getInbounds());
     if (failed(plan))
       return failure();
 
@@ -2835,6 +2841,7 @@ static void populateTileIRToMLIRConversionPatterns(
       DirectConversion<cuda_tile::OrIOp, arith::OrIOp>,
       DirectConversion<cuda_tile::PackOp, vector::BitCastOp>,
       DirectConversion<cuda_tile::FPowFOp, math::PowFOp>,
+      DirectConversion<cuda_tile::FPowIOp, math::FPowIOp>,
       DirectConversion<cuda_tile::RemFOp, arith::RemFOp>,
       DirectConversion<cuda_tile::SelectOp, arith::SelectOp>,
       DirectConversion<cuda_tile::SinOp, math::SinOp>,

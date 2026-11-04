@@ -401,6 +401,18 @@ cuda_tile.module @ops_module {
     return
   }
 
+  // --- fpowi ---
+  // CHECK-LABEL: gpu.func @test_powi
+  entry @test_powi() {
+    // CHECK: %[[POWI_BASE:.*]] = arith.constant dense<2.000000e+00> : vector<4xf32>
+    %source = constant <f32: 2.0> : tile<4xf32>
+    // CHECK: %[[POWI_EXP:.*]] = arith.constant dense<3> : vector<4xi32>
+    %exponent = constant <i32: 3> : tile<4xi32>
+    // CHECK: %[[POWI_R:.*]] = math.fpowi %[[POWI_BASE]], %[[POWI_EXP]] : vector<4xf32>, vector<4xi32>
+    %result = fpowi %source, %exponent : tile<4xf32>, tile<4xi32>
+    return
+  }
+
   // --- rsqrt ---
   // CHECK-LABEL: gpu.func @test_rsqrt
   entry @test_rsqrt() {
