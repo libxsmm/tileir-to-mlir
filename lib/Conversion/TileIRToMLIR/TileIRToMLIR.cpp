@@ -328,19 +328,21 @@ static Value toIndex(OpBuilder &builder, Location loc, Value value,
 }
 
 /// Replace `op` with the signed or unsigned target op selected by `signedness`,
-/// forwarding `args` to the target op builder.
-template <typename SignedDstOp, typename UnsignedDstOp, typename SrcOp,
-          typename... Args>
-static Operation *replaceBySignedness(ConversionPatternRewriter &rewriter,
-                                     SrcOp op, cuda_tile::Signedness signedness,
-                                     Args &&...args) {
-  if (signedness == cuda_tile::Signedness::Unsigned)
+/// with the converted result type and operands.
+template <typename SignedDstOp, typename UnsignedDstOp, typename SrcOp>
+static Operation *
+replaceBySignedness(ConversionPatternRewriter &rewriter, SrcOp op,
+                    cuda_tile::Signedness signedness, TypeRange resultTypes,
+                    ValueRange operands) {
+  if (signedness == cuda_tile::Signedness::Unsigned) {
     return rewriter
         .template replaceOpWithNewOp<UnsignedDstOp>(
-            op, std::forward<Args>(args)...)
+            op, resultTypes, operands, typename UnsignedDstOp::Properties{})
         .getOperation();
+  }
   return rewriter
-      .template replaceOpWithNewOp<SignedDstOp>(op, std::forward<Args>(args)...)
+      .template replaceOpWithNewOp<SignedDstOp>(
+          op, resultTypes, operands, typename SignedDstOp::Properties{})
       .getOperation();
 }
 
@@ -465,7 +467,8 @@ struct DirectConversion : public OpConversionPattern<SrcOp> {
     if (!resultTy)
       return rewriter.notifyMatchFailure(op, "cannot convert result type");
     rewriter.template replaceOpWithNewOp<DstOp>(op, TypeRange{resultTy},
-                                                adaptor.getOperands());
+                                                adaptor.getOperands(),
+                                                typename DstOp::Properties{});
     return success();
   }
 };
@@ -647,7 +650,8 @@ struct ConvertFromToSignednessCastWithRoundingOp
       return failure();
 
     Operation *newOp = replaceBySignedness<SignedDstOp, UnsignedDstOp>(
-        rewriter, op, op.getSignedness(), resultTy.value(), adaptor.getFrom());
+        rewriter, op, op.getSignedness(), TypeRange{resultTy.value()},
+        ValueRange{adaptor.getFrom()});
     if (!roundingRepresented)
       preserveDroppedRounding(rewriter, op.getRoundingMode(), newOp);
     return success();
@@ -704,6 +708,7 @@ struct TokenDroppingPattern : public OpConversionPattern<SourceOp> {
 template <typename SrcOp>
 struct EraseTokenOp : public TokenDroppingPattern<SrcOp> {
   using TokenDroppingPattern<SrcOp>::TokenDroppingPattern;
+  using TokenDroppingPattern<SrcOp>::matchAndRewrite;
 
   LogicalResult
   matchAndRewrite(SrcOp op,
@@ -1258,16 +1263,19 @@ struct ConvertDivI : public OpConversionPattern<cuda_tile::DivIOp> {
     cuda_tile::Signedness signedness = op.getSignedness();
     switch (op.getRounding()) {
     case cuda_tile::RoundingMode::ZERO:
-      replaceBySignedness<arith::DivSIOp, arith::DivUIOp>(rewriter, op,
-                                                          signedness, lhs, rhs);
+      replaceBySignedness<arith::DivSIOp, arith::DivUIOp>(
+          rewriter, op, signedness, TypeRange{lhs.getType()},
+          ValueRange{lhs, rhs});
       return success();
     case cuda_tile::RoundingMode::POSITIVE_INF:
       replaceBySignedness<arith::CeilDivSIOp, arith::CeilDivUIOp>(
-          rewriter, op, signedness, lhs, rhs);
+          rewriter, op, signedness, TypeRange{lhs.getType()},
+          ValueRange{lhs, rhs});
       return success();
     case cuda_tile::RoundingMode::NEGATIVE_INF:
       replaceBySignedness<arith::FloorDivSIOp, arith::DivUIOp>(
-          rewriter, op, signedness, lhs, rhs);
+          rewriter, op, signedness, TypeRange{lhs.getType()},
+          ValueRange{lhs, rhs});
       return success();
     default:
       return rewriter.notifyMatchFailure(op, "unsupported divi rounding mode");
@@ -1527,7 +1535,8 @@ struct ConvertFToF : public OptionsPattern<cuda_tile::FToFOp> {
 
     if (srcWidth < dstWidth) {
       auto extOp = rewriter.replaceOpWithNewOp<arith::ExtFOp>(
-          op, resultTy.value(), adaptor.getFrom());
+          op, TypeRange{resultTy.value()}, ValueRange{adaptor.getFrom()},
+          arith::ExtFOp::Properties{});
       if (options.dropRoundingModes)
         preserveDroppedRounding(rewriter, op.getRoundingMode(), extOp);
       return success();
@@ -1837,6 +1846,7 @@ using ConvertIToF = ConvertFromToSignednessCastWithRoundingOp<
 struct ConvertLoadViewTko
     : public OptionsPattern<cuda_tile::LoadViewTkoOp,
                             TokenDroppingPattern<cuda_tile::LoadViewTkoOp>> {
+  using OptionsPattern::matchAndRewrite;
   using OptionsPattern::OptionsPattern;
 
   LogicalResult
@@ -2191,6 +2201,7 @@ struct ConvertNegI : public OpConversionPattern<cuda_tile::NegIOp> {
 /// Convert a scalar cuda_tile.load_ptr_tko to a memref.load from the pointer.
 struct ConvertLoadPtrTkoScalar
     : public TokenDroppingPattern<cuda_tile::LoadPtrTkoOp> {
+  using TokenDroppingPattern::matchAndRewrite;
   using TokenDroppingPattern::TokenDroppingPattern;
 
   LogicalResult
@@ -2223,6 +2234,7 @@ struct ConvertLoadPtrTkoScalar
 /// Convert a scalar cuda_tile.store_ptr_tko to a memref.store to the pointer.
 struct ConvertStorePtrTkoScalar
     : public TokenDroppingPattern<cuda_tile::StorePtrTkoOp> {
+  using TokenDroppingPattern::matchAndRewrite;
   using TokenDroppingPattern::TokenDroppingPattern;
 
   LogicalResult
@@ -2409,6 +2421,7 @@ mapAtomicRMWMode(cuda_tile::AtomicRMWMode mode) {
 /// checkCommonTkoGuards).
 struct ConvertAtomicRMWTko
     : public TokenDroppingPattern<cuda_tile::AtomicRMWTkoOp> {
+  using TokenDroppingPattern::matchAndRewrite;
   using TokenDroppingPattern::TokenDroppingPattern;
 
   LogicalResult
@@ -2676,6 +2689,7 @@ using ConvertSqrt =
 struct ConvertStoreViewTko
     : public OptionsPattern<cuda_tile::StoreViewTkoOp,
                             TokenDroppingPattern<cuda_tile::StoreViewTkoOp>> {
+  using OptionsPattern::matchAndRewrite;
   using OptionsPattern::OptionsPattern;
 
   LogicalResult
