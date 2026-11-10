@@ -197,8 +197,14 @@ if(TILEIR_TO_MLIR_EXTERNAL_PROJECT_BUILD OR TILEIR_TO_MLIR_BUILD_CUDA_TILE)
 
   set(_tileir_to_mlir_runtime_output_dir "${LLVM_RUNTIME_OUTPUT_INTDIR}")
   set(_tileir_to_mlir_library_output_dir "${LLVM_LIBRARY_OUTPUT_INTDIR}")
+  get_property(_tileir_to_mlir_mlir_exports GLOBAL PROPERTY MLIR_EXPORTS)
   add_subdirectory("${TILEIR_TO_MLIR_CUDA_TILE_SOURCE_DIR}"
                    "${CMAKE_CURRENT_BINARY_DIR}/cuda-tile" EXCLUDE_FROM_ALL)
+  get_property(_tileir_to_mlir_cuda_tile_libraries GLOBAL PROPERTY MLIR_EXPORTS)
+  if(_tileir_to_mlir_mlir_exports)
+    list(REMOVE_ITEM _tileir_to_mlir_cuda_tile_libraries ${_tileir_to_mlir_mlir_exports})
+  endif()
+  unset(_tileir_to_mlir_mlir_exports)
 
   # CUDA Tile changes these shared output variables for its own targets.
   set(LLVM_RUNTIME_OUTPUT_INTDIR "${_tileir_to_mlir_runtime_output_dir}")
@@ -301,14 +307,32 @@ add_subdirectory(lib)
 add_subdirectory(tools)
 add_subdirectory(test)
 
-install(TARGETS TileIRToMLIR
+set(_tileir_to_mlir_export_targets TileIRToMLIR)
+if(TILEIR_TO_MLIR_EXTERNAL_PROJECT_BUILD OR TILEIR_TO_MLIR_BUILD_CUDA_TILE)
+  list(APPEND _tileir_to_mlir_export_targets
+    CudaTileDialect CudaTileBytecodeCommon CudaTileBytecodeReader
+    ${_tileir_to_mlir_cuda_tile_libraries})
+  list(REMOVE_DUPLICATES _tileir_to_mlir_export_targets)
+  install(DIRECTORY "${CUDA_TILE_PUBLIC_INCLUDE_DIR}/" "${CUDA_TILE_GEN_INCLUDE_DIR}/"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+    COMPONENT TileIRToMLIR
+    FILES_MATCHING PATTERN "*.h" PATTERN "*.inc" PATTERN "*.def" PATTERN "*.td")
+  install(FILES "${TILEIR_TO_MLIR_CUDA_TILE_SOURCE_DIR}/LICENSE.txt"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/TileIRToMLIR/cuda-tile"
+    COMPONENT TileIRToMLIR)
+endif()
+install(TARGETS ${_tileir_to_mlir_export_targets}
+  EXPORT TileIRToMLIRTargets
   ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+  COMPONENT TileIRToMLIR
 )
 install(TARGETS tileir-to-mlir
   RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+  COMPONENT tileir-to-mlir
 )
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/mlir/Conversion/TileIRToMLIR"
   DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/mlir/Conversion"
+  COMPONENT TileIRToMLIR
   FILES_MATCHING
   PATTERN "*.h"
   PATTERN "*.td"
@@ -316,4 +340,24 @@ install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/mlir/Conversion/TileIRToM
 install(FILES
   "${CMAKE_CURRENT_BINARY_DIR}/include/mlir/Conversion/TileIRToMLIR/Passes.h.inc"
   DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/mlir/Conversion/TileIRToMLIR"
+  COMPONENT TileIRToMLIR
 )
+
+include(CMakePackageConfigHelpers)
+set(_tileir_to_mlir_cmake_dir "${CMAKE_INSTALL_LIBDIR}/cmake/TileIRToMLIR")
+configure_package_config_file(cmake/TileIRToMLIRConfig.cmake.in
+  "${CMAKE_CURRENT_BINARY_DIR}/TileIRToMLIRConfig.cmake"
+  INSTALL_DESTINATION "${_tileir_to_mlir_cmake_dir}")
+install(EXPORT TileIRToMLIRTargets
+  NAMESPACE TileIRToMLIR::
+  DESTINATION "${_tileir_to_mlir_cmake_dir}"
+  COMPONENT TileIRToMLIR)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/TileIRToMLIRConfig.cmake"
+  DESTINATION "${_tileir_to_mlir_cmake_dir}"
+  COMPONENT TileIRToMLIR)
+install(FILES LICENSE llvm-revision.txt
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/TileIRToMLIR"
+  COMPONENT TileIRToMLIR)
+add_llvm_install_targets(install-TileIRToMLIR
+  COMPONENT TileIRToMLIR
+  DEPENDS ${_tileir_to_mlir_export_targets})
